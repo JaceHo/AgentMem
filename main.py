@@ -1,5 +1,5 @@
 """
-OpenClaw Local Memory Service  v0.2.0
+OpenClaw Local Memory Service  v0.3.0
 ======================================
 Replaces memos-cloud-openclaw-plugin with fully local, persistent memory.
 
@@ -8,6 +8,7 @@ Features:
   2. Scene isolation     — language + domain tags filter recall by context
   3. Evolving persona    — structured user profile updated from extracted facts
   4. Summarize-then-embed— long turns compressed before MiniLM embedding
+  5. Hybrid extraction   — regex (instant) + LLM (GLM-4-flash, async) for facts
 
 Endpoints:
   POST /recall   — before_agent_start hook
@@ -73,12 +74,12 @@ async def lifespan(app: FastAPI):
     _redis = await mem_store.get_client()
     log.info("Ensuring vectorset indexes…")
     await mem_store.ensure_indexes(_redis)
-    log.info("Memory service v0.2.0 ready on :18790")
+    log.info("Memory service v0.3.0 ready on :18790")
     yield
     await _redis.aclose()
 
 
-app = FastAPI(title="OpenClaw Memory Service", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="OpenClaw Memory Service", version="0.3.0", lifespan=lifespan)
 
 
 # ── Request / Response models ──────────────────────────────────────────────────
@@ -172,9 +173,9 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
             )
             ep_saved = 1
 
-        # 5. Rule-based fact extraction → dedup → save → update persona
+        # 5. Hybrid fact extraction (regex + LLM) → dedup → save → update persona
         raw_msgs = [m.model_dump() for m in clean if m.role == "user"]
-        facts = extractor.extract(raw_msgs)
+        facts = await extractor.extract_hybrid(raw_msgs, turn_text)
         fact_saved = 0
         for fact in facts:
             f_emb = _encode(fact.content)
@@ -204,7 +205,7 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
 async def health():
     try:
         await _redis.ping()
-        return {"status": "ok", "redis": "ok", "version": "0.2.0"}
+        return {"status": "ok", "redis": "ok", "version": "0.3.0"}
     except Exception as e:
         return {"status": "degraded", "error": str(e)}
 
