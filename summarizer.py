@@ -11,7 +11,6 @@ Degrades gracefully: returns truncated original if key unavailable or timeout.
 
 import json
 import os
-from functools import lru_cache
 from pathlib import Path
 
 import httpx
@@ -22,18 +21,18 @@ ZAI_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
 TIMEOUT_S = 4.0
 
 
-@lru_cache(maxsize=1)
 def _load_key() -> str:
-    # 1. Env var
+    """Re-read on every call so key rotation is picked up without restart."""
+    # 1. Env var (set in LaunchAgent plist overrides all)
     if k := os.environ.get("ZAI_API_KEY"):
         return k
-    # 2. ~/.openclaw/.env
+    # 2. ~/.openclaw/.env  ← rotation script updates this
     env = Path.home() / ".openclaw" / ".env"
     if env.exists():
         for line in env.read_text().splitlines():
             if line.startswith("ZAI_API_KEY="):
                 return line.split("=", 1)[1].strip().strip("\"'")
-    # 3. openclaw.json provider key
+    # 3. openclaw.json provider key (fallback)
     cfg = Path.home() / ".openclaw" / "openclaw.json"
     if cfg.exists():
         try:
