@@ -36,10 +36,8 @@ def compute_heat(attrs: dict) -> float:
 def heat_rerank(items: list[dict]) -> list[dict]:
     """Re-rank a list of {content, score, attrs} dicts by cosine × heat."""
     for item in items:
-        raw_score = float(item.get("score", 0))
-        # Redis VSIM returns cosine DISTANCE (0=identical, 2=opposite).
-        # Convert to similarity: sim = 1 - dist/2
-        sim = max(0.0, 1.0 - raw_score / 2.0)
+        # Redis VSIM returns cosine SIMILARITY (1=identical, 0=opposite).
+        sim = max(0.0, float(item.get("score", 0)))
         h = compute_heat(item.get("attrs", {}))
         item["heat_score"] = sim * h
     return sorted(items, key=lambda x: x["heat_score"], reverse=True)

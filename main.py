@@ -163,7 +163,8 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
         # 4. Embed + dedup-check + save episode
         ep_emb = _encode(summary[:500])
         similar = await mem_store.knn_search(_redis, mem_store.EPISODE_KEY, ep_emb, k=1)
-        is_dup = bool(similar and similar[0].get("score", 1.0) < 0.05)
+        # VSIM returns similarity (1=identical). Dedup if score > 0.95.
+        is_dup = bool(similar and similar[0].get("score", 0.0) > 0.95)
         ep_saved = 0
         if not is_dup:
             await mem_store.save_episode(
@@ -178,7 +179,7 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
         for fact in facts:
             f_emb = _encode(fact.content)
             existing = await mem_store.knn_search(_redis, mem_store.FACT_KEY, f_emb, k=1)
-            if existing and existing[0].get("score", 1.0) < 0.05:
+            if existing and existing[0].get("score", 0.0) > 0.95:
                 continue
             await mem_store.save_fact(
                 _redis, fact.content, fact.category, fact.confidence, f_emb, lang, domain
