@@ -9,7 +9,8 @@ Fully local, persistent, fast — no external dependencies.
 
 | Feature | Description |
 |---------|-------------|
-| **Semantic recall** | Redis 8 native vectorset HNSW + `all-MiniLM-L6-v2` (384-dim) |
+| **Hybrid fact extraction** | Dual-layer: regex (~1ms) + LLM/GLM-4-flash (~200-500ms) for Chinese/implicit/contextual facts |
+| **Semantic recall** | Redis 8 native vectorset HNSW + `paraphrase-multilingual-MiniLM-L12-v2` (384-dim) |
 | **Heat-tiered ranking** | Frequently/recently accessed memories rank higher |
 | **Scene isolation** | Language + domain tags filter recall to relevant context |
 | **Evolving persona** | Structured user profile updated incrementally from conversations |
@@ -28,7 +29,7 @@ memos-local plugin (JS)   ← ~/.openclaw/extensions/memos-local/
     ▼
 Memory Service (Python FastAPI) @ localhost:18790
     ├── /recall  → embed query → KNN (scene-filtered) → heat rerank → prependContext
-    └── /store   → filter → detect scene → summarize → embed → dedup → save
+    └── /store   → filter → detect scene → summarize → hybrid extract → embed → dedup → save
          │
          ▼
     Redis 8 (localhost:6379)
@@ -66,6 +67,19 @@ Global search supplements if scene results are sparse.
 
 Detected domains: `trading`, `coding`, `devops`, `ai`, `finance`, `general`
 
+## Hybrid Fact Extraction (v0.3.0)
+
+Two-layer extraction runs on every `/store` call (async, non-blocking):
+
+| Layer | Method | Latency | Catches |
+|-------|--------|---------|---------|
+| **Regex** | 9 compiled patterns | ~1ms | English first-person: "My name is...", "I prefer..." |
+| **LLM** | GLM-4-flash (ZAI) | ~200-500ms | Chinese, implicit, contextual, decisions, third-person |
+
+Categories: `identity`, `work`, `preference`, `location`, `personal`, `reminder`, `rule`, `decision`, `context`, `credential`
+
+LLM extraction skips `credential` for safety. Results are merged and deduped (substring match) before embedding and storing.
+
 ## Setup
 
 ### Requirements
@@ -88,7 +102,7 @@ ZAI_API_KEY=your-key-here
 MEMOS_API_KEY=your-key-here
 ```
 
-Summarization degrades gracefully without a key (truncates to 180 chars instead).
+Both summarization and LLM extraction degrade gracefully without a key (summarizer truncates to 180 chars; extractor falls back to regex-only).
 
 ### Running
 
@@ -138,7 +152,7 @@ Returns `{ "status": "queued" }` (async background processing)
 
 ### `GET /health`
 ```json
-{ "status": "ok", "redis": "ok", "version": "0.2.0" }
+{ "status": "ok", "redis": "ok", "version": "0.3.0" }
 ```
 
 ### `GET /stats`
@@ -152,7 +166,8 @@ Returns `{ "status": "queued" }` (async background processing)
 |-----------|-----|-----|
 | Recall (cache hit) | ~8ms | ~15ms |
 | Recall (cold) | ~70ms | ~100ms |
-| Store (async) | non-blocking | non-blocking |
+| Store (async, regex-only) | non-blocking | non-blocking |
+| Store (async, hybrid) | non-blocking (~1.2s background) | non-blocking |
 
 ## Research Basis
 
