@@ -1,0 +1,24 @@
+{
+  "id": "memos-local-openclaw-plugin",
+  "name": "Local Memory (Redis HNSW + MiniLM)",
+  "description": "Long-term memory via local FastAPI sidecar + Redis vector search. No cloud dependency.",
+  "version": "0.1.0",
+  "kind": "lifecycle",
+  "main": "./index.js",
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "baseUrl": {
+        "type": "string",
+        "description": "Memory service base URL",
+        "default": "http://127.0.0.1:18790"
+      },
+      "memoryLimitNumber": {
+        "type": "number",
+        "description": "Max memories to recall per query",
+        "default": 6
+      }
+    },
+    "additionalProperties": false
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "name": "memos-local-openclaw-plugin",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Local long-memory via Redis HNSW + MiniLM. Replaces memos-cloud.",
+  "openclaw": {
+    "extensions": ["./index.js"]
+  }
+}
