@@ -5,7 +5,7 @@ MiniLM-L6 silently truncates at 256 word-pieces (~200 chars of dense text).
 Long conversations lose their tail. Summarizing first ensures the full
 turn is captured in the 384-dim embedding.
 
-Uses GLM-4-flash (ZAI) — fast (~800ms) and cheap.
+Uses GLM-4-flash (ZAI) — fast (~500ms) and cheap, no reasoning overhead.
 Degrades gracefully: returns truncated original if key unavailable or timeout.
 """
 
@@ -26,10 +26,10 @@ def _load_key() -> str:
     # 1. Env var (set in LaunchAgent plist overrides all)
     if k := os.environ.get("ZAI_API_KEY"):
         return k
-    # 2. ~/.openclaw/.env  ← rotation script updates this
-    env = Path.home() / ".openclaw" / ".env"
-    if env.exists():
-        for line in env.read_text().splitlines():
+    # 2. memory-service/.env  ← local override
+    local_env = Path(__file__).parent / ".env"
+    if local_env.exists():
+        for line in local_env.read_text().splitlines():
             if line.startswith("ZAI_API_KEY="):
                 return line.split("=", 1)[1].strip().strip("\"'")
     # 3. openclaw.json provider key (fallback)

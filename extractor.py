@@ -94,9 +94,9 @@ def _load_key() -> str:
     """Re-read on every call so key rotation is picked up without restart."""
     if k := os.environ.get("ZAI_API_KEY"):
         return k
-    env = Path.home() / ".openclaw" / ".env"
-    if env.exists():
-        for line in env.read_text().splitlines():
+    local_env = Path(__file__).parent / ".env"
+    if local_env.exists():
+        for line in local_env.read_text().splitlines():
             if line.startswith("ZAI_API_KEY="):
                 return line.split("=", 1)[1].strip().strip("\"'")
     cfg = Path.home() / ".openclaw" / "openclaw.json"
