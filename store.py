@@ -144,9 +144,12 @@ async def save_fact(
     embedding: np.ndarray,
     language: str = "en",
     domain: str = "general",
+    keywords: list[str] | None = None,
+    persons: list[str] | None = None,
+    entities: list[str] | None = None,
 ) -> str:
     uid  = str(ULID())
-    attr = json.dumps({
+    attr_dict = {
         "content":      content[:500],
         "category":     category,
         "language":     language,
@@ -154,9 +157,15 @@ async def save_fact(
         "confidence":   confidence,
         "ts":           int(time.time() * 1000),
         "access_count": 0,
-    })
+    }
+    if keywords:
+        attr_dict["keywords"] = keywords[:10]
+    if persons:
+        attr_dict["persons"] = persons[:5]
+    if entities:
+        attr_dict["entities"] = entities[:5]
     await r.execute_command("VADD", FACT_KEY, "FP32", _blob(embedding), uid,
-                            "SETATTR", attr)
+                            "SETATTR", json.dumps(attr_dict))
     return uid
 
 

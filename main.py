@@ -1,5 +1,5 @@
 """
-OpenClaw Local Memory Service  v0.3.0
+OpenClaw Local Memory Service  v0.4.0
 ======================================
 Replaces memos-cloud-openclaw-plugin with fully local, persistent memory.
 
@@ -18,12 +18,15 @@ Endpoints:
 """
 
 import asyncio
+import json
 import logging
+import re
 import time
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from typing import Any
 
+import httpx
 import numpy as np
 from fastapi import FastAPI, BackgroundTasks
 from pydantic import BaseModel
@@ -74,12 +77,12 @@ async def lifespan(app: FastAPI):
     _redis = await mem_store.get_client()
     log.info("Ensuring vectorset indexes…")
     await mem_store.ensure_indexes(_redis)
-    log.info("Memory service v0.3.0 ready on :18790")
+    log.info("Memory service v0.4.0 ready")
     yield
     await _redis.aclose()
 
 
-app = FastAPI(title="OpenClaw Memory Service", version="0.3.0", lifespan=lifespan)
+app = FastAPI(title="OpenClaw Memory Service", version="0.4.0", lifespan=lifespan)
 
 
 # ── Request / Response models ──────────────────────────────────────────────────
@@ -128,7 +131,14 @@ def _format_prepend(
         lines.append("## Long-Term Memory (Facts)")
         for i, f in enumerate(facts, 1):
             tag = f.get("category") or f.get("domain") or "?"
-            lines.append(f"{i}. [{tag}] {f['content']}")
+            attrs = f.get("attrs", {})
+            meta_parts = []
+            if p := attrs.get("persons"):
+                meta_parts.append(f"who:{','.join(p)}")
+            if e := attrs.get("entities"):
+                meta_parts.append(f"re:{','.join(e)}")
+            meta = f" ({'; '.join(meta_parts)})" if meta_parts else ""
+            lines.append(f"{i}. [{tag}]{meta} {f['content']}")
         lines.append("")
 
     if episodes:
@@ -138,6 +148,33 @@ def _format_prepend(
         lines.append("")
 
     return "\n".join(lines).strip()
+
+
+# ── Query complexity estimator (SimpleMem-inspired, zero-cost) ────────────────
+_COMPLEX_SIGNALS = re.compile(
+    r'\b(what|when|where|who|how|why|which|compare|difference|between|all|every|list'
+    r'|什么|怎么|哪|为什么|比较|区别|所有|每个|列出)\b', re.I
+)
+
+def _estimate_depth(query: str, base_limit: int) -> tuple[int, int]:
+    """
+    Adaptive retrieval depth: k_dyn = k_base × (1 + δ × C_q).
+    Returns (n_facts, n_episodes). C_q estimated from query features.
+    """
+    words = query.split()
+    n_words = len(words)
+    n_signals = len(_COMPLEX_SIGNALS.findall(query))
+    # Simple complexity score: 0.0 (trivial) to 1.0 (complex)
+    c_q = min(1.0, (n_words / 30) + (n_signals * 0.2))
+    delta = 0.8   # scaling factor
+
+    k_base_facts = max(1, base_limit // 2)
+    k_base_eps   = base_limit
+
+    n_facts    = max(1, int(k_base_facts * (1.0 + delta * c_q)))
+    n_episodes = max(2, int(k_base_eps   * (1.0 + delta * c_q * 0.5)))
+
+    return n_facts, n_episodes
 
 
 # ── Background store ──────────────────────────────────────────────────────────
@@ -183,7 +220,8 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
             if existing and existing[0].get("score", 0.0) > 0.95:
                 continue
             await mem_store.save_fact(
-                _redis, fact.content, fact.category, fact.confidence, f_emb, lang, domain
+                _redis, fact.content, fact.category, fact.confidence, f_emb, lang, domain,
+                keywords=fact.keywords, persons=fact.persons, entities=fact.entities,
             )
             await persona_mod.update(_redis, fact.category, fact.content)
             fact_saved += 1
@@ -205,7 +243,7 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
 async def health():
     try:
         await _redis.ping()
-        return {"status": "ok", "redis": "ok", "version": "0.3.0"}
+        return {"status": "ok", "redis": "ok", "version": "0.4.0"}
     except Exception as e:
         return {"status": "degraded", "error": str(e)}
 
@@ -232,8 +270,8 @@ async def recall(req: RecallRequest):
     q_lang, q_domain = query_scene["language"], query_scene["domain"]
     emb = _encode(req.query)
 
-    n_facts    = max(1, req.memory_limit_number // 2)
-    n_episodes = req.memory_limit_number
+    # Adaptive retrieval depth (SimpleMem-inspired C_q estimator)
+    n_facts, n_episodes = _estimate_depth(req.query, req.memory_limit_number)
 
     # Build filter expressions for scene isolation
     lang_filter   = f'.language == "{q_lang}"'
@@ -294,3 +332,197 @@ async def recall(req: RecallRequest):
 async def store_memory(req: StoreRequest, background_tasks: BackgroundTasks):
     background_tasks.add_task(_do_store, req.messages, req.session_id)
     return {"status": "queued"}
+
+
+# ── Consolidation (SimpleMem-inspired recursive merging) ─────────────────────
+
+async def _do_consolidate(similarity_threshold: float = 0.85) -> dict:
+    """
+    Find clusters of similar facts and merge them into consolidated entries.
+    Uses VSIM to find near-duplicates, then LLM to produce a merged fact.
+    """
+    t0 = time.time()
+    all_facts = []
+
+    # Fetch all fact elements with their attributes
+    card = await _redis.execute_command("VCARD", mem_store.FACT_KEY)
+    if not card or int(card) <= 1:
+        return {"merged": 0, "removed": 0, "ms": 0}
+
+    # Get all elements via VRANDMEMBER (Redis 8 vectorset supports this)
+    try:
+        # Use a large VSIM with a zero vector to get all entries
+        # (Not ideal but Redis 8 vectorset has no SCAN equivalent)
+        seed = np.zeros(mem_store.DIMS, dtype=np.float32)
+        results = await _redis.execute_command(
+            "VSIM", mem_store.FACT_KEY, "FP32", seed.tobytes(),
+            "COUNT", min(int(card), 500), "WITHSCORES", "WITHATTRIBS"
+        )
+    except Exception as e:
+        log.warning(f"[consolidate] failed to scan facts: {e}")
+        return {"error": str(e)}
+
+    # Parse all facts
+    i = 0
+    while i + 2 < len(results):
+        elem = results[i]
+        score = results[i + 1]
+        raw = results[i + 2]
+        i += 3
+        elem_str = elem.decode() if isinstance(elem, bytes) else elem
+        if elem_str == "__seed__":
+            continue
+        try:
+            attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+        except Exception:
+            continue
+        if attrs.get("_seed") or not attrs.get("content"):
+            continue
+        all_facts.append({"element": elem_str, "attrs": attrs})
+
+    if len(all_facts) < 2:
+        return {"merged": 0, "removed": 0, "total": len(all_facts), "ms": 0}
+
+    # Find clusters: for each fact, find similar ones
+    merged_count = 0
+    removed_elements = set()
+
+    for idx, fact in enumerate(all_facts):
+        if fact["element"] in removed_elements:
+            continue
+
+        f_emb = _encode(fact["attrs"]["content"])
+        similar = await mem_store.knn_search(
+            _redis, mem_store.FACT_KEY, f_emb, k=5
+        )
+
+        # Find cluster members (similar facts above threshold)
+        cluster = [fact]
+        for s in similar:
+            if s["_element"] == fact["element"]:
+                continue
+            if s["_element"] in removed_elements:
+                continue
+            if s.get("score", 0) >= similarity_threshold:
+                # Find the full fact entry
+                for f2 in all_facts:
+                    if f2["element"] == s["_element"]:
+                        cluster.append(f2)
+                        break
+
+        if len(cluster) < 2:
+            continue
+
+        # Merge cluster into a single consolidated fact via LLM
+        contents = [c["attrs"]["content"] for c in cluster]
+        merged_content = await _llm_merge_facts(contents)
+        if not merged_content:
+            continue
+
+        # Keep the newest entry, update its content, remove the rest
+        cluster.sort(key=lambda c: c["attrs"].get("ts", 0), reverse=True)
+        keeper = cluster[0]
+
+        # Update keeper with merged content
+        new_attrs = dict(keeper["attrs"])
+        new_attrs["content"] = merged_content[:500]
+        new_attrs["access_count"] = max(
+            c["attrs"].get("access_count", 0) for c in cluster
+        )
+        new_attrs["consolidated_from"] = len(cluster)
+
+        # Collect keywords/persons/entities from all cluster members
+        all_kw = set()
+        all_persons = set()
+        all_entities = set()
+        for c in cluster:
+            for kw in c["attrs"].get("keywords", []):
+                all_kw.add(kw)
+            for p in c["attrs"].get("persons", []):
+                all_persons.add(p)
+            for e in c["attrs"].get("entities", []):
+                all_entities.add(e)
+        if all_kw:
+            new_attrs["keywords"] = list(all_kw)[:10]
+        if all_persons:
+            new_attrs["persons"] = list(all_persons)[:5]
+        if all_entities:
+            new_attrs["entities"] = list(all_entities)[:5]
+
+        # Re-embed the merged content and replace keeper
+        m_emb = _encode(merged_content)
+        try:
+            await _redis.execute_command(
+                "VADD", mem_store.FACT_KEY, "FP32", m_emb.tobytes(),
+                keeper["element"], "SETATTR", json.dumps(new_attrs)
+            )
+        except Exception as e:
+            log.warning(f"[consolidate] failed to update keeper: {e}")
+            continue
+
+        # Remove other cluster members
+        for c in cluster[1:]:
+            try:
+                await _redis.execute_command("VREM", mem_store.FACT_KEY, c["element"])
+                removed_elements.add(c["element"])
+            except Exception:
+                pass
+
+        merged_count += 1
+
+    ms = int((time.time() - t0) * 1000)
+    log.info(f"[consolidate] merged={merged_count} removed={len(removed_elements)} {ms}ms")
+    return {
+        "merged": merged_count,
+        "removed": len(removed_elements),
+        "total_before": len(all_facts),
+        "total_after": len(all_facts) - len(removed_elements),
+        "ms": ms,
+    }
+
+
+async def _llm_merge_facts(contents: list[str]) -> str | None:
+    """Use GLM-4-flash to merge multiple similar facts into one consolidated fact."""
+    key = extractor._load_key()
+    if not key:
+        # Fallback: just pick the longest fact
+        return max(contents, key=len)
+
+    facts_text = "\n".join(f"- {c}" for c in contents)
+    prompt = (
+        f"以下是关于同一主题的多条记忆，请合并为一条完整、准确的事实陈述。"
+        f"保留所有不同的细节，去除重复。输出仅包含合并后的一句话，不要解释。\n\n{facts_text}"
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.post(
+                extractor.ZAI_URL,
+                json={
+                    "model": "glm-4-flash",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 150,
+                    "temperature": 0.1,
+                },
+                headers={"Authorization": f"Bearer {key}"},
+            )
+            if resp.status_code == 200:
+                return resp.json()["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        log.warning(f"[consolidate] LLM merge failed: {e}")
+
+    return max(contents, key=len)
+
+
+@app.post("/consolidate")
+async def consolidate(background_tasks: BackgroundTasks):
+    """Trigger memory consolidation — merges similar facts to reduce redundancy."""
+    background_tasks.add_task(_do_consolidate)
+    return {"status": "consolidation_queued"}
+
+
+@app.post("/consolidate/sync")
+async def consolidate_sync():
+    """Synchronous consolidation — returns results immediately."""
+    result = await _do_consolidate()
+    return result
