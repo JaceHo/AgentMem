@@ -66,7 +66,7 @@ def _regex_extract(user_text: str) -> list[ExtractedFact]:
 # ── Layer 2: LLM extraction (GLM-4-flash, ~200-500ms) ────────────────────────
 
 ZAI_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
-LLM_TIMEOUT_S = 5.0
+LLM_TIMEOUT_S = 10.0
 LLM_MAX_INPUT = 1500   # chars of conversation to send
 
 _EXTRACT_PROMPT = """从以下对话中提取关于用户的关键事实。只提取明确表述的事实，不要推测。
@@ -144,7 +144,7 @@ async def _llm_extract(conversation_text: str) -> list[ExtractedFact]:
                 json={
                     "model": "glm-4-flash",
                     "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 300,
+                    "max_tokens": 500,
                     "temperature": 0.1,
                 },
                 headers={"Authorization": f"Bearer {key}"},
@@ -245,8 +245,10 @@ async def extract_hybrid(
     llm_input = conversation_text or user_text
     llm_facts = await _llm_extract(llm_input)
 
-    # Merge: regex first (higher trust for exact matches), then LLM additions
-    merged = regex_facts + llm_facts
+    # Merge: LLM first (atomized, richer metadata), then regex additions
+    # LLM facts are self-contained with coreference resolution;
+    # regex facts are raw snippets kept only if LLM missed them
+    merged = llm_facts + regex_facts
     deduped = _dedup(merged)
 
     log.info(f"[extractor] regex={len(regex_facts)} llm={len(llm_facts)} "
