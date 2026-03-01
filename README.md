@@ -120,12 +120,34 @@ Two-layer extraction runs on every `/store` call (async, non-blocking):
 
 | Layer | Method | Latency | Catches |
 |-------|--------|---------|---------|
-| **Regex** | 9 compiled patterns | ~1ms | English first-person: "My name is...", "I prefer..." |
-| **LLM** | GLM-4-flash (ZAI) | ~200-500ms | Chinese, implicit, contextual, decisions, third-person |
+| **LLM** | GLM-4-flash (ZAI) | ~1-5s | Chinese, implicit, contextual, decisions, third-person. **Atomized output.** |
+| **Regex** | 9 compiled patterns | ~1ms | English first-person: "My name is...", "I prefer..." (fallback) |
 
 Categories: `identity`, `work`, `preference`, `location`, `personal`, `reminder`, `rule`, `decision`, `context`, `credential`
 
-LLM extraction skips `credential` for safety. Results are merged and deduped (substring match) before embedding and storing.
+LLM-extracted facts take priority over regex (atomized > raw snippets). LLM extraction skips `credential` for safety. Results are merged and deduped (substring match) before embedding and storing.
+
+## Benchmark (v0.4.0)
+
+Tested with 61 episodes + 23 facts on Apple M4 Pro / Redis 8 / MiniLM-L12 on MPS:
+
+| Metric | Result |
+|--------|--------|
+| Recall P50 (warm) | **1.7ms** |
+| Recall P90 (warm) | **2.0ms** |
+| Recall cold | **46ms** |
+| Embedding cache speedup | **20x** |
+| Store (queue) | instant (async) |
+| Consolidation (no merges) | **3ms** |
+| Consolidation (with merges) | **~1.2s** |
+
+Adaptive depth verified:
+
+| Query complexity | Facts retrieved | Episodes |
+|-----------------|----------------|----------|
+| Trivial (`"name"`) | 3 | 6 |
+| Simple (`"coding preference"`) | 3 | 6 |
+| Complex (`"compare all APIs, tools..."`) | 5 | 8 |
 
 ## Setup
 
@@ -223,11 +245,11 @@ Returns `{ "merged": N, "removed": N, "total_before": N, "total_after": N, "ms":
 
 | Operation | P50 | P95 |
 |-----------|-----|-----|
-| Recall (cache hit) | ~8ms | ~15ms |
-| Recall (cold) | ~70ms | ~100ms |
+| Recall (cache hit) | ~2ms | ~3ms |
+| Recall (cold) | ~46ms | ~100ms |
 | Store (async, regex-only) | non-blocking | non-blocking |
-| Store (async, hybrid) | non-blocking (~1.2s background) | non-blocking |
-| Consolidate (sync) | ~1-3s | ~5s |
+| Store (async, hybrid) | non-blocking (~5s background) | non-blocking |
+| Consolidate (sync) | ~3ms (no merges) | ~1.2s (with merges) |
 
 ## Research Basis
 
