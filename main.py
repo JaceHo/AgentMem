@@ -526,3 +526,35 @@ async def consolidate_sync():
     """Synchronous consolidation — returns results immediately."""
     result = await _do_consolidate()
     return result
+
+
+@app.post("/admin/delete-facts-by-content")
+async def admin_delete_facts_by_content(pattern: str = "Always send a report"):
+    """Delete facts whose content contains the given pattern (admin only)."""
+    card = await _redis.execute_command("VCARD", mem_store.FACT_KEY)
+    if not card or int(card) <= 1:
+        return {"deleted": 0, "message": "no facts to scan"}
+
+    seed = np.zeros(mem_store.DIMS, dtype=np.float32)
+    results = await _redis.execute_command(
+        "VSIM", mem_store.FACT_KEY, "FP32", seed.tobytes(),
+        "COUNT", min(int(card), 500), "WITHSCORES", "WITHATTRIBS"
+    )
+    deleted = 0
+    i = 0
+    while i + 2 < len(results):
+        elem = results[i]
+        raw = results[i + 2]
+        i += 3
+        elem_str = elem.decode() if isinstance(elem, bytes) else elem
+        if elem_str == "__seed__":
+            continue
+        try:
+            attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+        except Exception:
+            continue
+        content = attrs.get("content", "")
+        if pattern.lower() in content.lower():
+            await _redis.execute_command("VREM", mem_store.FACT_KEY, elem_str)
+            deleted += 1
+    return {"deleted": deleted, "pattern": pattern}
