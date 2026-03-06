@@ -27,6 +27,7 @@ SESSIONS_DIR = Path.home() / ".openclaw" / "agents" / "main" / "sessions"
 SESSIONS_JSON = SESSIONS_DIR / "sessions.json"
 THRESHOLD_KB = 200          # compact if session > this size
 KEEP_LAST_N_TURNS = 30      # keep this many user+assistant pairs
+HARD_LIMIT_KB = 300         # force-compact even if pairs < KEEP_LAST_N_TURNS (tool-heavy sessions)
 NON_MESSAGE_TYPES = {"session", "model_change", "thinking_level_change", "tool_change"}
 
 
@@ -84,11 +85,20 @@ def compact_session(session_path: Path, dry_run: bool = False) -> dict:
         pairs.append([pending])
 
     total_pairs = len(pairs)
-    if total_pairs <= KEEP_LAST_N_TURNS:
-        return {"skipped": True, "reason": f"only {total_pairs} pairs, under limit"}
+    if total_pairs <= 1:
+        return {"skipped": True, "reason": "only 1 pair, cannot trim"}
 
-    old_pairs = pairs[: total_pairs - KEEP_LAST_N_TURNS]
-    new_pairs = pairs[total_pairs - KEEP_LAST_N_TURNS :]
+    file_size_kb = session_path.stat().st_size // 1024
+    if total_pairs <= KEEP_LAST_N_TURNS:
+        if file_size_kb < HARD_LIMIT_KB:
+            return {"skipped": True, "reason": f"only {total_pairs} pairs, under limit"}
+        # Large file with few pairs (tool-heavy session) — keep last half
+        keep_n = max(1, total_pairs // 2)
+    else:
+        keep_n = KEEP_LAST_N_TURNS
+
+    old_pairs = pairs[: total_pairs - keep_n]
+    new_pairs = pairs[total_pairs - keep_n :]
 
     # Ship old messages to memory service so facts are preserved
     old_messages = []
@@ -112,7 +122,7 @@ def compact_session(session_path: Path, dry_run: bool = False) -> dict:
         stored = False
 
     if dry_run:
-        print(f"  [dry-run] would trim {len(old_pairs)} old pairs -> {KEEP_LAST_N_TURNS} kept, store={len(old_messages)} msgs")
+        print(f"  [dry-run] would trim {len(old_pairs)} old pairs -> {keep_n} kept, store={len(old_messages)} msgs")
         return {"dry_run": True, "old_pairs": len(old_pairs), "kept": len(new_pairs)}
 
     # Rebuild trimmed file: headers + recent messages

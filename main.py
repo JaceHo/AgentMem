@@ -58,6 +58,21 @@ def _is_injected(text: str) -> bool:
     return any(t.startswith(p) for p in _SKIP_PREFIXES)
 
 
+# ── Trivial message filter ─────────────────────────────────────────────────────
+_TRIVIAL_MIN_CHARS = 15  # user text shorter than this → skip episode store
+_TRIVIAL_PATTERNS = re.compile(
+    r"^(hi+|hello+|hey+|yo+|ok+|okay|sure|thanks?|thx|bye+|good\s*(morning|night|day)|"
+    r"好的|嗯|哦|呵|哈|谢谢|再见|早|晚安|你好|您好|ji+|test+|ping)[\s!?.。！？]*$",
+    re.IGNORECASE,
+)
+
+def _is_trivial(user_text: str) -> bool:
+    t = user_text.strip()
+    if len(t) < _TRIVIAL_MIN_CHARS:
+        return True
+    return bool(_TRIVIAL_PATTERNS.match(t))
+
+
 # ── Embedding cache ────────────────────────────────────────────────────────────
 @lru_cache(maxsize=1024)
 def _cached_encode(text: str) -> bytes:
@@ -191,6 +206,12 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
         user_text_raw = " ".join(_msg_text(m) for m in clean if m.role == "user")
         if not user_text_raw:
             return
+
+        # 2b. Skip trivial exchanges (greetings, single words) — prevents feedback loops
+        if _is_trivial(user_text_raw):
+            log.info(f"[store] skipped trivial exchange: {user_text_raw[:40]!r}")
+            return
+
         sc = scene_mod.detect(user_text_raw)
         lang, domain = sc["language"], sc["domain"]
 
