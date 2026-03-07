@@ -165,30 +165,51 @@ EOF
 
 ---
 
-## Bootstrap from OpenClaw Chat History
+## Bootstrap from Existing Chat Histories
 
-Already have hundreds of OpenClaw sessions? Ingest them all into AgentMem in one shot:
+### Claude Code — All Projects
+
+Ingest all past Claude Code sessions across every project directory:
 
 ```bash
+# List all projects and session counts
+python3 digest-claudecode.py --list-projects
+
 # Dry run — see what would be ingested without touching Redis
+python3 digest-claudecode.py --dry-run
+
+# Ingest all sessions from all projects (incremental)
+python3 digest-claudecode.py
+
+# Only ingest sessions from one project
+python3 digest-claudecode.py --project healthlens
+
+# Force re-ingest everything
+python3 digest-claudecode.py --reset
+```
+
+`digest-claudecode.py` handles Claude Code's richer JSONL format:
+- Skips `toolUseResult` user events (tool call outputs — bash/file noise, not user intent)
+- Extracts only `type=text` assistant blocks (skips `tool_use`, `thinking` blocks)
+- Strips injected `<cross_session_memory>` blocks to avoid circular echo
+- Namespaces session IDs as `claudecode:{project-slug}:{session-uuid}`
+- State tracked in `.digest-claudecode-state.json` — reruns are incremental
+
+### OpenClaw Chat History
+
+```bash
+# Dry run
 python3 digest-openclaw.py --dry-run
 
-# Ingest all sessions (incremental — skips already-processed sessions)
+# Ingest all sessions (incremental)
 python3 digest-openclaw.py
 
 # Force re-ingest everything
 python3 digest-openclaw.py --reset
 
-# Custom sessions directory or API URL
-python3 digest-openclaw.py --sessions-dir ~/.openclaw/agents/main/sessions --api http://localhost:18800
+# Custom sessions directory
+python3 digest-openclaw.py --sessions-dir ~/.openclaw/agents/main/sessions
 ```
-
-The script:
-- Parses OpenClaw's JSONL session format (`message` events → `{role, content}` pairs)
-- Strips injected `<cross_session_memory>` blocks to avoid circular echo ingestion
-- Skips trivial sessions (< 2 turns by default, configurable with `--min-turns`)
-- Tracks processed sessions in `.digest-state.json` — reruns are incremental
-- Rate-limits at 200ms between `/store` calls to avoid overwhelming Redis
 
 After ingestion, run consolidation to merge semantically duplicate facts:
 ```bash
