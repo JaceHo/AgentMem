@@ -280,21 +280,55 @@ def token_f1(prediction: str, ground_truth: str) -> float:
     return 2 * precision * recall / (precision + recall)
 
 
-def context_f1(context: str, ground_truth: str) -> float:
-    """Max token F1 across any 20-word sliding window in the context.
+_WRAPPER_RE = re.compile(
+    r"<cross_session_memory>.*?(?=##|\Z)",
+    re.DOTALL,
+)
 
-    This simulates: 'given ideal LLM extraction, what's the best F1
-    achievable from this context?' — measuring retrieval quality cleanly.
+
+def _strip_memory_wrapper(context: str) -> str:
+    """Strip the <cross_session_memory> boilerplate header from recalled context.
+
+    The wrapper contains usage instructions that pad the token count without
+    carrying factual signal. We keep everything from the first ## section header
+    onwards (## User Profile, ## Current Session Context, etc.).
     """
+    if not context:
+        return context
+    # Find first section header after the XML open tag
+    m = re.search(r"(##\s+\w)", context)
+    if m:
+        # Keep from first section header; strip closing XML tag
+        content = context[m.start():]
+        content = re.sub(r"</cross_session_memory>", "", content).strip()
+        return content
+    # No section headers: strip just the XML tags and boilerplate preamble
+    context = re.sub(r"</?cross_session_memory>", "", context)
+    context = re.sub(
+        r"The following is relevant context.*?verbatim\.\s*",
+        "",
+        context,
+        flags=re.DOTALL,
+    )
+    return context.strip()
+
+
+def context_f1(context: str, ground_truth: str) -> float:
+    """Max token F1 across any 10-word sliding window in the context.
+
+    Boilerplate wrapper is stripped first so only factual content is scored.
+    Uses 10-word window (LoCoMo-style: concise answers need tight windows).
+    """
+    context = _strip_memory_wrapper(context)
     if not context.strip():
         return 0.0
     words = context.split()
-    window = 20
+    window = 10
     best = 0.0
     for i in range(len(words)):
         chunk = " ".join(words[i : i + window])
         best = max(best, token_f1(chunk, ground_truth))
-    # Also try full context if short
+    # Also try full (de-wrapped) context if it's short
     best = max(best, token_f1(context, ground_truth))
     return best
 
@@ -314,9 +348,30 @@ def _post(url: str, payload: dict, timeout: int = 10) -> dict:
 
 
 def store_session(api: str, session_id: str, turns: list[tuple]) -> bool:
-    messages = [{"role": r, "content": c} for r, c in turns]
-    result = _post(f"{api}/store", {"messages": messages, "session_id": session_id})
-    return "error" not in result
+    """Store a conversation turn-by-turn to match production AgentMem behavior.
+
+    Production hooks call /store after every new turn. Sending all turns at once
+    causes _do_store's clean[-4:] window to drop all but the last 2 messages.
+    We simulate real-time ingestion by submitting cumulative context per pair:
+      call 1: turns[0:2]   (first user+assistant pair)
+      call 2: turns[0:4]   (both pairs so far, window grabs last pair)
+      ...
+    This ensures every turn pair is processed by the fact extractor.
+    """
+    ok = True
+    pairs = list(range(0, len(turns), 2))
+    for i in pairs:
+        cumulative = turns[:i + 2]  # all turns up to and including this pair
+        messages = [{"role": r, "content": c} for r, c in cumulative]
+        result = _post(
+            f"{api}/store",
+            {"messages": messages, "session_id": session_id},
+            timeout=15,
+        )
+        if "error" in result:
+            ok = False
+        time.sleep(0.25)  # 250ms rate limit between calls
+    return ok
 
 
 def recall_context(api: str, query: str, session_id: str) -> str:
@@ -455,13 +510,15 @@ def run_benchmark(quick: bool, verbose: bool, no_store: bool) -> None:
         flush_bench_db(BENCH_API)
         print("done.")
 
-        print(f"Phase 2 — Storing {len(conversations)} conversations…")
+        total_pairs = sum(len(c["turns"]) // 2 for c in conversations)
+        print(f"Phase 2 — Storing {len(conversations)} conversations ({total_pairs} turn pairs)…")
         for conv in conversations:
+            n_pairs = len(conv["turns"]) // 2
             ok = store_session(BENCH_API, conv["session_id"], conv["turns"])
             status = "ok" if ok else "FAIL"
-            print(f"  {conv['session_id']}  [{status}]")
+            print(f"  {conv['session_id']}  {n_pairs} pairs  [{status}]")
 
-        wait_for_processing(BENCH_API, seconds=10)
+        wait_for_processing(BENCH_API, seconds=45)
     else:
         print("Skipping store phase (--no-store).")
 
@@ -582,8 +639,8 @@ def run_benchmark(quick: bool, verbose: bool, no_store: bool) -> None:
     print(f"\n  Metrics explained:")
     print(f"  • Answer-in-Context (AIC): % of questions where the answer text")
     print(f"    appears in recalled context — primary retrieval quality metric.")
-    print(f"  • Context-F1: max token F1 over 20-word sliding window — same")
-    print(f"    formula as LoCoMo/SQuAD (measures retrieval signal density).")
+    print(f"  • Context-F1: max token F1 over 10-word sliding window (wrapper")
+    print(f"    stripped) — measures fact density in recalled context.")
     print(f"  • Published LoCoMo F1 uses LLM extraction on top of retrieval.")
     print("═" * 65 + "\n")
 
