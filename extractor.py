@@ -49,6 +49,7 @@ class ExtractedFact:
 # ── Layer 1: Regex patterns (fast, ~1ms) ──────────────────────────────────────
 
 _PATTERNS = [
+    # ── English patterns ──────────────────────────────────────────────────────
     # Identity
     (re.compile(r"(?:my name is|I am|I'm)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)", re.I), "identity"),
     # Work / profession — covers "I work at X", "I work as X", "I'm a/an X", "I'm an X at Y"
@@ -91,6 +92,35 @@ _PATTERNS = [
     (re.compile(r"(?:the (?:best|correct|right) way to)\s+(.+?)\s+is\s+(?:to\s+)?(.+?)(?:\.|$)", re.I), "procedure"),
     (re.compile(r"(?:workflow|steps?|process) (?:for|to)\s+(.+?):\s*(.+?)(?:\.|$)", re.I),        "procedure"),
     (re.compile(r"(?:always|when)\s+(.+?),\s+(?:use|run|call|execute)\s+(.+?)(?:\.|,|$)", re.I),  "procedure"),
+
+    # ── Chinese / CJK patterns ────────────────────────────────────────────────
+    # Chinese has NO spaces between words — patterns use Chinese punctuation
+    # (。，！？；：) and end-of-string as delimiters instead of \s+.
+    # CJK range: \u4e00-\u9fff (CJK Unified Ideographs)
+
+    # Identity: 我叫X / 我是X / 我的名字是X
+    (re.compile(r"(?:我叫|我的名字是)\s*(.{1,20}?)(?:[，。！\n]|$)"),             "identity"),
+    # Work: 我在X工作 / 我在X上班 / 我是X（职位）
+    (re.compile(r"我在([^\s，。！？]{2,30}?)(?:工作|上班)(?:[，。！\n]|$)"),      "work"),
+    (re.compile(r"我(?:是|做)(?:一名|一个)?\s*([^\s，。！？]{2,20}?)(?:[，。！\n]|$)"), "work"),
+    (re.compile(r"我的(?:工作|职位|职业|岗位)是\s*(.{1,30}?)(?:[，。！\n]|$)"),  "work"),
+    # Location: 我住在X / 我在X住 / 我来自X / 我现在在X
+    (re.compile(r"我(?:住在|居住在|定居在|在.{0,3}住|来自|生活在)\s*(.{1,30}?)(?:[，。！\n]|$)"), "location"),
+    (re.compile(r"我(?:现在|目前)在\s*(.{1,20}?)(?:[，。！\n]|$)"),              "location"),
+    # Education: 我在X读书 / 我毕业于X / 我的学校是X
+    (re.compile(r"我(?:在|毕业于|就读于|读书于)\s*(.{2,30}?)(?:读书|学习|毕业)?(?:[，。！\n]|$)"), "personal"),
+    (re.compile(r"我的学校(?:是|叫)\s*(.{2,30}?)(?:[，。！\n]|$)"),             "personal"),
+    # Duration: 我已经X了Y年/月
+    (re.compile(r"我(?:已经|已)?(.{2,20}?)[了]?\s*(\d+\s*(?:年|个月|周))(?:[，。！\n]|$)"), "personal"),
+    # Preferences: 我喜欢X / 我不喜欢X / 我偏好X
+    (re.compile(r"我(?:喜欢|热爱|爱好|偏好|不喜欢|讨厌)\s*(.{1,40}?)(?:[，。！\n]|$)"), "preference"),
+    # Named relations: 我的X(关系词)叫Y / 我的朋友X
+    (re.compile(r"我的(?:伴侣|妻子|丈夫|老婆|老公|姐姐|妹妹|哥哥|弟弟|朋友|同事|邻居)\s*(.{1,10}?)(?:[，。！是叫\n]|$)"), "personal"),
+    # Reminders / rules (Chinese): 记住X / 注意X / 重要：X
+    (re.compile(r"(?:记住|注意|重要)[：:]\s*(.{1,100}?)(?:[。！\n]|$)"),          "reminder"),
+    (re.compile(r"(?:总是|始终|永远|绝对不|从不)\s*(.{1,60}?)(?:[，。！\n]|$)"),  "rule"),
+    # Deadline: X截止日期是Y / Y之前完成X
+    (re.compile(r"(?:截止|截止日期|deadline)[是为：:]\s*(.{1,30}?)(?:[，。！\n]|$)"), "deadline"),
 ]
 
 

@@ -22,10 +22,15 @@ GRAPH_PREFIX = "mem:graph:"
 
 
 def _slug(entity: str) -> str:
-    """Normalise an entity name to a stable Redis key segment."""
+    """Normalise an entity name to a stable Redis key segment.
+
+    Preserves CJK characters (U+4E00–U+9FFF) which were previously stripped
+    by [^\w] since \w does not include Unicode CJK in Python's default ASCII mode.
+    """
     s = entity.lower().strip()
     s = re.sub(r"\s+", "_", s)
-    s = re.sub(r"[^\w]", "", s)
+    # Keep ASCII word chars, CJK unified ideographs, and underscores
+    s = re.sub(r"[^\w\u4e00-\u9fff\u3400-\u4dbf\u20000-\u2a6df]", "", s)
     return s
 
 
