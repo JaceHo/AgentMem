@@ -835,11 +835,11 @@ async def answer(req: AnswerRequest):
         f'Return JSON: {{"answer": "<exact phrase from context>"}}'
     )
     try:
-        async with httpx.AsyncClient(timeout=12.0) as client:
+        async with httpx.AsyncClient(timeout=8.0) as client:
             resp = await client.post(
                 ZAI_URL,
                 json={
-                    "model": "glm-4-plus",
+                    "model": "glm-4-flash",
                     "messages": [
                         {"role": "system", "content": "You are a precise question-answering assistant. Extract the exact answer phrase from the provided context. Output valid JSON only."},
                         {"role": "user",   "content": prompt},
