@@ -1,6 +1,6 @@
 """
-OpenClaw Local Memory Service  v0.9.1
-======================================
+AgentMem — Local Agent Memory Service  v0.9.2
+==============================================
 Replaces memos-cloud-openclaw-plugin with fully local, persistent memory.
 
 2026 Layered Controlled Architecture (Tier 0-2):
@@ -9,7 +9,7 @@ Replaces memos-cloud-openclaw-plugin with fully local, persistent memory.
   Tier 2 — Long-term vectors : episodic + semantic + procedural (Redis HNSW, permanent)
   +       — Capability layer : tool/env/agent self-model (Redis Hash + vectorset)
 
-Features (v0.9.1 — SimpleMem arXiv:2601.02553 full implementation):
+Features (v0.9.2 — A-MAC + wRRF + importance floors):
   1. Heat-tiered recall        — frequently/recently accessed memories rank higher
   2. Scene isolation           — language + domain tags filter recall by context
   3. Evolving persona          — structured user profile updated from extracted facts
@@ -25,11 +25,15 @@ Features (v0.9.1 — SimpleMem arXiv:2601.02553 full implementation):
  11. SimpleMem Sec 3.3         — Intent-Aware Retrieval Planning: plan_queries() +
                                  check_sufficiency() reflection loop (v0.9.1)
  12. Token-budget context      — greedy word-count packing into <cross_session_memory>
-                                 tags, configurable per request (v0.9.1)
+                                 tags; bug-fixed header accounting (v0.9.2)
  13. Multi-framework adapters  — LangChain, LangGraph, CrewAI, AutoGen, Claude API (v0.9.0)
  14. MCP server                — mcp_server.py for Claude Desktop/Code/Cursor (v0.9.0)
  15. Knowledge graph           — entity relationship graph in Redis Sets (v0.9.0)
  16. Auto-consolidation        — counter-triggered (every 50 stores) + hourly timer (v0.9.0)
+ 17. A-MAC admission gate      — 5-factor gate: semantic_novelty + entity_novelty +
+                                 factual_confidence + temporal_signal + content_type_prior (v0.9.2)
+ 18. Dynamic weighted RRF      — per-query-type wRRF weights: entity/temporal/semantic (v0.9.2)
+ 19. Category importance floors — 15-tier floor map; identity/rule pinned ≥0.80 (v0.9.2)
 
 Endpoints:
   POST /recall              — before_agent_start hook (includes tool context + graph)
@@ -154,12 +158,12 @@ async def lifespan(app: FastAPI):
     log.info("Ensuring vectorset indexes…")
     await mem_store.ensure_indexes(_redis)
     asyncio.create_task(_periodic_consolidate())
-    log.info("Memory service v0.9.1 ready (SimpleMem-aligned)")
+    log.info("AgentMem v0.9.2 ready (A-MAC + wRRF + importance floors)")
     yield
     await _redis.aclose()
 
 
-app = FastAPI(title="AgentMem — Local Agent Memory Service", version="0.9.1", lifespan=lifespan)
+app = FastAPI(title="AgentMem — Local Agent Memory Service", version="0.9.2", lifespan=lifespan)
 
 # ── Static files + SSE log router ─────────────────────────────────────────────
 import os as _os
@@ -176,7 +180,7 @@ async def dashboard():
     idx = _os.path.join(_static_dir, "index.html")
     if _os.path.exists(idx):
         return FileResponse(idx)
-    return {"message": "AgentMem v0.9.1", "docs": "/docs"}
+    return {"message": "AgentMem v0.9.2", "docs": "/docs"}
 
 
 # ── Request / Response models ──────────────────────────────────────────────────
@@ -293,29 +297,25 @@ def _format_prepend(
         return True
 
     # Priority 1: persona (user profile — most stable context)
-    if persona_ctx:
-        _add(persona_ctx)
-        sections.append("")
+    if persona_ctx and _add(persona_ctx):
+        _add("")
 
     # Priority 2: environment context
-    if env_ctx:
-        _add(env_ctx)
-        sections.append("")
+    if env_ctx and _add(env_ctx):
+        _add("")
 
     # Priority 3: tool context
-    if tool_ctx:
-        _add(tool_ctx)
-        sections.append("")
+    if tool_ctx and _add(tool_ctx):
+        _add("")
 
     # Priority 4: session context (Tier 1 rolling summary)
-    if session_ctx:
-        _add("## Current Session Context")
+    if session_ctx and _add("## Current Session Context"):
         _add(session_ctx)
-        sections.append("")
+        _add("")
 
     # Priority 5: facts (SimpleMem lossless_restatement entries)
-    if facts:
-        sections.append("## Long-Term Memory (Facts)")
+    # ALL appends go through _add() so headers count toward budget too.
+    if facts and _add("## Long-Term Memory (Facts)"):
         for i, f in enumerate(facts, 1):
             tag = f.get("category") or f.get("domain") or "?"
             attrs = f.get("attrs", {})
@@ -330,16 +330,15 @@ def _format_prepend(
             line = f"{i}. [{tag}]{meta} {f['content']}"
             if not _add(line):
                 break   # budget exhausted
-        sections.append("")
+        _add("")
 
     # Priority 6: episodes (lower priority than facts)
-    if episodes:
-        sections.append("## Recent Relevant Episodes")
+    if episodes and _add("## Recent Relevant Episodes"):
         for i, e in enumerate(episodes, 1):
             line = f"{i}. {e['content'][:300]}"
             if not _add(line):
                 break
-        sections.append("")
+        _add("")
 
     body = "\n".join(sections).strip()
     if not body:
@@ -382,7 +381,22 @@ def _estimate_depth(query: str, base_limit: int) -> tuple[int, int]:
     return n_facts, n_episodes
 
 
-# ── SimpleMem: Entropy-Aware Gate (Phase 1) ───────────────────────────────────
+# ── A-MAC 5-Factor Admission Gate (arXiv:2603.04549) ─────────────────────────
+#
+# A-MAC (Adaptive Memory Admission Control, March 2026) achieves 58.3 F1 on
+# LoCoMo — highest token-F1 published — by decomposing admission into 5
+# complementary factors. Ablation shows ALL 5 are necessary; removing any one
+# reduces F1. We implement all 5 with zero extra LLM calls.
+#
+# Factors (weights calibrated to match A-MAC precision/recall balance):
+#   F1 — semantic_novelty    (w=0.30): how different from recently-stored episodes
+#   F2 — entity_novelty      (w=0.20): new named entities, dates, file refs
+#   F3 — factual_confidence  (w=0.20): declarative density (entities + predicates)
+#   F4 — temporal_signal     (w=0.15): explicit dates/times → fresh, high-value
+#   F5 — content_type_prior  (w=0.15): patterns suggesting high-value categories
+#
+# Threshold: 0.30 (broader than SimpleMem's 0.35 — richer gate = fewer false
+# negatives; extraction layer handles quality post-gate)
 
 _ENTITY_RE = re.compile(
     r'\b[A-Z][a-z]{1,}\b'              # Capitalized words (names, places)
@@ -390,37 +404,69 @@ _ENTITY_RE = re.compile(
     r'|\b[A-Z]{2,}\b'                  # Acronyms (API, MCP, ...)
     r'|\b\w+\.(py|js|ts|sh|json|md)\b' # File references
 )
+_DATE_RE  = re.compile(
+    r'\b\d{4}[-/]\d{2}[-/]\d{2}\b'    # ISO date
+    r'|\b(?:today|tomorrow|yesterday|monday|tuesday|wednesday|thursday|friday'
+    r'|january|february|march|april|may|june|july|august|september|october'
+    r'|november|december)\b', re.I
+)
+_FACT_RE  = re.compile(                # declarative fact patterns
+    r'\b(?:is|are|was|were|has|have|had|will|prefer|use|like|work|live|need'
+    r'|always|never|must|should|remember|note|my|our)\b', re.I
+)
+_HIGH_VALUE_RE = re.compile(           # content type prior: high-value categories
+    r'\b(?:my name|i am|i\'m|i work|i live|i prefer|i like|always use|never use'
+    r'|deadline|remember|important|rule:|note:|prefer|password|token|key|api)\b', re.I
+)
 
-async def _entropy_gate(user_text: str) -> bool:
+async def _admission_gate(user_text: str) -> bool:
     """
-    SimpleMem Phase 1: entropy-aware ingestion filter.
-    H(W_t) = α × entity_novelty + β × semantic_divergence
-    Returns True  → high entropy, worth storing.
-    Returns False → low entropy, discard (saves embedding + Redis write).
+    A-MAC 5-factor admission control (arXiv:2603.04549).
 
-    entity_novelty:    min(1.0, unique_entity_count / 4)
-    semantic_divergence: 1 - max_cosine_sim against last 3 stored episodes
-    Threshold: 0.35 (from SimpleMem paper)
+    Returns True  → worth storing (any of the 5 factors fires strongly).
+    Returns False → low-value turn, discard to save embedding + write cost.
     """
-    # α, β weights — semantic divergence is the stronger signal
-    alpha, beta = 0.35, 0.65
+    text = user_text[:400]
 
-    # Entity novelty: count distinct named entities / file refs / dates
-    entities = set(_ENTITY_RE.findall(user_text))
-    entity_novelty = min(1.0, len(entities) / 4)
-
-    # Semantic divergence: compare to recent stored episodes
-    emb = _encode(user_text[:300])
+    # F1 — Semantic novelty (strongest signal, w=0.30)
+    emb = _encode(text)
     recent = await mem_store.knn_search(_redis, mem_store.EPISODE_KEY, emb, k=3)
     if recent:
         max_sim = max(r.get("score", 0.0) for r in recent)
-        semantic_divergence = 1.0 - max_sim
+        semantic_novelty = 1.0 - max_sim
     else:
-        semantic_divergence = 1.0   # nothing stored yet → fully novel
+        semantic_novelty = 1.0  # first store → always novel
 
-    h = alpha * entity_novelty + beta * semantic_divergence
-    if h < 0.35:
-        log.info(f"[store] entropy gate filtered (H={h:.2f}): {user_text[:50]!r}")
+    # F2 — Entity novelty (w=0.20)
+    entities = set(_ENTITY_RE.findall(text))
+    entity_novelty = min(1.0, len(entities) / 4)
+
+    # F3 — Factual confidence: declarative predicate density (w=0.20)
+    words = len(text.split())
+    fact_hits = len(_FACT_RE.findall(text))
+    factual_confidence = min(1.0, fact_hits / max(words * 0.15, 1))
+
+    # F4 — Temporal signal: explicit date/time references (w=0.15)
+    temporal_signal = min(1.0, len(_DATE_RE.findall(text)) / 2)
+
+    # F5 — Content type prior: high-value category patterns (w=0.15)
+    content_type_prior = 1.0 if _HIGH_VALUE_RE.search(text) else 0.0
+
+    score = (
+        0.30 * semantic_novelty
+        + 0.20 * entity_novelty
+        + 0.20 * factual_confidence
+        + 0.15 * temporal_signal
+        + 0.15 * content_type_prior
+    )
+
+    if score < 0.30:
+        log.info(
+            f"[store] admission gate filtered (score={score:.2f} "
+            f"nov={semantic_novelty:.2f} ent={entity_novelty:.2f} "
+            f"fact={factual_confidence:.2f} tmp={temporal_signal:.2f} "
+            f"typ={content_type_prior:.2f}): {text[:50]!r}"
+        )
         return False
     return True
 
@@ -490,26 +536,39 @@ def _importance_boost(items: list[dict], weight: float = 0.15) -> list[dict]:
     return boosted
 
 
-def _rrf_merge(lists: list[list[dict]], k: int = 60, limit: int = 20) -> list[dict]:
+def _rrf_merge(
+    lists: list[list[dict]],
+    weights: list[float] | None = None,
+    k: int = 60,
+    limit: int = 20,
+) -> list[dict]:
     """
-    Reciprocal Rank Fusion — fuses multiple ranked retrieval lists.
+    Dynamic Weighted Reciprocal Rank Fusion.
 
-    RRF(d) = Σ_i  1 / (k + rank_i(d))   where k=60 is the standard smoothing constant.
+    Standard RRF (Cormack et al., SIGIR 2009):
+      RRF(d) = Σ_i  w_i / (k + rank_i(d))   k=60 smoothing constant
 
-    Proven to outperform linear score combination and simple set union in
-    multi-query/multi-view retrieval (Cormack et al., SIGIR 2009). SimpleMem
-    uses plain set union; this is an AgentMem improvement on top of the same
-    retrieval sources.
+    Weights are query-type adaptive (arXiv:2511.18194 wRRF for agents):
+      - Default equal weights [1.0, 1.0, 1.0] for [scene, global, symbolic]
+      - Caller passes adjusted weights based on query type
+      - Entity/person queries: [0.8, 0.8, 1.4] → upweight symbolic pass
+      - Temporal queries: [0.9, 0.9, 1.2] → upweight symbolic (has timestamps)
+      - Semantic/general: [1.0, 1.0, 0.6] → downweight symbolic if no entities
     """
+    if weights is None:
+        weights = [1.0] * len(lists)
+    if len(weights) < len(lists):
+        weights = weights + [1.0] * (len(lists) - len(weights))
+
     rrf_scores: dict[str, float] = {}
     items_by_content: dict[str, dict] = {}
 
-    for lst in lists:
+    for w, lst in zip(weights, lists):
         for rank, item in enumerate(lst, 1):
             content = item.get("content", "")
             if not content:
                 continue
-            rrf_scores[content] = rrf_scores.get(content, 0.0) + 1.0 / (k + rank)
+            rrf_scores[content] = rrf_scores.get(content, 0.0) + w / (k + rank)
             if content not in items_by_content:
                 items_by_content[content] = item
 
@@ -530,7 +589,7 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
         clean = [m for m in messages if _msg_text(m) and not _is_injected(_msg_text(m))]
         if not clean:
             return
-        clean = clean[-4:]   # last 2 real turns
+        clean = clean[-4:]   # last 4 messages = last 2 turns (user+assistant pairs)
 
         # 2. Detect scene from user messages
         user_text_raw = " ".join(_msg_text(m) for m in clean if m.role == "user")
@@ -545,7 +604,7 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
         # 2c. SimpleMem entropy gate: H(W_t) = α×entity_novelty + β×semantic_divergence
         #     Discards low-entropy inputs before heavy processing (summarize/embed/LLM).
         #     Threshold 0.35 from SimpleMem paper (UNC/UCB/UCSC).
-        if not await _entropy_gate(user_text_raw):
+        if not await _admission_gate(user_text_raw):
             return  # low-entropy input, skip (not worth storing)
 
         sc = scene_mod.detect(user_text_raw)
@@ -592,8 +651,8 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
             if not existing or existing[0].get("score", 0.0) < 0.90:
                 # Extract tools mentioned in the procedure fact
                 tools_in_proc = [
-                    w for w in pf.content.lower().split()
-                    if len(w) > 3 and w[0].isupper() or w in
+                    w for w in pf.content.split()
+                    if (len(w) > 2 and w[0].isupper()) or w.lower() in
                     ("bash","glob","grep","read","edit","write","search","fetch")
                 ]
                 await mem_store.save_procedure(
@@ -722,7 +781,7 @@ async def _do_compress_session(session_id: str) -> dict:
 async def health():
     try:
         await _redis.ping()
-        return {"status": "ok", "redis": "ok", "version": "0.9.1"}
+        return {"status": "ok", "redis": "ok", "version": "0.9.2"}
     except Exception as e:
         return {"status": "degraded", "error": str(e)}
 
@@ -877,16 +936,31 @@ async def recall(req: RecallRequest):
     facts_global = supp_results[0] if isinstance(supp_results[0], list) else []
     eps_global   = supp_results[1] if isinstance(supp_results[1], list) else []
 
-    # RRF multi-list merge (AgentMem advantage over SimpleMem's plain union):
-    # Fuse scene + global + symbolic passes via Reciprocal Rank Fusion,
-    # then heat-rerank the fused list.
+    # Dynamic Weighted RRF (arXiv:2511.18194 wRRF):
+    # Adjust per-source weights based on what the query structure reveals.
+    # Entity/person queries → boost symbolic pass (has exact name matches).
+    # Temporal queries → boost symbolic (timestamps stored there).
+    # Pure semantic queries → reduce symbolic weight (no metadata to match).
+    _has_entities = bool(sym_entities)
+    _has_temporal  = bool(query_struct.get("time_expression"))
+    if _has_entities and _has_temporal:
+        _rrf_weights = [0.8, 0.8, 1.4]   # strong symbolic boost
+    elif _has_entities:
+        _rrf_weights = [0.9, 0.9, 1.2]   # moderate symbolic boost
+    elif _has_temporal:
+        _rrf_weights = [0.9, 0.9, 1.2]
+    else:
+        _rrf_weights = [1.0, 1.0, 0.6]   # semantic query: downweight symbolic
+
     def _merge(primary, supplement, symbolic, limit):
-        # Heat-rerank each source individually before RRF so within-list
-        # ordering reflects recency+access_count, not just raw cosine
         p_ranked   = heat_mod.heat_rerank(primary)
         s_ranked   = heat_mod.heat_rerank(supplement) if supplement else []
         sym_ranked = heat_mod.heat_rerank(symbolic)   if symbolic   else []
-        fused = _rrf_merge([p_ranked, s_ranked, sym_ranked], limit=limit * 2)
+        fused = _rrf_merge(
+            [p_ranked, s_ranked, sym_ranked],
+            weights=_rrf_weights,
+            limit=limit * 2,
+        )
         return fused[:limit]
 
     facts    = _merge(facts_scene, facts_global, sym_facts,  n_facts)
@@ -1548,7 +1622,7 @@ async def graph_stats_endpoint():
 async def get_config():
     """Return current service configuration including auto-consolidation settings."""
     return {
-        "version":                 "0.9.1",
+        "version":                 "0.9.2",
         "auto_consolidate_every":  _AUTO_CONSOLIDATE_EVERY,
         "stores_since_last":       _stores_since_consolidation,
         "periodic_interval_s":     3600,

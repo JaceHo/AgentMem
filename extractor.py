@@ -264,6 +264,30 @@ async def _llm_extract(conversation_text: str) -> list[ExtractedFact]:
                     importance = float(item.get("importance", 0.5))
                     importance = max(0.0, min(1.0, importance))
 
+                    # A-MAC content type prior (arXiv:2603.04549):
+                    # Category-based importance floors ensure high-value facts
+                    # survive consolidation pruning. The LLM score is the ceiling;
+                    # the floor prevents systematic under-scoring of critical facts.
+                    _IMPORTANCE_FLOOR = {
+                        "identity":   0.80,
+                        "rule":       0.80,
+                        "preference": 0.75,
+                        "work":       0.65,
+                        "personal":   0.65,
+                        "reminder":   0.65,
+                        "decision":   0.60,
+                        "procedure":  0.55,
+                        "location":   0.55,
+                        "capability_gained": 0.55,
+                        "env_change": 0.50,
+                        "tool_use":   0.45,
+                        "env_context":0.40,
+                        "context":    0.35,
+                        "general":    0.30,
+                    }
+                    floor = _IMPORTANCE_FLOOR.get(category, 0.35)
+                    importance = max(importance, floor)
+
                     facts.append(ExtractedFact(
                         content=str(content).strip()[:500],
                         category=category,

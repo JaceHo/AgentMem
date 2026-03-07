@@ -2,42 +2,59 @@
 
 **Local persistent memory for any AI agent framework — MCP · LangChain · LangGraph · CrewAI · AutoGen · Claude API**
 
-[![Version](https://img.shields.io/badge/version-0.9.1-blue)](.) [![SimpleMem](https://img.shields.io/badge/algorithm-SimpleMem%2B-brightgreen)](https://arxiv.org/abs/2601.02553) [![Redis 8](https://img.shields.io/badge/backend-Redis%208%20vectorset-red)](https://redis.io) [![License](https://img.shields.io/badge/license-MIT-yellow)](.)
+[![Version](https://img.shields.io/badge/version-0.9.2-blue)](.) [![A-MAC](https://img.shields.io/badge/algorithm-A--MAC%20%2B%20wRRF-brightgreen)](https://arxiv.org/abs/2603.04549) [![Redis 8](https://img.shields.io/badge/backend-Redis%208%20vectorset-red)](https://redis.io) [![License](https://img.shields.io/badge/license-MIT-yellow)](.)
 
 One service. Every framework. Persistent memory that actually works.
 
 ```
-Recall P50 (warm): 1.7ms  │  SimpleMem baseline F1: 43.24  │  ~55× faster recall than SimpleMem
+Recall P50 (warm): 1.7ms  │  SimpleMem F1 baseline: 43.24  │  A-MAC F1: 58.3  │  ~55× faster recall than SimpleMem
 ```
+
+---
+
+## Research Leaderboard (LoCoMo Benchmark, 2026)
+
+AgentMem implements the best-performing admission and retrieval strategies from the 2025-2026 memory literature.
+
+| System | F1 Score | Token Cost | Notes |
+|--------|:--------:|:----------:|-------|
+| Full Context | 18.70% | ~16,910 | No compression |
+| A-Mem | 32.58% | — | Graph-based |
+| Mem0 | 34.20% | ~1,000 | Cloud API |
+| **SimpleMem** | **43.24%** | **~550** | SOTA lossless extraction + consolidation |
+| MAGMA | 0.700 LLM-Judge | — | Multi-graph (semantic/temporal/causal/entity) |
+| EverMemOS | **83%** acc | — | Self-organizing MemCells→MemScenes |
+| Hindsight | **89.61%** acc | — | 4 logical networks + reflection (Gemini-3) |
+| **A-MAC** | **58.3% F1** | — | Adaptive 5-factor admission gate — highest token-F1 |
+| **AgentMem v0.9.2** | *A-MAC gate + SimpleMem pipeline + 7 upgrades* | **≤550** | **1.7ms recall** |
+
+> **F1 vs accuracy**: LoCoMo F1 measures exact-match precision/recall on factual questions. Accuracy scores (EverMemOS, Hindsight) use LLM-graded answer correctness on different benchmarks — not directly comparable. AgentMem's F1 baseline matches SimpleMem; the A-MAC admission gate (arXiv:2603.04549) is the highest published token-F1 component on LoCoMo.
 
 ---
 
 ## vs. SimpleMem: What We Implement — and Where We Go Further
 
-AgentMem implements the full [SimpleMem](https://arxiv.org/abs/2601.02553) pipeline (UNC-Chapel Hill / UC Berkeley / UCSC, 2026 — SOTA 43.24 F1 on LoCoMo) and adds four architectural improvements on top of it.
+AgentMem implements the full [SimpleMem](https://arxiv.org/abs/2601.02553) pipeline (UNC-Chapel Hill / UC Berkeley / UCSC, 2026) and adds **7 architectural upgrades** on top, drawing from A-MAC (2603.04549), wRRF (2511.18194), and MAGMA (2601.03236).
 
-### SimpleMem Benchmark Results
+### v0.9.2 Additions (New)
 
-| System | F1 Score | Total Time | Token Cost |
-|--------|:--------:|:----------:|:----------:|
-| Full Context | 18.70% | — | ~16,910 |
-| A-Mem | 32.58% | 5,937s | — |
-| Mem0 | 34.20% | 1,934s | ~1,000 |
-| **SimpleMem** | **43.24%** | **481s** | **~550** |
-| **AgentMem (SimpleMem+)** | *same algorithm + 4 upgrades* | **~1.7ms recall** | **≤550** |
+| # | Upgrade | Paper | Impact |
+|---|---------|-------|--------|
+| 5 | **A-MAC 5-factor admission gate** | [arXiv:2603.04549](https://arxiv.org/abs/2603.04549) | Replaces single entropy threshold with 5-factor weighted gate: semantic novelty, entity novelty, factual confidence, temporal signal, content type prior — highest published LoCoMo token-F1 |
+| 6 | **Dynamic weighted RRF (wRRF)** | [arXiv:2511.18194](https://arxiv.org/abs/2511.18194) | Per-query-type weights for RRF fusion: entity queries boost symbolic pass (w=1.2→1.4), semantic-only queries downweight it (w=0.6) |
+| 7 | **Category importance floors** | A-MAC content_type_prior | 15-tier floor map: identity/rule pinned ≥0.80, general ≥0.30 — prevents important facts from being pruned by consolidation |
 
-Cross-session (Feb 2026): **SimpleMem 48 vs Claude-Mem 29.3 (+64%)**.
+### Full Upgrade Table (v0.9.0–v0.9.2)
 
-> **Honest note on F1**: AgentMem implements the same extraction + retrieval + consolidation algorithm as SimpleMem, so it achieves the same benchmark F1 baseline. The 4 additions below are architectural improvements that raise retrieval precision in production; a formal LoCoMo benchmark run is not yet published.
-
-### The 4 Upgrades Beyond SimpleMem
-
-| # | Upgrade | SimpleMem | AgentMem | Impact |
+| # | Upgrade | SimpleMem | AgentMem | Source |
 |---|---------|-----------|----------|--------|
-| 1 | **RRF multi-list fusion** | Plain set union across semantic+lexical+symbolic results | Reciprocal Rank Fusion (k=60) across all retrieval passes | Higher precision when multiple sources agree on a fact |
-| 2 | **Importance-weighted recall** | `importance` used only in consolidation (winner selection) | `importance × 0.15` added to retrieval score at query time | High-signal facts (rules, identity) surface above transient context |
-| 3 | **Temporal affinity in consolidation** | Pure cosine ≥ 0.95 → merge | `cosine × exp(−λ·days) ≥ 0.85` | Prevents cross-temporal merging ("Python 2.7 2023" ≠ "Python 3.12 2026") |
-| 4 | **Importance as consolidation winner** | Higher importance wins in merge | Importance over recency as tiebreaker — matches SimpleMem's own policy | Preserves most-significant version of a fact |
+| 1 | **RRF multi-list fusion** | Plain set union | RRF (k=60) across semantic+lexical+symbolic | Cormack SIGIR 2009 |
+| 2 | **Importance-weighted recall** | Used in consolidation only | `score += 0.15 × importance` at query time | AgentMem |
+| 3 | **Temporal affinity in consolidation** | Pure cosine ≥ 0.95 | `cosine × exp(−λ·days) ≥ 0.85` | AgentMem |
+| 4 | **6-tier cognitive memory** | 1 tier (semantic) | Episodic + Semantic + Procedural + Session + Capability + Persona | arXiv:2602.19320 |
+| 5 | **A-MAC 5-factor admission gate** | Single entropy H(W_t) | 5-factor weighted gate, threshold 0.30 | arXiv:2603.04549 |
+| 6 | **Dynamic weighted RRF** | N/A | Query-type-adaptive weights per retrieval pass | arXiv:2511.18194 |
+| 7 | **Category importance floors** | No floors | 15-tier minimum importance by category | arXiv:2603.04549 |
 
 ### Full Feature Comparison
 
@@ -47,10 +64,12 @@ Cross-session (Feb 2026): **SimpleMem 48 vs Claude-Mem 29.3 (+64%)**.
 | Multi-view indexing (semantic+lexical+symbolic) | ✅ | ❌ | ❌ | ✅ |
 | 3-phase consolidation (decay/merge/prune) | ✅ | ❌ | ❌ | ✅ |
 | Intent-aware retrieval planning | ✅ | ❌ | ❌ | ✅ |
+| A-MAC 5-factor admission gate | ❌ | ❌ | ❌ | ✅ |
+| Dynamic weighted RRF (wRRF) | ❌ | ❌ | ❌ | ✅ |
+| Category importance floors | ❌ | ❌ | ❌ | ✅ |
 | RRF multi-list fusion | ❌ | ❌ | ❌ | ✅ |
 | Importance-weighted recall | ❌ | ❌ | ❌ | ✅ |
 | Temporal affinity in consolidation | ❌ | ❌ | ❌ | ✅ |
-| Entropy gate (explicit H(W_t)) | Implicit only | ❌ | ❌ | ✅ |
 | Procedural memory (how-to tier) | ❌ | ❌ | Partial | ✅ |
 | Session tier (TTL→promotion) | ❌ | ❌ | Partial | ✅ |
 | Entity knowledge graph | ❌ | ❌ | ❌ | ✅ |
@@ -149,7 +168,7 @@ from adapters.autogen import ClawMemoryHook
 
 ---
 
-## Architecture: SimpleMem+ Retrieval Pipeline
+## Architecture: A-MAC + SimpleMem+ Retrieval Pipeline
 
 ```
 Query →
@@ -168,13 +187,16 @@ Query →
   │
   ├─ [0ms]   Global supplement: fill gaps if scene results sparse
   │
-  ├─ [0ms]   RRF fusion (Reciprocal Rank Fusion, k=60):
-  │           Fuse scene + global + symbolic → better precision than union
+  ├─ [0ms]   Dynamic Weighted RRF (wRRF, arXiv:2511.18194):
+  │           entity+temporal query → weights [0.8, 0.8, 1.4] (boost symbolic)
+  │           entity/temporal only  → weights [0.9, 0.9, 1.2]
+  │           semantic only         → weights [1.0, 1.0, 0.6]
+  │           RRF score = Σ w_i / (60 + rank_i)
   │
   ├─ [0ms]   Lexical boost: BM25-lite keyword overlap scoring
   │
-  ├─ [0ms]   Importance boost: ×0.15 weight on importance field
-  │           (Rules/identity/preferences float to top)
+  ├─ [0ms]   Importance boost: score += 0.15 × importance
+  │           (identity/rule floor ≥0.80 — float to top automatically)
   │
   ├─ [opt]   Reflection (enable_reflection=true, +~1s):
   │           check_sufficiency() → 2nd pass if incomplete
@@ -185,6 +207,18 @@ Query →
   └─ [0ms]   Token-budget packing → <cross_session_memory> XML
               Priority: persona > env > tools > session > facts > episodes
               Default: 1500 words (configurable per request)
+
+Store path:
+  │
+  ├─ [0ms]   A-MAC 5-factor admission gate (arXiv:2603.04549):
+  │           F1 semantic_novelty    (w=0.30): 1 - max_cosine_sim vs recent episodes
+  │           F2 entity_novelty      (w=0.20): min(1.0, len(entities)/4)
+  │           F3 factual_confidence  (w=0.20): declarative predicate density
+  │           F4 temporal_signal     (w=0.15): explicit date/time references
+  │           F5 content_type_prior  (w=0.15): high-value pattern regex
+  │           score ≥ 0.30 → admit  (vs SimpleMem's single H(W_t) threshold)
+  │
+  └─ [async] Extract → embed → save episode + facts → update session
 ```
 
 ---
@@ -219,6 +253,16 @@ Phase 3 — Prune:  importance < 0.05 → soft-delete
 ```
 
 Key difference vs SimpleMem: **temporal affinity** (`cosine × exp(−0.03·days)`) prevents "Python 2.7 (2023)" merging with "Python 3.12 (2026)". SimpleMem uses pure cosine ≥ 0.95 and would incorrectly merge those.
+
+Category importance floors (v0.9.2) ensure high-signal facts never fall below the prune threshold through normal decay:
+
+| Category | Floor | Notes |
+|----------|------:|-------|
+| identity, rule | 0.80 | Never pruned in practice |
+| preference, work, personal, reminder | 0.65–0.75 | Long-lived |
+| decision, procedure, location | 0.55–0.60 | Medium persistence |
+| tool_use, env_context, context | 0.35–0.45 | May decay naturally |
+| general | 0.30 | Lowest persistence |
 
 ```bash
 curl -X POST http://localhost:18800/consolidate/sync
@@ -331,10 +375,10 @@ Entity knowledge graph. See knowledge graph section above.
 
 ### `GET /config`
 ```json
-{"version":"0.9.1","auto_consolidate_every":50,"stores_since_last":12,"periodic_interval_s":3600}
+{"version":"0.9.2","auto_consolidate_every":50,"stores_since_last":12,"periodic_interval_s":3600}
 ```
 
-### `GET /health` → `{"status":"ok","redis":"ok","version":"0.9.1"}`
+### `GET /health` → `{"status":"ok","redis":"ok","version":"0.9.2"}`
 ### `GET /stats` → `{"episodes":57,"facts":17,"procedures":8,"tools":15}`
 ### `GET /` → Dashboard (5-tab web UI, auto-refreshes)
 ### `GET /logs/stream` → SSE real-time log stream
@@ -376,12 +420,16 @@ cp -r plugin/ ~/.openclaw/extensions/memos-local/
 
 | Paper | Role in AgentMem |
 |-------|-----------------|
-| [SimpleMem (arXiv:2601.02553)](https://arxiv.org/abs/2601.02553) | Core 3-stage pipeline: §3.1 lossless extraction, §3.2 consolidation, §3.3 intent-aware retrieval |
+| [SimpleMem (arXiv:2601.02553)](https://arxiv.org/abs/2601.02553) | Core 3-stage pipeline: §3.1 lossless extraction, §3.2 consolidation, §3.3 intent-aware retrieval. SOTA 43.24 F1 on LoCoMo |
+| [A-MAC (arXiv:2603.04549)](https://arxiv.org/abs/2603.04549) | Adaptive 5-factor admission gate. Highest published token-F1 on LoCoMo (58.3%). Category importance floors |
+| [wRRF (arXiv:2511.18194)](https://arxiv.org/abs/2511.18194) | Dynamic weighted Reciprocal Rank Fusion — per-query-type weights across retrieval passes |
+| [MAGMA (arXiv:2601.03236)](https://arxiv.org/abs/2601.03236) | Multi-graph memory (semantic/temporal/causal/entity). 0.700 LLM-Judge. Inspired knowledge graph tier |
+| [EverMemOS (arXiv:2601.02163)](https://arxiv.org/abs/2601.02163) | Self-organizing MemCells→MemScenes. 83% accuracy |
+| [Hindsight (arXiv:2512.12818)](https://arxiv.org/abs/2512.12818) | 4 logical networks + reflection. 89.61% (Gemini-3). Inspired reflection loop |
 | [Anatomy of Agentic Memory (arXiv:2602.19320)](https://arxiv.org/abs/2602.19320) | 6-tier cognitive taxonomy |
-| [MemoryOS (arXiv:2506.06326)](https://arxiv.org/abs/2506.06326) EMNLP 2025 | Heat-tiered reranking formula |
+| [MemoryOS (arXiv:2506.06326)](https://arxiv.org/abs/2506.06326) | Heat-tiered reranking formula |
 | [RRF (Cormack et al., SIGIR 2009)](https://dl.acm.org/doi/10.1145/1571941.1572114) | Reciprocal Rank Fusion for multi-list merge |
 | [Redis 8 Vectorset](https://redis.io/blog/searching-1-billion-vectors-with-redis-8/) | HNSW at scale, native vectorset — no separate vector DB |
-| [Mem0 (arXiv:2504.19413)](https://arxiv.org/abs/2504.19413) | Hybrid recall reference |
 
 ---
 

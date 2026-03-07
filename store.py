@@ -232,43 +232,49 @@ async def soft_delete_fact(
 
     Sets superseded_by = winner's element_id. knn_search() skips these by default.
     The entry is kept for audit/history but excluded from recall.
-    """
-    # Get current attrs first
-    try:
-        results = await r.execute_command(
-            "VSIM", FACT_KEY, "ELE", element_id, "COUNT", 1, "WITHATTRIBS"
-        )
-    except Exception:
-        results = []
 
-    # Use VSETATTR to update superseded_by
-    # We need current attrs to avoid losing other fields
-    # Fall back to minimal update
+    Bug fix v0.9.2: removed the ×0.1 importance decay that was applied here.
+    Phase 1 (Decay) already applies ×0.9 per 90 days; Phase 3 (Prune) removes
+    entries that fall below 0.05. Applying a second ×0.1 during soft-delete
+    caused double-decay: loser facts dropped from 0.5 → 0.045, landing just
+    below the prune floor and being silently hard-removed the very next run.
+
+    Redis 8 vectorset has no direct VGETATTR by element ID, so we use VGETATTR
+    (available in Redis 8.0.1+) and fall back to the VSIM ELE scan.
+    """
     try:
-        # Fetch attrs via VSIM with zero vector to find the entry
-        seed = np.zeros(DIMS, dtype=np.float32)
+        # Redis 8.0.1+ supports VGETATTR element_id directly
+        raw = await r.execute_command("VGETATTR", FACT_KEY, element_id)
+        if raw:
+            attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+            attrs["superseded_by"] = superseded_by
+            await r.execute_command("VSETATTR", FACT_KEY, element_id, json.dumps(attrs))
+            return
+    except Exception:
+        pass  # VGETATTR not available; fall through to VSIM scan
+
+    # Fallback: VSIM ELE lookup (element-space traversal, Redis 8 native)
+    try:
         scan = await r.execute_command(
-            "VSIM", FACT_KEY, "FP32", seed.tobytes(),
-            "COUNT", 2000, "WITHSCORES", "WITHATTRIBS"
+            "VSIM", FACT_KEY, "ELE", element_id,
+            "COUNT", 1, "WITHATTRIBS"
         )
-        i = 0
-        while i + 2 < len(scan):
-            elem = scan[i]
-            raw = scan[i + 2]
-            i += 3
-            elem_str = elem.decode() if isinstance(elem, bytes) else elem
-            if elem_str != element_id:
-                continue
-            try:
-                attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
-                attrs["superseded_by"] = superseded_by
-                attrs["importance"] = min(attrs.get("importance", 0.5) * 0.1, 0.05)
-                await r.execute_command(
-                    "VSETATTR", FACT_KEY, element_id, json.dumps(attrs)
-                )
-            except Exception:
-                pass
-            break
+        if scan and len(scan) >= 2:
+            raw = scan[1]
+            attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+            attrs["superseded_by"] = superseded_by
+            await r.execute_command("VSETATTR", FACT_KEY, element_id, json.dumps(attrs))
+            return
+    except Exception:
+        pass
+
+    # Last resort: set superseded_by with minimal attrs to ensure
+    # knn_search() will filter this entry out
+    try:
+        await r.execute_command(
+            "VSETATTR", FACT_KEY, element_id,
+            json.dumps({"superseded_by": superseded_by, "content": ""})
+        )
     except Exception:
         pass
 
