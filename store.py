@@ -22,6 +22,7 @@ Redis 8 vectorset API summary:
 """
 
 import json
+import os
 import time
 from typing import Optional
 
@@ -29,7 +30,7 @@ import numpy as np
 import redis.asyncio as aioredis
 from ulid import ULID
 
-REDIS_URL    = "redis://localhost:6379"
+REDIS_URL    = os.getenv("REDIS_URL", "redis://localhost:6379")
 EPISODE_KEY  = "mem:episodes"
 FACT_KEY     = "mem:facts"
 TOOL_KEY     = "mem:tools"      # capability: tool/skill definitions
