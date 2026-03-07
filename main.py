@@ -829,34 +829,45 @@ async def answer(req: AnswerRequest):
 
     prompt = (
         f"Based only on the following memory context, answer the question concisely "
-        f"(1-5 words, exact phrase from context if possible).\n\n"
-        f"Context:\n{req.context[:1200]}\n\n"
+        f"using the exact phrase or name from the context (1-8 words preferred).\n\n"
+        f"Context:\n{req.context[:2500]}\n\n"
         f"Question: {req.query}\n\n"
-        f'Return JSON: {{"answer": "<short answer>"}}'
+        f'Return JSON: {{"answer": "<exact phrase from context>"}}'
     )
     try:
-        async with httpx.AsyncClient(timeout=8.0) as client:
+        async with httpx.AsyncClient(timeout=12.0) as client:
             resp = await client.post(
                 ZAI_URL,
                 json={
-                    "model": "glm-4-flash",
+                    "model": "glm-4-plus",
                     "messages": [
-                        {"role": "system", "content": "Extract a concise answer from context. Output valid JSON only."},
+                        {"role": "system", "content": "You are a precise question-answering assistant. Extract the exact answer phrase from the provided context. Output valid JSON only."},
                         {"role": "user",   "content": prompt},
                     ],
-                    "temperature": 0.1,
-                    "max_tokens": 60,
+                    "temperature": 0.0,
+                    "max_tokens": 80,
                 },
                 headers={"Authorization": f"Bearer {key}"},
             )
         if resp.status_code == 200:
             raw = resp.json()["choices"][0]["message"]["content"].strip()
-            import extractor as _ext
-            parsed = _ext._parse_llm_json(raw)
-            if isinstance(parsed, dict):
-                return {"answer": str(parsed.get("answer", ""))}
-            elif isinstance(parsed, list) and parsed:
-                return {"answer": str(parsed[0].get("answer", ""))}
+            # Strip markdown code fences (glm-4-plus wraps JSON in ```json...```)
+            if raw.startswith("```"):
+                raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+            # Parse JSON object or array — _parse_llm_json only handles arrays,
+            # so we parse directly here to support both response shapes.
+            obj_start = raw.find("{")
+            arr_start = raw.find("[")
+            start = min(x for x in [obj_start, arr_start] if x != -1) if any(x != -1 for x in [obj_start, arr_start]) else -1
+            if start != -1:
+                end_ch = "}" if raw[start] == "{" else "]"
+                end = raw.rfind(end_ch)
+                if end != -1:
+                    parsed = json.loads(raw[start:end + 1])
+                    if isinstance(parsed, dict):
+                        return {"answer": str(parsed.get("answer", ""))}
+                    elif isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
+                        return {"answer": str(parsed[0].get("answer", ""))}
     except Exception as e:
         log.debug(f"[answer] LLM extraction failed: {e}")
     return {"answer": ""}

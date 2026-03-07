@@ -11,7 +11,7 @@ Evaluates memory retrieval quality by:
 Metrics:
   LLM-F1       — LLM extracts concise answer from recalled context → token F1
                  vs ground truth. Directly comparable to published LoCoMo baselines
-                 (SimpleMem 43.24%, A-MAC 58.30%). Uses /answer endpoint.
+                 (SimpleMem 43.24%, AriadneMem 46.30% SOTA). Uses /answer endpoint.
   Context-F1   — token F1 between recalled text and ground truth answer via
                  10-word sliding window (pure retrieval quality, no LLM step)
   Recall@1     — ground truth tokens appear in top recalled context
@@ -409,18 +409,19 @@ def store_session(api: str, session_id: str, turns: list[tuple]) -> bool:
 
 
 def recall_context(api: str, query: str, session_id: str) -> str:
-    """Recall context with planning + reflection enabled for maximum retrieval quality."""
+    """Recall context with planning + reflection + graph enabled for maximum retrieval quality."""
     result = _post(
         f"{api}/recall",
         {
             "query":              query,
             "session_id":         session_id,
-            "memory_limit_number": 10,
-            "token_budget":       1000,
+            "memory_limit_number": 12,
+            "token_budget":       1500,
             "enable_planning":    True,   # SimpleMem intent-aware query expansion
             "enable_reflection":  True,   # Re-fetch if first pass is insufficient
+            "include_graph":      True,   # AriadneMem: graph bridge discovery
         },
-        timeout=20,
+        timeout=25,
     )
     return result.get("prependContext", "")
 
@@ -582,7 +583,7 @@ def run_benchmark(quick: bool, verbose: bool, no_store: bool) -> None:
             status = "ok" if ok else "FAIL"
             print(f"  {conv['session_id']}  {n_pairs} pairs  [{status}]")
 
-        wait_for_processing(BENCH_API, seconds=45)
+        wait_for_processing(BENCH_API, seconds=75)
     else:
         print("Skipping store phase (--no-store).")
 
@@ -664,14 +665,14 @@ def run_benchmark(quick: bool, verbose: bool, no_store: bool) -> None:
     print("  RESULTS SUMMARY")
     print("═" * 90)
 
-    # Published baseline F1 scores from LoCoMo papers
+    # Published baseline F1 scores from LoCoMo papers (GPT-4.1-mini backbone)
     # NOTE: published F1 = LLM-extracted answer F1 (comparable to our LLM-F1 column)
     published = {
-        "Full Context":       (18.70, "—",    "~16,910"),
-        "A-Mem":              (32.58, "—",    "—"),
-        "Mem0":               (34.20, "—",    "~1,000"),
-        "SimpleMem (SOTA)":   (43.24, "—",    "~550"),
-        "A-MAC (paper)":      (58.30, "—",    "—"),
+        "Full Context":          (18.70, "—", "~16,910"),
+        "A-Mem":                 (32.58, "—", "—"),
+        "Mem0":                  (34.20, "—", "~1,000"),
+        "SimpleMem":             (43.24, "—", "~550"),
+        "AriadneMem (SOTA)":     (46.30, "—", "~497"),
     }
 
     print(f"\n{'System':<28}  {'Context-F1':>12}  {'LLM-F1*':>9}  {'Recall@1':>10}  {'Avg Latency':>12}  {'Avg Tokens':>12}")
@@ -702,17 +703,21 @@ def run_benchmark(quick: bool, verbose: bool, no_store: bool) -> None:
         llm_col    = f"{llm_f1_pct:>8.2f}%" if key == "agentmem" else f"{'—':>8}"
         print(f"  {label:<26}  {f1_pct:>11.2f}%  {llm_col}  {r1_pct:>9.1f}%  {lat_str:>12}  {tok_str:>12}{marker}")
 
-    # vs SimpleMem comparison
+    # vs SimpleMem + AriadneMem comparison
     simplemem_published = 43.24
+    ariadne_published   = 46.30
     gap = am_llm_f1_pct - simplemem_published
     gap_str = f"+{gap:.2f}%" if gap >= 0 else f"{gap:.2f}%"
+    gap_ariadne = am_llm_f1_pct - ariadne_published
+    gap_ariadne_str = f"+{gap_ariadne:.2f}%" if gap_ariadne >= 0 else f"{gap_ariadne:.2f}%"
 
     # Summary stats
     am_f1_pct  = am.mean_f1 * 100
     am_aic_pct = am.answer_in_context_rate * 100
     fc_aic_pct = systems["full_context"].answer_in_context_rate * 100
     print(f"\n{'─'*90}")
-    print(f"  AgentMem LLM-F1 (vs SimpleMem 43.24%) : {am_llm_f1_pct:.2f}%  [{gap_str} vs SOTA]")
+    print(f"  AgentMem LLM-F1 (vs SimpleMem  43.24%) : {am_llm_f1_pct:.2f}%  [{gap_str} vs SimpleMem]")
+    print(f"  AgentMem LLM-F1 (vs AriadneMem 46.30%) : {am_llm_f1_pct:.2f}%  [{gap_ariadne_str} vs AriadneMem SOTA]")
     print(f"  AgentMem Context-F1                    : {am_f1_pct:.2f}%  (raw retrieval quality)")
     print(f"  AgentMem Answer-in-Context             : {am_aic_pct:.1f}%")
     print(f"  Full-Context oracle AIC                : {fc_aic_pct:.1f}%  (upper bound)")
@@ -743,7 +748,8 @@ def run_benchmark(quick: bool, verbose: bool, no_store: bool) -> None:
             }
             for k, v in systems.items()
         },
-        "vs_simplemem_gap_pct": round(gap, 2),
+        "vs_simplemem_gap_pct":  round(gap, 2),
+        "vs_ariadnemem_gap_pct": round(gap_ariadne, 2),
     }
     out = "/tmp/agentmem-bench-results.json"
     with open(out, "w") as f:

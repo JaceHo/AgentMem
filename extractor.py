@@ -144,7 +144,7 @@ def _regex_extract(user_text: str) -> list[ExtractedFact]:
 
 ZAI_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
 LLM_TIMEOUT_S = 10.0
-LLM_MAX_INPUT = 2000   # chars of conversation to send to LLM
+LLM_MAX_INPUT = 3000   # chars of conversation to send to LLM
 
 # SimpleMem-aligned extraction prompt (bilingual):
 # - Φ_coref: forbids all pronouns (he/she/it/they/this/that/我/他/她)
@@ -293,7 +293,7 @@ async def _llm_extract(conversation_text: str) -> list[ExtractedFact]:
                             },
                             {"role": "user", "content": prompt},
                         ],
-                        "max_tokens": 800,
+                        "max_tokens": 1500,
                         "temperature": 0.1,
                     },
                     headers={"Authorization": f"Bearer {key}"},
@@ -452,7 +452,7 @@ async def extract_hybrid(
     regex_facts = _regex_extract(all_text)
 
     # Layer 2: SimpleMem LLM gate (~200-500ms, background)
-    llm_input = conversation_text or user_text
+    llm_input = conversation_text or all_text
     llm_facts = await _llm_extract(llm_input)
 
     # Merge: LLM first (lossless, pronoun-free, richer metadata),
