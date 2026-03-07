@@ -403,20 +403,25 @@ _ENTITY_RE = re.compile(
     r'|\b\d{4}[-/]\d{2}[-/]\d{2}\b'   # ISO dates
     r'|\b[A-Z]{2,}\b'                  # Acronyms (API, MCP, ...)
     r'|\b\w+\.(py|js|ts|sh|json|md)\b' # File references
+    r'|[\u4e00-\u9fff\u3400-\u4dbf]{2,}' # CJK entity names (≥2 chars)
 )
 _DATE_RE  = re.compile(
     r'\b\d{4}[-/]\d{2}[-/]\d{2}\b'    # ISO date
     r'|\b(?:today|tomorrow|yesterday|monday|tuesday|wednesday|thursday|friday'
     r'|january|february|march|april|may|june|july|august|september|october'
-    r'|november|december)\b', re.I
+    r'|november|december)\b'
+    r'|\d{4}年\d{1,2}月(?:\d{1,2}日)?'  # Chinese date: 2026年3月7日
+    r'|(?:昨天|今天|明天|上周|下周|上个月|下个月)', re.I
 )
-_FACT_RE  = re.compile(                # declarative fact patterns
+_FACT_RE  = re.compile(                # declarative fact patterns (EN + ZH)
     r'\b(?:is|are|was|were|has|have|had|will|prefer|use|like|work|live|need'
-    r'|always|never|must|should|remember|note|my|our)\b', re.I
+    r'|always|never|must|should|remember|note|my|our)\b'
+    r'|(?:是|有|在|住|工作|喜欢|需要|记住|总是|从不|必须|应该|我的)', re.I
 )
-_HIGH_VALUE_RE = re.compile(           # content type prior: high-value categories
+_HIGH_VALUE_RE = re.compile(           # content type prior: high-value (EN + ZH)
     r'\b(?:my name|i am|i\'m|i work|i live|i prefer|i like|always use|never use'
-    r'|deadline|remember|important|rule:|note:|prefer|password|token|key|api)\b', re.I
+    r'|deadline|remember|important|rule:|note:|prefer|password|token|key|api)\b'
+    r'|(?:我叫|我是|我在|我住|我喜欢|总是用|截止|记住|重要|密码|令牌)', re.I
 )
 
 async def _admission_gate(user_text: str) -> bool:
@@ -442,7 +447,11 @@ async def _admission_gate(user_text: str) -> bool:
     entity_novelty = min(1.0, len(entities) / 4)
 
     # F3 — Factual confidence: declarative predicate density (w=0.20)
-    words = len(text.split())
+    # For Chinese text .split() returns 1 token for the whole string; use
+    # character count ÷ avg_word_len as a proxy for mixed-language word count.
+    en_words  = len(text.split())
+    zh_chars  = len(re.findall(r'[\u4e00-\u9fff]', text))
+    words = max(en_words, 1) + zh_chars // 2  # ~2 chars per Chinese word
     fact_hits = len(_FACT_RE.findall(text))
     factual_confidence = min(1.0, fact_hits / max(words * 0.15, 1))
 
@@ -475,13 +484,20 @@ async def _admission_gate(user_text: str) -> bool:
 # ── SimpleMem: Keyword Lexical Boost (Phase 3 hybrid scoring) ─────────────────
 
 def _tokenize_query(query: str) -> set[str]:
-    """Extract meaningful tokens from query for BM25-lite keyword matching."""
-    # Strip stopwords, keep tokens ≥ 3 chars
+    """Extract meaningful tokens from query for BM25-lite keyword matching.
+
+    Handles both English (space-separated, ≥3 chars) and Chinese (CJK character
+    sequences ≥2 chars, since Chinese has no word boundaries).
+    """
     STOP = {"the", "and", "for", "are", "you", "can", "how", "what",
             "when", "where", "who", "why", "this", "that", "was", "did",
-            "的", "了", "是", "在", "有", "我", "你", "他", "她"}
-    tokens = set(re.findall(r'\b\w{3,}\b', query.lower()))
-    return tokens - STOP
+            "的", "了", "是", "在", "有", "我", "你", "他", "她", "它",
+            "这", "那", "吗", "呢", "啊", "哦", "嗯"}
+    # English tokens (≥3 chars)
+    en_tokens = set(re.findall(r'\b[a-zA-Z]{3,}\b', query.lower()))
+    # Chinese tokens: sequences of CJK chars (≥2 chars)
+    zh_tokens = set(re.findall(r'[\u4e00-\u9fff\u3400-\u4dbf]{2,}', query))
+    return (en_tokens | zh_tokens) - STOP
 
 
 def _keyword_boost(items: list[dict], query: str, boost: float = 0.06) -> list[dict]:
@@ -779,6 +795,64 @@ async def _do_compress_session(session_id: str) -> dict:
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
+
+class AnswerRequest(BaseModel):
+    query:   str
+    context: str
+
+
+@app.post("/answer")
+async def answer(req: AnswerRequest):
+    """
+    Extract a concise answer from recalled context using the LLM.
+
+    Mirrors SimpleMem's AnswerGenerator (core/answer_generator.py):
+    LLM reads the retrieved context and produces a short span answer,
+    enabling token-F1 computation comparable to published LoCoMo baselines
+    (which all use LLM-in-the-loop answer generation, not raw context F1).
+
+    Returns {"answer": "<short span>"} or {"answer": ""} if LLM unavailable.
+    """
+    from extractor import ZAI_URL, _load_key
+
+    key = _load_key()
+    if not key or not req.context.strip():
+        return {"answer": ""}
+
+    prompt = (
+        f"Based only on the following memory context, answer the question concisely "
+        f"(1-5 words, exact phrase from context if possible).\n\n"
+        f"Context:\n{req.context[:1200]}\n\n"
+        f"Question: {req.query}\n\n"
+        f'Return JSON: {{"answer": "<short answer>"}}'
+    )
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            resp = await client.post(
+                ZAI_URL,
+                json={
+                    "model": "glm-4-flash",
+                    "messages": [
+                        {"role": "system", "content": "Extract a concise answer from context. Output valid JSON only."},
+                        {"role": "user",   "content": prompt},
+                    ],
+                    "temperature": 0.1,
+                    "max_tokens": 60,
+                },
+                headers={"Authorization": f"Bearer {key}"},
+            )
+        if resp.status_code == 200:
+            raw = resp.json()["choices"][0]["message"]["content"].strip()
+            import extractor as _ext
+            parsed = _ext._parse_llm_json(raw)
+            if isinstance(parsed, dict):
+                return {"answer": str(parsed.get("answer", ""))}
+            elif isinstance(parsed, list) and parsed:
+                return {"answer": str(parsed[0].get("answer", ""))}
+    except Exception as e:
+        log.debug(f"[answer] LLM extraction failed: {e}")
+    return {"answer": ""}
+
 
 @app.get("/health")
 async def health():
