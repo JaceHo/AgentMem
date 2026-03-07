@@ -1,8 +1,8 @@
 {
   "id": "memos-local-openclaw-plugin",
-  "name": "Local Memory (Redis HNSW + MiniLM)",
-  "description": "Long-term memory + capability registry via local FastAPI sidecar + Redis vector search.",
-  "version": "0.2.0",
+  "name": "AgentMem — Local Agent Memory",
+  "description": "AgentMem v0.9.2: A-MAC + SimpleMem+ 6-tier persistent memory via Redis HNSW. Replaces memos-cloud.",
+  "version": "0.3.0",
   "kind": "lifecycle",
   "main": "./index.js",
   "configSchema": {
@@ -10,8 +10,8 @@
     "properties": {
       "baseUrl": {
         "type": "string",
-        "description": "Memory service base URL",
-        "default": "http://127.0.0.1:18790"
+        "description": "AgentMem service base URL",
+        "default": "http://127.0.0.1:18800"
       },
       "memoryLimitNumber": {
         "type": "number",

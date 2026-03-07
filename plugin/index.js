@@ -1,6 +1,6 @@
 /**
- * memos-local-openclaw-plugin  v0.3.0
- * Local long-memory via Redis HNSW + MiniLM FastAPI sidecar.
+ * agentmem-openclaw-plugin  v0.3.0
+ * AgentMem — local persistent memory via Redis HNSW + MiniLM FastAPI sidecar.
  * Drop-in replacement for memos-cloud-openclaw-plugin.
  *
  * v0.3.0 additions (2026 layered controlled architecture):
@@ -15,7 +15,7 @@
  *   - Uses /recall-tools for capability-style queries
  */
 
-const DEFAULT_BASE_URL = "http://127.0.0.1:18790";
+const DEFAULT_BASE_URL = "http://127.0.0.1:18800";
 const DEFAULT_LIMIT    = 6;
 const RECALL_TIMEOUT   = 3000;   // ms — block agent start if exceeded
 const STORE_TIMEOUT    = 500;    // ms — fire-and-forget, don't block
