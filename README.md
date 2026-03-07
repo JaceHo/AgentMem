@@ -7,7 +7,7 @@
 One service. Every framework. Persistent memory that actually works.
 
 ```
-Recall P50 (warm): 1.7ms  │  Measured Context-F1: 38.28%  │  AIC: 97.9%  │  Beats Mem0 (34.20%) on LoCoMo-style benchmark
+Recall P50 (warm): 1.7ms  │  Context-F1: 38.28%  │  LLM-F1: see leaderboard  │  AIC: 97.9%  │  CJK/Chinese supported
 ```
 
 ---
@@ -16,27 +16,30 @@ Recall P50 (warm): 1.7ms  │  Measured Context-F1: 38.28%  │  AIC: 97.9%  │
 
 AgentMem implements the best-performing admission and retrieval strategies from the 2025-2026 memory literature.
 
-| System | Context-F1 | AIC | Token Cost | Notes |
-|--------|:----------:|:---:|:----------:|-------|
-| Full Context | 18.70% | 100% | ~16,910 | No compression (published) |
-| A-Mem | 32.58% | — | — | Graph-based (published) |
-| Mem0 | 34.20% | — | ~1,000 | Cloud API (published) |
-| **AgentMem v0.9.2** | **38.28%** | **97.9%** | **~800** | **Local, self-hosted — measured ✅** |
-| SimpleMem | 43.24% | — | ~550 | SOTA lossless extraction (published) |
-| A-MAC | 58.30% | — | — | Adaptive admission gate (published) |
-| MAGMA | 0.700 LLM-Judge | — | — | Multi-graph (semantic/temporal/causal/entity) |
-| EverMemOS | 83% acc | — | — | Self-organizing MemCells→MemScenes |
-| Hindsight | 89.61% acc | — | — | 4 logical networks + reflection (Gemini-3) |
+> **Metric key**: *LLM-F1* = LLM extracts concise answer from recalled context → token F1 vs GT (how SimpleMem/A-MAC are scored in their papers). *Context-F1* = max token F1 over 10-word sliding window, no LLM step (harder; measures raw fact density). Run `bench-f1.py` for both.
 
-**AgentMem v0.9.2 measured results** (LoCoMo-style bench, 8 conversations, 47 Q/A pairs, `bench-f1.py`):
+| System | LLM-F1 | Context-F1 | AIC | Token Cost | Notes |
+|--------|:------:|:----------:|:---:|:----------:|-------|
+| Full Context | 18.70% | — | 100% | ~16,910 | No compression (published) |
+| A-Mem | 32.58% | — | — | — | Graph-based (published) |
+| Mem0 | 34.20% | — | — | ~1,000 | Cloud API (published) |
+| SimpleMem | 43.24% | — | — | ~550 | SOTA lossless extraction (published) |
+| **AgentMem [OURS]** | **run bench** | **38.28%** | **97.9%** | **~800** | **Local, self-hosted ✅ CJK/Chinese ✅** |
+| A-MAC | 58.30% | — | — | — | Adaptive admission gate (published) |
+| MAGMA | 0.700 LLM-Judge | — | — | — | Multi-graph (semantic/temporal/causal/entity) |
+| EverMemOS | 83% acc | — | — | — | Self-organizing MemCells→MemScenes |
+| Hindsight | 89.61% acc | — | — | — | 4 logical networks + reflection (Gemini-3) |
+
+**AgentMem measured results** (LoCoMo-style bench, 8 conversations, 47 Q/A pairs, `bench-f1.py`):
 - Context-F1: **38.28%** — beats Full Context, A-Mem, Mem0 ✅
+- LLM-F1: run `python3 bench-f1.py` — directly comparable to SimpleMem 43.24% / A-MAC 58.30%
 - Answer-in-Context (AIC): **97.9%** — 46/47 questions retrievable
 - Mean recall latency: **~2.4s** (includes embedding + wRRF + heat reranking)
 - Mean context tokens: **~800 words** (compressed from ~16,910 full context)
 
-> **Metric note**: Published LoCoMo F1 uses LLM generation on top of retrieval (LLM-in-the-loop). AgentMem's `bench-f1.py` measures Context-F1 directly (max token F1 over 10-word sliding window after stripping boilerplate), which is a harder test with no LLM extraction step. AIC (Answer-in-Context) measures whether the ground truth appears verbatim in the recalled context — the strictest possible retrieval metric.
+> **Why two F1 metrics?** Published papers (SimpleMem, A-MAC) use LLM extraction: a language model reads the recalled context and generates a short answer, then token F1 is computed against ground truth. This pipeline is implemented in AgentMem's `/answer` endpoint. Context-F1 (our original metric) measures token overlap directly in the raw recalled text — no LLM step, harder to game, but not directly comparable to published numbers. Run `bench-f1.py` to get both.
 >
-> **F1 vs accuracy**: Accuracy scores (EverMemOS, Hindsight) use LLM-graded answer correctness on different benchmarks — not directly comparable to LoCoMo token-F1.
+> **F1 vs accuracy**: Accuracy scores (EverMemOS, Hindsight) use LLM-graded correctness on different benchmarks — not directly comparable to LoCoMo token-F1.
 
 ---
 
@@ -529,10 +532,12 @@ Two extraction layers run in parallel:
 
 | Layer | Method | Latency | Catches |
 |-------|--------|---------|---------|
-| **Regex** | 18 compiled patterns | ~1ms | English first-person, procedures, env |
-| **LLM** | GLM-4-flash (ZAI) | ~200-500ms async | Implicit, Chinese, contextual, decisions |
+| **Regex** | 35+ compiled patterns (English + Chinese) | ~1ms | First-person English + CJK (我叫/我在/我住/我喜欢…), procedures, env |
+| **LLM** | GLM-4-flash (ZAI) | ~200-500ms async | Implicit facts, multilingual, contextual, decisions |
 
 Both produce `lossless_restatement` with `topic`, `location`, `importance`, `keywords[]`, `persons[]`, `entities[]`.
+
+**CJK / Chinese language support** (v0.9.3+): All regex patterns, entity extraction, knowledge graph slugging, tokenization (F1 scoring), and word-count estimation are CJK-aware. Chinese characters are tokenized individually for F1 computation; entity slugs preserve CJK ideographs; Chinese punctuation (`。，！？；：`) is handled separately from ASCII punctuation. See `extractor.py`, `graph.py`, `bench-f1.py`.
 
 ---
 
@@ -588,6 +593,13 @@ Speed advantage: AgentMem uses Redis 8 native HNSW vectorset (VSIM) with cached 
  "enable_planning":false,"enable_reflection":false,"include_graph":false,"include_tools":true}
 ```
 Returns `{"prependContext":"...","latency_ms":2}`
+
+### `POST /answer`
+```json
+{"query": "What city does the user live in?", "context": "<recalled context text>"}
+```
+LLM reads the recalled context and extracts a concise answer (1-5 words). Used by `bench-f1.py` to compute LLM-F1 comparable to SimpleMem/A-MAC published baselines. Requires ZAI API key.
+Returns `{"answer": "Oakland"}`
 
 ### `POST /store`
 ```json
