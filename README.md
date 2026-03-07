@@ -16,28 +16,44 @@ Recall P50 (warm): 1.7ms  │  Context-F1: 38.28%  │  LLM-F1: see leaderboard 
 
 AgentMem implements the best-performing admission and retrieval strategies from the 2025-2026 memory literature.
 
-> **Metric key**: *LLM-F1* = LLM extracts concise answer from recalled context → token F1 vs GT (how SimpleMem/A-MAC are scored in their papers). *Context-F1* = max token F1 over 10-word sliding window, no LLM step (harder; measures raw fact density). Run `bench-f1.py` for both.
+> **Metric key**: *LLM-F1* = LLM extracts short answer from recalled context → token F1 vs GT (how SimpleMem is scored). *Context-F1* = max token F1 in 10-word sliding window, no LLM step (harder; measures raw fact density). Run `bench-f1.py` for both.
+>
+> ⚠️ **A-MAC's 0.583 is NOT QA F1.** It is binary admission classification F1 (precision=0.417/recall=0.972 over *whether to store* each memory). A-MAC never reports QA token-F1 and cannot be placed on the same row as SimpleMem's 43.24%. See [arXiv:2603.04549](https://arxiv.org/abs/2603.04549).
+
+**LoCoMo QA Token-F1 leaderboard** (SimpleMem metric):
 
 | System | LLM-F1 | Context-F1 | AIC | Token Cost | Notes |
 |--------|:------:|:----------:|:---:|:----------:|-------|
 | Full Context | 18.70% | — | 100% | ~16,910 | No compression (published) |
 | A-Mem | 32.58% | — | — | — | Graph-based (published) |
-| Mem0 | 34.20% | — | — | ~1,000 | Cloud API (published) |
+| Mem0 | 34.20% | — | ~1,000 | — | Cloud API (published) |
 | SimpleMem | 43.24% | — | — | ~550 | SOTA lossless extraction (published) |
-| **AgentMem [OURS]** | **run bench** | **38.28%** | **97.9%** | **~800** | **Local, self-hosted ✅ CJK/Chinese ✅** |
-| A-MAC | 58.30% | — | — | — | Adaptive admission gate (published) |
-| MAGMA | 0.700 LLM-Judge | — | — | — | Multi-graph (semantic/temporal/causal/entity) |
-| EverMemOS | 83% acc | — | — | — | Self-organizing MemCells→MemScenes |
-| Hindsight | 89.61% acc | — | — | — | 4 logical networks + reflection (Gemini-3) |
+| **AgentMem [OURS]** | **run bench** | **38.28%** | **97.9%** | **~800** | **Local, self-hosted ✅ CJK ✅** |
+
+**Admission quality leaderboard** (A-MAC metric — binary classification F1):
+
+| System | Admission F1 | Precision | Recall | Notes |
+|--------|:------------:|:---------:|:------:|-------|
+| A-MAC | 0.583 | 0.417 | 0.972 | Learned weights + LLM utility call (published) |
+| **AgentMem [OURS]** | **run bench** | — | — | **Rule-based (no LLM gate call), threshold=0.40** |
 
 **AgentMem measured results** (LoCoMo-style bench, 8 conversations, 47 Q/A pairs, `bench-f1.py`):
 - Context-F1: **38.28%** — beats Full Context, A-Mem, Mem0 ✅
-- LLM-F1: run `python3 bench-f1.py` — directly comparable to SimpleMem 43.24% / A-MAC 58.30%
+- LLM-F1: run `python3 bench-f1.py` — comparable to SimpleMem 43.24%
 - Answer-in-Context (AIC): **97.9%** — 46/47 questions retrievable
 - Mean recall latency: **~2.4s** (includes embedding + wRRF + heat reranking)
 - Mean context tokens: **~800 words** (compressed from ~16,910 full context)
 
-> **Why two F1 metrics?** Published papers (SimpleMem, A-MAC) use LLM extraction: a language model reads the recalled context and generates a short answer, then token F1 is computed against ground truth. This pipeline is implemented in AgentMem's `/answer` endpoint. Context-F1 (our original metric) measures token overlap directly in the raw recalled text — no LLM step, harder to game, but not directly comparable to published numbers. Run `bench-f1.py` to get both.
+**Other systems** (different benchmarks, not directly comparable):
+
+| System | Score | Metric | Notes |
+|--------|------:|--------|-------|
+| A-MAC | 0.583 F1 | Admission classification F1 | Binary store/discard gate quality |
+| MAGMA | 0.700 | LLM-Judge | Multi-graph (semantic/temporal/causal/entity) |
+| EverMemOS | 83% | Answer accuracy | Self-organizing MemCells→MemScenes |
+| Hindsight | 89.61% | Answer accuracy | 4 logical networks + reflection (Gemini-3) |
+
+> **Why two F1 metrics?** SimpleMem uses LLM extraction (model reads recalled context → 1-5 word answer → token F1 vs GT). This is implemented in AgentMem's `/answer` endpoint. Context-F1 measures token overlap directly in raw recalled text — harder, no LLM step, not directly comparable to SimpleMem's published number.
 >
 > **F1 vs accuracy**: Accuracy scores (EverMemOS, Hindsight) use LLM-graded correctness on different benchmarks — not directly comparable to LoCoMo token-F1.
 
@@ -51,7 +67,7 @@ AgentMem implements the full [SimpleMem](https://arxiv.org/abs/2601.02553) pipel
 
 | # | Upgrade | Paper | Impact |
 |---|---------|-------|--------|
-| 5 | **A-MAC 5-factor admission gate** | [arXiv:2603.04549](https://arxiv.org/abs/2603.04549) | Replaces single entropy threshold with 5-factor weighted gate: semantic novelty, entity novelty, factual confidence, temporal signal, content type prior — highest published LoCoMo token-F1 |
+| 5 | **A-MAC 5-factor admission gate** | [arXiv:2603.04549](https://arxiv.org/abs/2603.04549) | Replaces single entropy threshold with 5-factor weighted gate: semantic novelty, entity novelty, factual confidence, temporal signal, content type prior (dominant, w=0.30 per A-MAC ablation) |
 | 6 | **Dynamic weighted RRF (wRRF)** | [arXiv:2511.18194](https://arxiv.org/abs/2511.18194) | Per-query-type weights for RRF fusion: entity queries boost symbolic pass (w=1.2→1.4), semantic-only queries downweight it (w=0.6) |
 | 7 | **Category importance floors** | A-MAC content_type_prior | 15-tier floor map: identity/rule pinned ≥0.80, general ≥0.30 — prevents important facts from being pruned by consolidation |
 
@@ -269,7 +285,7 @@ OpenClaw agents get the same 6-tier semantic memory as Claude Code — facts, ep
 | Privacy | ❌ All memories sent to Mem0 servers | ✅ 100% local, never leaves your machine |
 | Cost | ❌ $0.002–0.01 per operation (adds up fast) | ✅ Free (Redis OSS + local model) |
 | Recall latency | ~50ms (network) | **1.7ms P50** — 30× faster |
-| F1 accuracy | 34.20% | **58.3% (A-MAC gate)** — 70% better |
+| QA F1 (LoCoMo) | 34.20% | **run bench-f1.py** (target >43.24%) |
 | Local-first | ❌ Requires cloud | ✅ Works offline, air-gapped |
 | Framework support | Partial (Python SDK only) | ✅ MCP + LangChain + LangGraph + CrewAI + AutoGen + hooks |
 | Lossless extraction | ❌ | ✅ Pronoun-free, time-anchored facts |
@@ -307,7 +323,7 @@ OpenClaw agents get the same 6-tier semantic memory as Claude Code — facts, ep
 | RRF fusion | ❌ | ✅ Dynamic weighted RRF across 3 retrieval passes |
 | Temporal affinity | ❌ (pure cosine — merges old+new incorrectly) | ✅ `cosine × exp(−λ·days)` — time-aware merging |
 | Local-first | ❌ (requires OpenAI) | ✅ MiniLM-L12 on MPS, no external API needed |
-| F1 score | 43.24% | **58.3% (A-MAC)** |
+| QA F1 (LoCoMo) | 43.24% | **run bench-f1.py** |
 | Claude Code hooks | ❌ | ✅ |
 
 ### Performance Summary
@@ -317,7 +333,7 @@ Recall P50 (warm):          1.7ms      │  55× faster than SimpleMem
 Recall P90 (warm):          2.0ms      │  30× faster than Mem0
 Hook wall time (claude code): ~330ms   │  well within 10s hook timeout
 Store (async):              instant    │  non-blocking, no prompt delay
-F1 score:                   58.3%      │  vs 43.24% SimpleMem, 34.20% Mem0
+LLM-F1 (QA):                run bench  │  target: beat SimpleMem 43.24%
 Token budget:               ≤550       │  same as SimpleMem SOTA
 Privacy:                    100% local │  vs Mem0/MemGPT cloud dependency
 Cost:                       $0/month   │  vs Mem0 API pricing
@@ -670,7 +686,7 @@ launchctl kickstart -k "gui/$(id -u)/ai.agent.memory"  # restart
 | Paper | Role in AgentMem |
 |-------|-----------------|
 | [SimpleMem (arXiv:2601.02553)](https://arxiv.org/abs/2601.02553) | Core 3-stage pipeline: §3.1 lossless extraction, §3.2 consolidation, §3.3 intent-aware retrieval. SOTA 43.24 F1 on LoCoMo |
-| [A-MAC (arXiv:2603.04549)](https://arxiv.org/abs/2603.04549) | Adaptive 5-factor admission gate. Highest published token-F1 on LoCoMo (58.3%). Category importance floors |
+| [A-MAC (arXiv:2603.04549)](https://arxiv.org/abs/2603.04549) | Adaptive 5-factor admission gate. F1=0.583 on *admission classification* task (≠ QA F1). Ablation: type_prior is dominant factor. Category importance floors |
 | [wRRF (arXiv:2511.18194)](https://arxiv.org/abs/2511.18194) | Dynamic weighted Reciprocal Rank Fusion — per-query-type weights across retrieval passes |
 | [MAGMA (arXiv:2601.03236)](https://arxiv.org/abs/2601.03236) | Multi-graph memory (semantic/temporal/causal/entity). 0.700 LLM-Judge. Inspired knowledge graph tier |
 | [EverMemOS (arXiv:2601.02163)](https://arxiv.org/abs/2601.02163) | Self-organizing MemCells→MemScenes. 83% accuracy |
