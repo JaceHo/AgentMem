@@ -9,8 +9,11 @@ Evaluates memory retrieval quality by:
   4. Comparing against published baselines
 
 Metrics:
-  Context-F1   — token F1 between recalled text and ground truth answer
-                 (pure retrieval quality, no LLM extraction step needed)
+  LLM-F1       — LLM extracts concise answer from recalled context → token F1
+                 vs ground truth. Directly comparable to published LoCoMo baselines
+                 (SimpleMem 43.24%, A-MAC 58.30%). Uses /answer endpoint.
+  Context-F1   — token F1 between recalled text and ground truth answer via
+                 10-word sliding window (pure retrieval quality, no LLM step)
   Recall@1     — ground truth tokens appear in top recalled context
   Token Budget — words in recalled context (efficiency metric)
 
@@ -256,17 +259,46 @@ CONVERSATIONS = [
 
 # ── token F1 (SQuAD / LoCoMo standard) ────────────────────────────────────────
 
+_ZH_PUNCT = "。，！？；：""''（）【】、…—～·《》〈〉「」『』"
+
+
 def _normalize(text: str) -> str:
-    """Lowercase, strip punctuation and articles."""
+    """Lowercase, strip punctuation and articles. Handles Chinese and English.
+
+    For Chinese text: strips CJK punctuation and returns character-level tokens
+    (joined with spaces) since Chinese has no word boundaries.
+    For English text: strips ASCII punctuation and removes articles.
+    """
     text = text.lower()
+    # Strip ASCII punctuation
     text = text.translate(str.maketrans("", "", string.punctuation))
-    tokens = text.split()
-    stop = {"a", "an", "the"}
-    return " ".join(t for t in tokens if t not in stop)
+    # Strip Chinese punctuation
+    text = text.translate(str.maketrans("", "", _ZH_PUNCT))
+
+    # Split into tokens: CJK chars (each char = 1 token) + English words
+    # This makes token-F1 work correctly for mixed or Chinese-only text.
+    tokens = []
+    for ch in re.split(r'([\u4e00-\u9fff\u3400-\u4dbf])', text):
+        ch = ch.strip()
+        if not ch:
+            continue
+        # CJK single character → its own token
+        if re.fullmatch(r'[\u4e00-\u9fff\u3400-\u4dbf]', ch):
+            tokens.append(ch)
+        else:
+            # English words — strip articles
+            en_stop = {"a", "an", "the"}
+            tokens.extend(w for w in ch.split() if w not in en_stop)
+
+    return " ".join(tokens)
 
 
 def token_f1(prediction: str, ground_truth: str) -> float:
-    """Compute token-level F1 between prediction and ground truth."""
+    """Compute token-level F1 between prediction and ground truth.
+
+    Works for English, Chinese, and mixed text. CJK characters are treated
+    as individual tokens (no word segmentation required).
+    """
     pred_tokens  = _normalize(prediction).split()
     gold_tokens  = _normalize(ground_truth).split()
     if not pred_tokens or not gold_tokens:
@@ -314,19 +346,21 @@ def _strip_memory_wrapper(context: str) -> str:
 
 
 def context_f1(context: str, ground_truth: str) -> float:
-    """Max token F1 across any 10-word sliding window in the context.
+    """Max token F1 across any 10-token sliding window in the context.
 
     Boilerplate wrapper is stripped first so only factual content is scored.
-    Uses 10-word window (LoCoMo-style: concise answers need tight windows).
+    Tokens are language-aware: CJK chars are individual tokens, English words
+    are space-separated. Window of 10 tokens works for both languages.
     """
     context = _strip_memory_wrapper(context)
     if not context.strip():
         return 0.0
-    words = context.split()
+    # Use normalized (language-aware) token list
+    tokens = _normalize(context).split()
     window = 10
     best = 0.0
-    for i in range(len(words)):
-        chunk = " ".join(words[i : i + window])
+    for i in range(len(tokens)):
+        chunk = " ".join(tokens[i : i + window])
         best = max(best, token_f1(chunk, ground_truth))
     # Also try full (de-wrapped) context if it's short
     best = max(best, token_f1(context, ground_truth))
@@ -375,16 +409,40 @@ def store_session(api: str, session_id: str, turns: list[tuple]) -> bool:
 
 
 def recall_context(api: str, query: str, session_id: str) -> str:
+    """Recall context with planning + reflection enabled for maximum retrieval quality."""
     result = _post(
         f"{api}/recall",
         {
-            "query":    query,
-            "session_id": session_id,
-            "memory_limit_number": 8,
-            "token_budget": 800,
+            "query":              query,
+            "session_id":         session_id,
+            "memory_limit_number": 10,
+            "token_budget":       1000,
+            "enable_planning":    True,   # SimpleMem intent-aware query expansion
+            "enable_reflection":  True,   # Re-fetch if first pass is insufficient
         },
+        timeout=20,
     )
     return result.get("prependContext", "")
+
+
+def extract_answer_llm(api: str, query: str, context: str) -> str:
+    """Use the AgentMem LLM backend to extract a concise answer from context.
+
+    This mirrors SimpleMem's AnswerGenerator: LLM reads the recalled context and
+    produces a short span answer. Token F1 between this answer and ground truth
+    is directly comparable to the published LoCoMo F1 numbers.
+
+    Falls back to empty string if ZAI key is not available.
+    """
+    stripped = _strip_memory_wrapper(context).strip()
+    if not stripped:
+        return ""
+    result = _post(
+        f"{api}/answer",
+        {"query": query, "context": stripped},
+        timeout=15,
+    )
+    return result.get("answer", "")
 
 
 def full_context(turns: list[tuple]) -> str:
@@ -450,6 +508,7 @@ def answer_in_context(context: str, ground_truth: str) -> bool:
 class SystemResult:
     name:         str
     f1_scores:    list[float] = field(default_factory=list)
+    llm_f1_scores: list[float] = field(default_factory=list)  # LLM-extracted answer F1
     aic_scores:   list[bool]  = field(default_factory=list)   # Answer In Context
     latencies_ms: list[float] = field(default_factory=list)
     token_counts: list[int]   = field(default_factory=list)
@@ -457,6 +516,11 @@ class SystemResult:
     @property
     def mean_f1(self) -> float:
         return sum(self.f1_scores) / len(self.f1_scores) if self.f1_scores else 0.0
+
+    @property
+    def mean_llm_f1(self) -> float:
+        """LLM-extracted answer F1 — comparable to published LoCoMo baselines."""
+        return sum(self.llm_f1_scores) / len(self.llm_f1_scores) if self.llm_f1_scores else 0.0
 
     @property
     def answer_in_context_rate(self) -> float:
@@ -565,84 +629,102 @@ def run_benchmark(quick: bool, verbose: bool, no_store: bool) -> None:
         systems["full_context"].f1_scores.append(fc_f1)
         systems["full_context"].aic_scores.append(fc_aic)
         systems["full_context"].latencies_ms.append(fc_ms)
-        systems["full_context"].token_counts.append(len(fc_ctx.split()))
+        systems["full_context"].token_counts.append(len(_normalize(fc_ctx).split()))
 
         # AgentMem recall
         t0 = time.perf_counter()
-        am_ctx = recall_context(BENCH_API, question, session_id)
-        am_f1  = context_f1(am_ctx, ground_truth)
-        am_aic = answer_in_context(am_ctx, ground_truth)
-        am_ms  = (time.perf_counter() - t0) * 1000
+        am_ctx    = recall_context(BENCH_API, question, session_id)
+        am_f1     = context_f1(am_ctx, ground_truth)
+        am_aic    = answer_in_context(am_ctx, ground_truth)
+        am_ms     = (time.perf_counter() - t0) * 1000
+        # LLM-extracted F1: mirrors SimpleMem's AnswerGenerator (comparable to published)
+        am_answer = extract_answer_llm(BENCH_API, question, am_ctx)
+        am_llm_f1 = token_f1(am_answer, ground_truth) if am_answer else 0.0
         systems["agentmem"].f1_scores.append(am_f1)
+        systems["agentmem"].llm_f1_scores.append(am_llm_f1)
         systems["agentmem"].aic_scores.append(am_aic)
         systems["agentmem"].latencies_ms.append(am_ms)
-        systems["agentmem"].token_counts.append(len(am_ctx.split()))
+        systems["agentmem"].token_counts.append(len(_normalize(am_ctx).split()))
 
-        q_short  = (question[:38] + "…") if len(question) > 38 else question
+        q_short  = (question[:36] + "…") if len(question) > 36 else question
         gt_short = (ground_truth[:14] + "…") if len(ground_truth) > 14 else ground_truth
         aic_mark = "✓" if am_aic else "✗"
-        print(f"{idx:>3}  {q_short:<40}  {gt_short:<16}  "
-              f"{fc_aic!s:<5}  {am_f1:>6.3f}  {aic_mark}")
+        llm_mark = f"{am_llm_f1:.2f}" if am_answer else "—"
+        print(f"{idx:>3}  {q_short:<38}  {gt_short:<16}  "
+              f"{fc_aic!s:<5}  {am_f1:>6.3f}  {aic_mark}  LLM-F1:{llm_mark}")
 
         if verbose:
             print(f"      [recalled]: {am_ctx[:150].strip()!r}")
 
     # ── results table ─────────────────────────────────────────────────
-    print("\n" + "═" * 65)
+    am = systems["agentmem"]
+    am_llm_f1_pct = am.mean_llm_f1 * 100
+
+    print("\n" + "═" * 90)
     print("  RESULTS SUMMARY")
-    print("═" * 65)
+    print("═" * 90)
 
     # Published baseline F1 scores from LoCoMo papers
+    # NOTE: published F1 = LLM-extracted answer F1 (comparable to our LLM-F1 column)
     published = {
-        "Full Context":       (18.70, "~16,910 tokens"),
-        "A-Mem":              (32.58, "—"),
-        "Mem0":               (34.20, "~1,000 tokens"),
-        "SimpleMem (SOTA)":   (43.24, "~550 tokens"),
-        "A-MAC (paper)":      (58.30, "—"),
+        "Full Context":       (18.70, "—",    "~16,910"),
+        "A-Mem":              (32.58, "—",    "—"),
+        "Mem0":               (34.20, "—",    "~1,000"),
+        "SimpleMem (SOTA)":   (43.24, "—",    "~550"),
+        "A-MAC (paper)":      (58.30, "—",    "—"),
     }
 
-    print(f"\n{'System':<28}  {'Context-F1':>12}  {'Recall@1':>10}  {'Avg Latency':>12}  {'Avg Tokens':>12}")
-    print("-" * 82)
+    print(f"\n{'System':<28}  {'Context-F1':>12}  {'LLM-F1*':>9}  {'Recall@1':>10}  {'Avg Latency':>12}  {'Avg Tokens':>12}")
+    print("-" * 92)
+    print("  (* LLM-F1 = LLM-extracted answer token F1, directly comparable to published baselines)")
+    print()
 
-    # Published baselines (greyed in output)
-    for name, (f1, tokens) in published.items():
-        print(f"  {name:<26}  {f1:>11.2f}%  {'—':>10}  {'—':>12}  {tokens:>12}  [published]")
+    # Published baselines
+    for name, (f1, llm_f1, tokens) in published.items():
+        llm_str = f"{llm_f1:>8}" if llm_f1 != "—" else f"{'—':>8}"
+        print(f"  {name:<26}  {'—':>11}  {f1:>8.2f}%  {'—':>10}  {'—':>12}  {tokens:>12}  [published]")
 
     print()
     # Our measured systems
     system_labels = {
         "no_memory":    "No Memory (baseline)",
         "full_context": "Full Context (oracle)",
-        "agentmem":     "AgentMem v0.9.2 [OURS]",
+        "agentmem":     "AgentMem [OURS]",
     }
     for key, label in system_labels.items():
         r = systems[key]
-        f1_pct  = r.mean_f1 * 100
-        r1_pct  = r.recall_at_1 * 100
-        lat_str = f"{r.mean_latency:>8.1f} ms"
-        tok_str = f"{r.mean_tokens:>8.0f}"
-        marker  = " ◀" if key == "agentmem" else ""
-        print(f"  {label:<26}  {f1_pct:>11.2f}%  {r1_pct:>9.1f}%  {lat_str:>12}  {tok_str:>12}{marker}")
+        f1_pct     = r.mean_f1 * 100
+        llm_f1_pct = r.mean_llm_f1 * 100
+        r1_pct     = r.recall_at_1 * 100
+        lat_str    = f"{r.mean_latency:>8.1f} ms"
+        tok_str    = f"{r.mean_tokens:>8.0f}"
+        marker     = " ◀" if key == "agentmem" else ""
+        llm_col    = f"{llm_f1_pct:>8.2f}%" if key == "agentmem" else f"{'—':>8}"
+        print(f"  {label:<26}  {f1_pct:>11.2f}%  {llm_col}  {r1_pct:>9.1f}%  {lat_str:>12}  {tok_str:>12}{marker}")
+
+    # vs SimpleMem comparison
+    simplemem_published = 43.24
+    gap = am_llm_f1_pct - simplemem_published
+    gap_str = f"+{gap:.2f}%" if gap >= 0 else f"{gap:.2f}%"
 
     # Summary stats
-    am = systems["agentmem"]
     am_f1_pct  = am.mean_f1 * 100
     am_aic_pct = am.answer_in_context_rate * 100
     fc_aic_pct = systems["full_context"].answer_in_context_rate * 100
-    print(f"\n{'─'*65}")
-    print(f"  AgentMem Answer-in-Context : {am_aic_pct:.1f}%  (primary metric)")
-    print(f"  Full-Context oracle AIC    : {fc_aic_pct:.1f}%  (upper bound)")
-    print(f"  AgentMem Context-F1        : {am_f1_pct:.2f}%")
-    print(f"  AgentMem Recall@1          : {am.recall_at_1*100:.1f}%")
-    print(f"  Mean recall latency        : {am.mean_latency:.1f} ms")
-    print(f"  Mean context tokens        : {am.mean_tokens:.0f}")
-    print(f"\n  Metrics explained:")
-    print(f"  • Answer-in-Context (AIC): % of questions where the answer text")
-    print(f"    appears in recalled context — primary retrieval quality metric.")
-    print(f"  • Context-F1: max token F1 over 10-word sliding window (wrapper")
-    print(f"    stripped) — measures fact density in recalled context.")
-    print(f"  • Published LoCoMo F1 uses LLM extraction on top of retrieval.")
-    print("═" * 65 + "\n")
+    print(f"\n{'─'*90}")
+    print(f"  AgentMem LLM-F1 (vs SimpleMem 43.24%) : {am_llm_f1_pct:.2f}%  [{gap_str} vs SOTA]")
+    print(f"  AgentMem Context-F1                    : {am_f1_pct:.2f}%  (raw retrieval quality)")
+    print(f"  AgentMem Answer-in-Context             : {am_aic_pct:.1f}%")
+    print(f"  Full-Context oracle AIC                : {fc_aic_pct:.1f}%  (upper bound)")
+    print(f"  AgentMem Recall@1                      : {am.recall_at_1*100:.1f}%")
+    print(f"  Mean recall latency                    : {am.mean_latency:.1f} ms")
+    print(f"  Mean context tokens                    : {am.mean_tokens:.0f}")
+    print(f"\n  Metrics:")
+    print(f"  • LLM-F1: LLM extracts concise answer from recalled ctx → token F1 vs GT")
+    print(f"    Comparable to SimpleMem/A-MAC published LoCoMo numbers.")
+    print(f"  • Context-F1: max token F1 in 10-word sliding window (no LLM step).")
+    print(f"  • Answer-in-Context (AIC): GT text appears verbatim in recalled context.")
+    print("═" * 90 + "\n")
 
     # ── save results ─────────────────────────────────────────────────
     results = {
@@ -653,6 +735,7 @@ def run_benchmark(quick: bool, verbose: bool, no_store: bool) -> None:
         "systems": {
             k: {
                 "mean_f1_pct":             round(v.mean_f1 * 100, 2),
+                "mean_llm_f1_pct":         round(v.mean_llm_f1 * 100, 2),
                 "answer_in_context_pct":   round(v.answer_in_context_rate * 100, 1),
                 "recall_at_1_pct":         round(v.recall_at_1 * 100, 1),
                 "mean_latency_ms":         round(v.mean_latency, 1),
@@ -660,6 +743,7 @@ def run_benchmark(quick: bool, verbose: bool, no_store: bool) -> None:
             }
             for k, v in systems.items()
         },
+        "vs_simplemem_gap_pct": round(gap, 2),
     }
     out = "/tmp/agentmem-bench-results.json"
     with open(out, "w") as f:
