@@ -1,5 +1,5 @@
 """
-OpenClaw Local Memory Service  v0.8.0
+OpenClaw Local Memory Service  v0.9.1
 ======================================
 Replaces memos-cloud-openclaw-plugin with fully local, persistent memory.
 
@@ -9,30 +9,43 @@ Replaces memos-cloud-openclaw-plugin with fully local, persistent memory.
   Tier 2 — Long-term vectors : episodic + semantic + procedural (Redis HNSW, permanent)
   +       — Capability layer : tool/env/agent self-model (Redis Hash + vectorset)
 
-Features:
-  1. Heat-tiered recall  — frequently/recently accessed memories rank higher
-  2. Scene isolation     — language + domain tags filter recall by context
-  3. Evolving persona    — structured user profile updated from extracted facts
-  4. Summarize-then-embed— long turns compressed before MiniLM embedding
-  5. Hybrid extraction   — regex (instant) + LLM (GLM-4-flash, async) for facts
+Features (v0.9.1 — SimpleMem arXiv:2601.02553 full implementation):
+  1. Heat-tiered recall        — frequently/recently accessed memories rank higher
+  2. Scene isolation           — language + domain tags filter recall by context
+  3. Evolving persona          — structured user profile updated from extracted facts
+  4. Summarize-then-embed      — long turns compressed before MiniLM embedding
+  5. Hybrid extraction         — regex (instant) + LLM (GLM-4-flash, async) for facts
   6. Agent capability registry — tool/skill/env/agent self-model (v0.6.0)
-  7. Procedural memory   — 4th cognitive tier: how-to workflows (v0.6.0)
-  8. Session promotion   — Tier 1→2 compression at session end (v0.7.0)
-  9. SimpleMem Phase 1   — entropy-aware ingestion gate H(W_t)≥0.35 (NEW v0.8.0)
- 10. SimpleMem Phase 2   — temporal affinity in consolidation: cos×e^(-λ·days) (NEW v0.8.0)
- 11. SimpleMem Phase 3   — keyword lexical boost in recall + time-range filter (NEW v0.8.0)
+  7. Procedural memory         — 4th cognitive tier: how-to workflows (v0.6.0)
+  8. Session promotion         — Tier 1→2 compression at session end (v0.7.0)
+  9. SimpleMem Sec 3.1         — lossless restatement: Φ_coref (no pronouns) +
+                                 Φ_time (absolute ISO 8601), topic/location/importance (v0.9.1)
+ 10. SimpleMem Sec 3.2         — 3-phase consolidation: Decay (×0.9/90d) → Merge
+                                 (soft-delete via superseded_by) → Prune (<0.05) (v0.9.1)
+ 11. SimpleMem Sec 3.3         — Intent-Aware Retrieval Planning: plan_queries() +
+                                 check_sufficiency() reflection loop (v0.9.1)
+ 12. Token-budget context      — greedy word-count packing into <cross_session_memory>
+                                 tags, configurable per request (v0.9.1)
+ 13. Multi-framework adapters  — LangChain, LangGraph, CrewAI, AutoGen, Claude API (v0.9.0)
+ 14. MCP server                — mcp_server.py for Claude Desktop/Code/Cursor (v0.9.0)
+ 15. Knowledge graph           — entity relationship graph in Redis Sets (v0.9.0)
+ 16. Auto-consolidation        — counter-triggered (every 50 stores) + hourly timer (v0.9.0)
 
 Endpoints:
-  POST /recall              — before_agent_start hook (includes tool context)
+  POST /recall              — before_agent_start hook (includes tool context + graph)
   POST /store               — agent_end hook (async, non-blocking)
-  POST /session/compress    — promote Tier 1 session → Tier 2 long-term (NEW)
-  GET  /session/{id}        — inspect current Tier 1 session state (NEW)
+  POST /session/compress    — promote Tier 1 session → Tier 2 long-term
+  GET  /session/{id}        — inspect current Tier 1 session state
   POST /register-tools      — register agent's tool/skill index
   POST /register-env        — register current environment state
   POST /recall-tools        — semantic search over tool index
   POST /recall-procedures   — semantic search over procedural memory
   POST /store-procedure     — manually store a workflow/how-to
   GET  /capabilities        — full capability manifest
+  GET  /graph/{entity}      — knowledge graph: entity neighbours + fact counts
+  POST /graph/recall        — knowledge graph: neighbourhood fact retrieval
+  GET  /graph/stats         — knowledge graph: node/edge counts
+  GET  /config              — service configuration + auto-consolidation state
   GET  /health
   GET  /stats
 """
@@ -57,9 +70,11 @@ from pydantic import BaseModel
 import capability as cap_mod
 import embedder
 import extractor
+import graph as graph_mod
 import heat as heat_mod
 import log_sse
 import persona as persona_mod
+import retrieval_planner
 import scene as scene_mod
 import store as mem_store
 import summarizer
@@ -73,6 +88,10 @@ _sse_handler.setFormatter(logging.Formatter("%(asctime)s [%(name)s] %(message)s"
 logging.getLogger().addHandler(_sse_handler)
 
 _redis = None
+
+# ── Auto-consolidation counters ────────────────────────────────────────────────
+_stores_since_consolidation: int = 0
+_AUTO_CONSOLIDATE_EVERY: int = 50   # trigger after every N stored facts
 
 # ── System-injected content filter ────────────────────────────────────────────
 _SKIP_PREFIXES = (
@@ -113,6 +132,18 @@ def _encode(text: str) -> np.ndarray:
 
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
+async def _periodic_consolidate() -> None:
+    """Background task: consolidate memory every hour if there are facts to merge."""
+    while True:
+        await asyncio.sleep(3600)
+        try:
+            card = await _redis.execute_command("VCARD", mem_store.FACT_KEY)
+            if int(card or 0) > 5:
+                await _do_consolidate()
+        except Exception as e:
+            log.warning(f"[periodic_consolidate] error: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _redis
@@ -122,12 +153,13 @@ async def lifespan(app: FastAPI):
     _redis = await mem_store.get_client()
     log.info("Ensuring vectorset indexes…")
     await mem_store.ensure_indexes(_redis)
-    log.info("Memory service v0.8.0 ready")
+    asyncio.create_task(_periodic_consolidate())
+    log.info("Memory service v0.9.1 ready (SimpleMem-aligned)")
     yield
     await _redis.aclose()
 
 
-app = FastAPI(title="OpenClaw Memory Service", version="0.8.0", lifespan=lifespan)
+app = FastAPI(title="AgentMem — Local Agent Memory Service", version="0.9.1", lifespan=lifespan)
 
 # ── Static files + SSE log router ─────────────────────────────────────────────
 import os as _os
@@ -144,7 +176,7 @@ async def dashboard():
     idx = _os.path.join(_static_dir, "index.html")
     if _os.path.exists(idx):
         return FileResponse(idx)
-    return {"message": "OpenClaw Memory Service v0.6.0", "docs": "/docs"}
+    return {"message": "AgentMem v0.9.1", "docs": "/docs"}
 
 
 # ── Request / Response models ──────────────────────────────────────────────────
@@ -153,6 +185,11 @@ class RecallRequest(BaseModel):
     session_id: str = ""
     memory_limit_number: int = 6
     include_tools: bool = True          # Whether to append relevant tool context
+    include_graph: bool = False         # Expand knowledge graph neighbours (v0.9.0)
+    # SimpleMem Section 3.3: Intent-Aware Retrieval Planning (v0.9.1)
+    enable_planning: bool = False       # LLM-based query planning (adds ~300-600ms)
+    enable_reflection: bool = False     # LLM sufficiency check + second-pass retrieval
+    token_budget: int = 1500            # Max tokens in context output (SimpleMem budget)
     # SimpleMem symbolic filter: restrict recall to a time window (Unix ms)
     time_from: int | None = None        # e.g. 1740000000000 (ms)
     time_to:   int | None = None        # e.g. 1742687999000 (ms)
@@ -221,6 +258,11 @@ def _messages_to_text(messages: list[Message]) -> str:
         f"{m.role}: {_msg_text(m)}" for m in messages if _msg_text(m)
     )
 
+def _estimate_tokens(text: str) -> int:
+    """Fast word-count token estimate (SimpleMem Section 3.3 budget packing)."""
+    return len(text.split())
+
+
 def _format_prepend(
     facts: list[dict],
     episodes: list[dict],
@@ -228,23 +270,52 @@ def _format_prepend(
     persona_ctx: str,
     env_ctx: str = "",
     tool_ctx: str = "",
+    token_budget: int = 1500,
 ) -> str:
-    lines: list[str] = []
+    """
+    Build the context string injected into the agent's system prompt.
 
+    SimpleMem Section 3.3 token-budget packing:
+    Priority order: persona → env → tools → session_ctx → facts → episodes
+    Greedy packing: stop adding items when token_budget is exhausted.
+    Output wrapped in <cross_session_memory> XML tags (SimpleMem convention).
+    """
+    sections: list[str] = []
+    tokens_used = 0
+
+    def _add(text: str) -> bool:
+        nonlocal tokens_used
+        cost = _estimate_tokens(text)
+        if tokens_used + cost > token_budget:
+            return False
+        sections.append(text)
+        tokens_used += cost
+        return True
+
+    # Priority 1: persona (user profile — most stable context)
     if persona_ctx:
-        lines += [persona_ctx, ""]
+        _add(persona_ctx)
+        sections.append("")
 
+    # Priority 2: environment context
     if env_ctx:
-        lines += [env_ctx, ""]
+        _add(env_ctx)
+        sections.append("")
 
+    # Priority 3: tool context
     if tool_ctx:
-        lines += [tool_ctx, ""]
+        _add(tool_ctx)
+        sections.append("")
 
+    # Priority 4: session context (Tier 1 rolling summary)
     if session_ctx:
-        lines += ["## Current Session Context", session_ctx, ""]
+        _add("## Current Session Context")
+        _add(session_ctx)
+        sections.append("")
 
+    # Priority 5: facts (SimpleMem lossless_restatement entries)
     if facts:
-        lines.append("## Long-Term Memory (Facts)")
+        sections.append("## Long-Term Memory (Facts)")
         for i, f in enumerate(facts, 1):
             tag = f.get("category") or f.get("domain") or "?"
             attrs = f.get("attrs", {})
@@ -253,17 +324,35 @@ def _format_prepend(
                 meta_parts.append(f"who:{','.join(p)}")
             if e := attrs.get("entities"):
                 meta_parts.append(f"re:{','.join(e)}")
+            if t := attrs.get("topic"):
+                meta_parts.append(f"topic:{t}")
             meta = f" ({'; '.join(meta_parts)})" if meta_parts else ""
-            lines.append(f"{i}. [{tag}]{meta} {f['content']}")
-        lines.append("")
+            line = f"{i}. [{tag}]{meta} {f['content']}"
+            if not _add(line):
+                break   # budget exhausted
+        sections.append("")
 
+    # Priority 6: episodes (lower priority than facts)
     if episodes:
-        lines.append("## Recent Relevant Episodes")
+        sections.append("## Recent Relevant Episodes")
         for i, e in enumerate(episodes, 1):
-            lines.append(f"{i}. {e['content'][:300]}")
-        lines.append("")
+            line = f"{i}. {e['content'][:300]}"
+            if not _add(line):
+                break
+        sections.append("")
 
-    return "\n".join(lines).strip()
+    body = "\n".join(sections).strip()
+    if not body:
+        return ""
+
+    # SimpleMem XML wrapper — clearly delineates injected memory from user content
+    return (
+        "<cross_session_memory>\n"
+        "The following is relevant context from long-term memory.\n"
+        "Use it to inform your responses but do not repeat it verbatim.\n\n"
+        + body
+        + "\n</cross_session_memory>"
+    )
 
 
 # ── Query complexity estimator (SimpleMem-inspired, zero-cost) ────────────────
@@ -437,6 +526,7 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
             await mem_store.save_fact(
                 _redis, fact.content, fact.category, fact.confidence, f_emb, lang, domain,
                 keywords=fact.keywords, persons=fact.persons, entities=fact.entities,
+                importance=fact.importance, topic=fact.topic, location=fact.location,
             )
             await persona_mod.update(_redis, fact.category, fact.content)
             fact_saved += 1
@@ -459,10 +549,25 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
                     domain=domain, language=lang,
                 )
 
-        # 7. Accumulate rolling session summary (Tier 1 — layered controlled architecture)
+        # 7. Record knowledge graph edges from persons + entities co-occurrences
+        for fact in facts:
+            if fact.persons or fact.entities:
+                all_ents = (fact.persons or []) + (fact.entities or [])
+                if len(all_ents) >= 2:
+                    await graph_mod.record_entities(_redis, all_ents, [])
+
+        # 8. Accumulate rolling session summary (Tier 1 — layered controlled architecture)
         #    Append this turn's summary instead of overwriting, so Tier 1 grows across
         #    the whole session rather than holding only the last turn.
         await _accumulate_session(session_id, summary)
+
+        # 9. Auto-consolidation: trigger after every _AUTO_CONSOLIDATE_EVERY stored facts
+        global _stores_since_consolidation
+        _stores_since_consolidation += fact_saved
+        if _stores_since_consolidation >= _AUTO_CONSOLIDATE_EVERY:
+            _stores_since_consolidation = 0
+            asyncio.create_task(_do_consolidate())
+            log.info("[store] auto-consolidation triggered")
 
         ms = int((time.time() - t0) * 1000)
         log.info(f"[store] session={session_id} lang={lang} domain={domain} "
@@ -541,6 +646,7 @@ async def _do_compress_session(session_id: str) -> dict:
             _redis, fact.content, fact.category, fact.confidence,
             f_emb, lang, domain,
             keywords=fact.keywords, persons=fact.persons, entities=fact.entities,
+            importance=fact.importance, topic=fact.topic, location=fact.location,
         )
         await persona_mod.update(_redis, fact.category, fact.content)
         fact_saved += 1
@@ -563,7 +669,7 @@ async def _do_compress_session(session_id: str) -> dict:
 async def health():
     try:
         await _redis.ping()
-        return {"status": "ok", "redis": "ok", "version": "0.8.0"}
+        return {"status": "ok", "redis": "ok", "version": "0.9.1"}
     except Exception as e:
         return {"status": "degraded", "error": str(e)}
 
@@ -649,6 +755,30 @@ async def recall(req: RecallRequest):
     eps_scene   = results[4]
     tools_raw   = results[5] if isinstance(results[5], list) else []
 
+    # SimpleMem Section 3.3 — Intent-Aware Planning (opt-in)
+    # If enable_planning=True, run LLM query planning to generate targeted queries,
+    # then re-fetch for each query and merge. Adds ~300-600ms but improves recall
+    # for complex multi-part questions.
+    if req.enable_planning:
+        targeted_queries = await retrieval_planner.plan_queries(req.query)
+        if len(targeted_queries) > 1:
+            # Run targeted queries in parallel (exclude original already fetched above)
+            extra_queries = [q for q in targeted_queries if q != req.query]
+            extra_tasks = [
+                mem_store.knn_search(_redis, mem_store.FACT_KEY, _encode(q), n_facts,
+                                     filter_expr=lang_filter_sym or None, bump_heat=True)
+                for q in extra_queries
+            ]
+            extra_results = await asyncio.gather(*extra_tasks)
+            seen_extra = {f["content"] for f in facts_scene}
+            for batch in extra_results:
+                for item in (batch if isinstance(batch, list) else []):
+                    if item["content"] not in seen_extra:
+                        facts_scene.append(item)
+                        seen_extra.add(item["content"])
+            log.info(f"[recall] planning: {len(targeted_queries)} queries, "
+                     f"total facts after planning: {len(facts_scene)}")
+
     # Supplement with global search if scene results are sparse
     supplement_tasks = []
     if len(facts_scene) < n_facts:
@@ -682,16 +812,66 @@ async def recall(req: RecallRequest):
     facts    = _keyword_boost(facts,    req.query)
     episodes = _keyword_boost(episodes, req.query, boost=0.03)  # lighter for episodes
 
+    # SimpleMem reflection loop (opt-in): check if results sufficient, if not re-fetch
+    if req.enable_reflection and facts:
+        is_sufficient = await retrieval_planner.check_sufficiency(req.query, facts)
+        if not is_sufficient:
+            # One additional targeted pass with a different angle
+            extra_q = await retrieval_planner.plan_queries(
+                f"Find additional information about: {req.query}"
+            )
+            if extra_q:
+                reflection_emb = _encode(extra_q[0])
+                reflection_facts = await mem_store.knn_search(
+                    _redis, mem_store.FACT_KEY, reflection_emb,
+                    k=max(3, n_facts // 2), bump_heat=True
+                )
+                seen_reflect = {f["content"] for f in facts}
+                for rf in reflection_facts:
+                    if rf["content"] not in seen_reflect:
+                        facts.append(rf)
+                        seen_reflect.add(rf["content"])
+                facts = facts[:n_facts + 3]
+                log.info(f"[recall] reflection pass: added {len(reflection_facts)} candidates")
+
+    # Knowledge graph expansion (v0.9.0): pull facts from graph neighbourhood
+    if req.include_graph and facts:
+        graph_ents: list[str] = []
+        for f in facts[:3]:
+            attrs = f.get("attrs", {})
+            graph_ents += attrs.get("persons", []) + attrs.get("entities", [])
+        graph_ents = list(dict.fromkeys(graph_ents))[:5]
+
+        if graph_ents:
+            graph_tasks = [
+                graph_mod.entity_recall(_redis, ent, emb, k=2)
+                for ent in graph_ents
+            ]
+            graph_results = await asyncio.gather(*graph_tasks)
+            seen_contents = {f["content"] for f in facts}
+            for batch in graph_results:
+                for gf in batch:
+                    if gf["content"] not in seen_contents:
+                        facts.append(gf)
+                        seen_contents.add(gf["content"])
+            facts = facts[:n_facts + 3]
+
     # Format tool context (only include env if it's non-trivial)
     tool_ctx = cap_mod.format_tool_context(tools_raw) if tools_raw else ""
     env_ctx_formatted = env_ctx if env_ctx and is_cap_query else ""
 
-    prepend = _format_prepend(facts, episodes, session_ctx, persona_ctx,
-                              env_ctx=env_ctx_formatted, tool_ctx=tool_ctx)
+    # SimpleMem Section 3.3 token-budget injection with XML wrapper
+    prepend = _format_prepend(
+        facts, episodes, session_ctx, persona_ctx,
+        env_ctx=env_ctx_formatted, tool_ctx=tool_ctx,
+        token_budget=req.token_budget,
+    )
     ms = int((time.time() - t0) * 1000)
 
+    planning_info = f" planning={req.enable_planning}" if req.enable_planning else ""
     log.info(f"[recall] session={req.session_id} lang={q_lang} domain={q_domain} "
-             f"facts={len(facts)} ep={len(episodes)} tools={len(tools_raw)} {ms}ms")
+             f"facts={len(facts)} ep={len(episodes)} tools={len(tools_raw)}"
+             f"{planning_info} {ms}ms")
 
     return {"prependContext": prepend if prepend else None, "latency_ms": ms}
 
@@ -961,21 +1141,21 @@ async def _do_consolidate(
     temporal_lambda: float = 0.03,      # temporal decay: λ=0.03 → 23-day half-life
 ) -> dict:
     """
-    Find clusters of similar facts and merge them into consolidated entries.
-    Uses VSIM to find near-duplicates, then LLM to produce a merged fact.
+    SimpleMem 3-phase consolidation (Section 3.2):
+      Phase 1 — Decay:  importance × 0.9 for entries older than 90 days
+      Phase 2 — Merge:  cluster near-duplicates (cosine×temporal ≥ threshold),
+                        LLM-merge into keeper, soft-delete losers via superseded_by
+      Phase 3 — Prune:  soft-delete any active entry with importance < 0.05
     """
     t0 = time.time()
-    all_facts = []
+    now_ms = int(time.time() * 1000)
+    NINETY_DAYS_MS = 90 * 86_400_000
 
-    # Fetch all fact elements with their attributes
     card = await _redis.execute_command("VCARD", mem_store.FACT_KEY)
     if not card or int(card) <= 1:
-        return {"merged": 0, "removed": 0, "ms": 0}
+        return {"merged": 0, "decayed": 0, "pruned": 0, "ms": 0}
 
-    # Get all elements via VRANDMEMBER (Redis 8 vectorset supports this)
     try:
-        # Use a large VSIM with a zero vector to get all entries
-        # (Not ideal but Redis 8 vectorset has no SCAN equivalent)
         seed = np.zeros(mem_store.DIMS, dtype=np.float32)
         results = await _redis.execute_command(
             "VSIM", mem_store.FACT_KEY, "FP32", seed.tobytes(),
@@ -985,7 +1165,8 @@ async def _do_consolidate(
         log.warning(f"[consolidate] failed to scan facts: {e}")
         return {"error": str(e)}
 
-    # Parse all facts
+    # Parse only active (non-superseded) facts
+    all_facts = []
     i = 0
     while i + 2 < len(results):
         elem = results[i]
@@ -1001,17 +1182,39 @@ async def _do_consolidate(
             continue
         if attrs.get("_seed") or not attrs.get("content"):
             continue
+        if attrs.get("superseded_by"):   # skip already-superseded entries
+            continue
         all_facts.append({"element": elem_str, "attrs": attrs})
 
     if len(all_facts) < 2:
-        return {"merged": 0, "removed": 0, "total": len(all_facts), "ms": 0}
+        return {"merged": 0, "decayed": 0, "pruned": 0, "total": len(all_facts), "ms": 0}
 
-    # Find clusters: for each fact, find similar ones
+    # ── Phase 1: Decay ─────────────────────────────────────────────────────────
+    # Entries older than 90 days lose 10% importance each consolidation run.
+    decayed_count = 0
+    for fact in all_facts:
+        ts = fact["attrs"].get("ts", now_ms)
+        if (now_ms - ts) > NINETY_DAYS_MS:
+            old_imp = fact["attrs"].get("importance", 0.5)
+            new_imp = round(old_imp * 0.9, 4)
+            fact["attrs"]["importance"] = new_imp
+            try:
+                await _redis.execute_command(
+                    "VSETATTR", mem_store.FACT_KEY, fact["element"],
+                    json.dumps(fact["attrs"])
+                )
+                decayed_count += 1
+            except Exception as e:
+                log.debug(f"[consolidate] decay VSETATTR failed: {e}")
+
+    # ── Phase 2: Merge ─────────────────────────────────────────────────────────
+    # affinity = cosine_similarity × exp(−λ × |days_between|)
+    # Cluster losers are soft-deleted (superseded_by = keeper_element), never VREM'd.
     merged_count = 0
-    removed_elements = set()
+    superseded_elements: set[str] = set()
 
-    for idx, fact in enumerate(all_facts):
-        if fact["element"] in removed_elements:
+    for fact in all_facts:
+        if fact["element"] in superseded_elements:
             continue
 
         f_emb = _encode(fact["attrs"]["content"])
@@ -1019,30 +1222,23 @@ async def _do_consolidate(
             _redis, mem_store.FACT_KEY, f_emb, k=5
         )
 
-        # Find cluster members using SimpleMem affinity score:
-        #   affinity = cosine_sim × exp(-λ × |days_between|)
-        # This prevents merging facts that are similar in content but
-        # from very different time periods (temporal context matters).
         cluster = [fact]
-        fact_ts = fact["attrs"].get("ts", 0)   # ms timestamp
+        fact_ts = fact["attrs"].get("ts", 0)
 
         for s in similar:
             if s["_element"] == fact["element"]:
                 continue
-            if s["_element"] in removed_elements:
+            if s["_element"] in superseded_elements:
                 continue
 
             cosine_sim = s.get("score", 0.0)
-
-            # Find the full fact entry to get its timestamp
             s_ts = 0
             for f2 in all_facts:
                 if f2["element"] == s["_element"]:
                     s_ts = f2["attrs"].get("ts", 0)
                     break
 
-            # Temporal affinity decay (SimpleMem Phase 2)
-            days_between = abs(fact_ts - s_ts) / 86_400_000   # ms → days
+            days_between = abs(fact_ts - s_ts) / 86_400_000
             temporal_factor = math.exp(-temporal_lambda * days_between)
             affinity = cosine_sim * temporal_factor
 
@@ -1055,35 +1251,28 @@ async def _do_consolidate(
         if len(cluster) < 2:
             continue
 
-        # Merge cluster into a single consolidated fact via LLM
         contents = [c["attrs"]["content"] for c in cluster]
         merged_content = await _llm_merge_facts(contents)
         if not merged_content:
             continue
 
-        # Keep the newest entry, update its content, remove the rest
         cluster.sort(key=lambda c: c["attrs"].get("ts", 0), reverse=True)
         keeper = cluster[0]
+        keeper_element = keeper["element"]
 
-        # Update keeper with merged content
         new_attrs = dict(keeper["attrs"])
         new_attrs["content"] = merged_content[:500]
-        new_attrs["access_count"] = max(
-            c["attrs"].get("access_count", 0) for c in cluster
-        )
+        new_attrs["access_count"] = max(c["attrs"].get("access_count", 0) for c in cluster)
+        new_attrs["importance"] = max(c["attrs"].get("importance", 0.5) for c in cluster)
         new_attrs["consolidated_from"] = len(cluster)
 
-        # Collect keywords/persons/entities from all cluster members
-        all_kw = set()
-        all_persons = set()
-        all_entities = set()
+        all_kw: set[str] = set()
+        all_persons: set[str] = set()
+        all_entities: set[str] = set()
         for c in cluster:
-            for kw in c["attrs"].get("keywords", []):
-                all_kw.add(kw)
-            for p in c["attrs"].get("persons", []):
-                all_persons.add(p)
-            for e in c["attrs"].get("entities", []):
-                all_entities.add(e)
+            all_kw.update(c["attrs"].get("keywords", []))
+            all_persons.update(c["attrs"].get("persons", []))
+            all_entities.update(c["attrs"].get("entities", []))
         if all_kw:
             new_attrs["keywords"] = list(all_kw)[:10]
         if all_persons:
@@ -1091,34 +1280,46 @@ async def _do_consolidate(
         if all_entities:
             new_attrs["entities"] = list(all_entities)[:5]
 
-        # Re-embed the merged content and replace keeper
         m_emb = _encode(merged_content)
         try:
             await _redis.execute_command(
                 "VADD", mem_store.FACT_KEY, "FP32", m_emb.tobytes(),
-                keeper["element"], "SETATTR", json.dumps(new_attrs)
+                keeper_element, "SETATTR", json.dumps(new_attrs)
             )
         except Exception as e:
             log.warning(f"[consolidate] failed to update keeper: {e}")
             continue
 
-        # Remove other cluster members
+        # Soft-delete losers: mark superseded_by = keeper_element (never VREM)
         for c in cluster[1:]:
-            try:
-                await _redis.execute_command("VREM", mem_store.FACT_KEY, c["element"])
-                removed_elements.add(c["element"])
-            except Exception:
-                pass
+            if c["element"] not in superseded_elements:
+                await mem_store.soft_delete_fact(_redis, c["element"], keeper_element)
+                superseded_elements.add(c["element"])
 
         merged_count += 1
 
+    # ── Phase 3: Prune ─────────────────────────────────────────────────────────
+    # Soft-delete any remaining active entry whose importance has decayed below 0.05.
+    pruned_count = 0
+    for fact in all_facts:
+        if fact["element"] in superseded_elements:
+            continue
+        if fact["attrs"].get("importance", 1.0) < 0.05:
+            await mem_store.soft_delete_fact(_redis, fact["element"], "pruned")
+            superseded_elements.add(fact["element"])
+            pruned_count += 1
+
     ms = int((time.time() - t0) * 1000)
-    log.info(f"[consolidate] merged={merged_count} removed={len(removed_elements)} {ms}ms")
+    log.info(
+        f"[consolidate] decayed={decayed_count} merged={merged_count} "
+        f"pruned={pruned_count} {ms}ms"
+    )
     return {
+        "decayed": decayed_count,
         "merged": merged_count,
-        "removed": len(removed_elements),
+        "pruned": pruned_count,
         "total_before": len(all_facts),
-        "total_after": len(all_facts) - len(removed_elements),
+        "total_after": len(all_facts) - len(superseded_elements),
         "ms": ms,
     }
 
@@ -1200,3 +1401,65 @@ async def admin_delete_facts_by_content(pattern: str = "Always send a report"):
             await _redis.execute_command("VREM", mem_store.FACT_KEY, elem_str)
             deleted += 1
     return {"deleted": deleted, "pattern": pattern}
+
+
+# ── Knowledge Graph endpoints (v0.9.0) ────────────────────────────────────────
+
+class GraphRecallRequest(BaseModel):
+    entity: str
+    k: int = 5
+
+
+@app.get("/graph/{entity}")
+async def graph_neighbors(entity: str):
+    """
+    Return entities related to *entity* in the knowledge graph, with connection counts.
+
+    Example: GET /graph/bob  →  related entities Bob co-occurs with in stored facts.
+    """
+    neighbors = await graph_mod.get_entity_neighbors_with_counts(_redis, entity)
+    return {
+        "entity":    entity,
+        "neighbors": neighbors,
+        "count":     len(neighbors),
+    }
+
+
+@app.post("/graph/recall")
+async def graph_recall(req: GraphRecallRequest):
+    """
+    Retrieve facts from the knowledge graph neighbourhood of an entity.
+
+    Example: {"entity": "Bob", "k": 5}
+    → facts that mention Bob's related entities.
+    """
+    emb = _encode(req.entity)
+    facts = await graph_mod.entity_recall(_redis, req.entity, emb, k=req.k)
+    return {
+        "entity": req.entity,
+        "facts":  [{"content": f["content"], "score": f.get("score", 0.0)} for f in facts],
+        "count":  len(facts),
+    }
+
+
+@app.get("/graph/stats")
+async def graph_stats_endpoint():
+    """Return knowledge graph statistics: node count and edge count."""
+    return await graph_mod.graph_stats(_redis)
+
+
+# ── Config endpoint (v0.9.0) ──────────────────────────────────────────────────
+
+@app.get("/config")
+async def get_config():
+    """Return current service configuration including auto-consolidation settings."""
+    return {
+        "version":                 "0.9.1",
+        "auto_consolidate_every":  _AUTO_CONSOLIDATE_EVERY,
+        "stores_since_last":       _stores_since_consolidation,
+        "periodic_interval_s":     3600,
+        "entropy_gate_threshold":  0.35,
+        "dedup_threshold":         0.95,
+        "consolidate_threshold":   0.85,
+        "session_ttl_s":           14400,
+    }

@@ -1,12 +1,19 @@
 """
-Redis 8 native vectorset store.
+Redis 8 native vectorset store — v0.9.1 (SimpleMem-aligned)
 
 Two vector sets:
   mem:episodes  — episodic memory (conversation turns)
-  mem:facts     — semantic memory (distilled facts)
+  mem:facts     — semantic memory (distilled lossless facts, SimpleMem Section 3.1)
 
 Session working memory in plain Redis strings (TTL-based).
 User persona in Redis Hash (mem:persona).
+
+SimpleMem additions (v0.9.1):
+  - importance field (float 0-1) on each fact: decays with age, used for pruning
+  - superseded_by field: soft-delete — facts merged by consolidation are marked
+    superseded_by = winning entry's element ID rather than hard-deleted
+  - topic and location fields: SimpleMem symbolic layer (R_k metadata)
+  - knn_search() filters out superseded entries by default
 
 Redis 8 vectorset API summary:
   VADD  key FP32 <blob> <element> [SETATTR <json>]
@@ -50,7 +57,8 @@ async def ensure_indexes(r: aioredis.Redis) -> None:
             seed = np.zeros(DIMS, dtype=np.float32)
             attr = json.dumps({"_seed": True, "content": "",
                                "language": "en", "domain": "general",
-                               "access_count": 0, "ts": 0})
+                               "access_count": 0, "ts": 0,
+                               "importance": 0.0, "superseded_by": ""})
             await r.execute_command("VADD", key, "FP32", _blob(seed), "__seed__",
                                     "SETATTR", attr)
     # Tool capability vectorset
@@ -73,11 +81,15 @@ async def knn_search(
     k: int,
     filter_expr: Optional[str] = None,
     bump_heat: bool = False,
+    include_superseded: bool = False,
 ) -> list[dict]:
     """
     KNN search. Returns list of {content, category, score, attrs, _element}.
+
     filter_expr: e.g. '.language == "zh"' or '.domain == "trading"'
     bump_heat:   if True, async-increment access_count on each hit (non-blocking).
+    include_superseded: if False (default), filter out soft-deleted entries.
+                        SimpleMem consolidation marks losers as superseded_by=<winner_id>.
     """
     cmd = ["VSIM", vset_key, "FP32", _blob(embedding),
            "COUNT", k + 1, "WITHSCORES", "WITHATTRIBS"]
@@ -109,6 +121,10 @@ async def knn_search(
         if attrs.get("_seed") or not attrs.get("content"):
             continue
 
+        # SimpleMem soft-delete: skip entries marked as superseded by consolidation
+        if not include_superseded and attrs.get("superseded_by"):
+            continue
+
         item = {
             "content":   attrs.get("content", ""),
             "category":  attrs.get("category", attrs.get("domain", "")),
@@ -121,7 +137,6 @@ async def knn_search(
         items.append(item)
 
         if bump_heat:
-            # Fire-and-forget: don't await, don't block recall latency
             import asyncio
             from heat import bump_heat as _bump
             asyncio.create_task(_bump(r, vset_key, elem_str, attrs))
@@ -146,6 +161,8 @@ async def save_episode(
         "session_id":   session_id,
         "ts":           int(time.time() * 1000),
         "access_count": 0,
+        "importance":   0.5,
+        "superseded_by": "",
     })
     await r.execute_command("VADD", EPISODE_KEY, "FP32", _blob(embedding), uid,
                             "SETATTR", attr)
@@ -163,16 +180,31 @@ async def save_fact(
     keywords: list[str] | None = None,
     persons: list[str] | None = None,
     entities: list[str] | None = None,
+    # SimpleMem additions (v0.9.1)
+    importance: float = 0.5,
+    topic: str | None = None,
+    location: str | None = None,
 ) -> str:
+    """
+    Save a fact to the semantic memory vectorset.
+
+    SimpleMem fields (v0.9.1):
+      importance:    float 0-1, decays during consolidation (×0.9 per 90 days)
+      topic:         SimpleMem topic phrase for the symbolic layer
+      location:      SimpleMem location string for symbolic search
+      superseded_by: empty string = active; set to winner's element ID on merge (soft-delete)
+    """
     uid  = str(ULID())
-    attr_dict = {
-        "content":      content[:500],
-        "category":     category,
-        "language":     language,
-        "domain":       domain,
-        "confidence":   confidence,
-        "ts":           int(time.time() * 1000),
-        "access_count": 0,
+    attr_dict: dict = {
+        "content":       content[:500],
+        "category":      category,
+        "language":      language,
+        "domain":        domain,
+        "confidence":    confidence,
+        "ts":            int(time.time() * 1000),
+        "access_count":  0,
+        "importance":    max(0.0, min(1.0, importance)),
+        "superseded_by": "",   # empty = active; set to winner_id on consolidation
     }
     if keywords:
         attr_dict["keywords"] = keywords[:10]
@@ -180,9 +212,65 @@ async def save_fact(
         attr_dict["persons"] = persons[:5]
     if entities:
         attr_dict["entities"] = entities[:5]
+    if topic:
+        attr_dict["topic"] = topic[:100]
+    if location:
+        attr_dict["location"] = location[:100]
+
     await r.execute_command("VADD", FACT_KEY, "FP32", _blob(embedding), uid,
                             "SETATTR", json.dumps(attr_dict))
     return uid
+
+
+async def soft_delete_fact(
+    r: aioredis.Redis,
+    element_id: str,
+    superseded_by: str,
+) -> None:
+    """
+    Mark a fact as superseded (soft-delete, SimpleMem consolidation pattern).
+
+    Sets superseded_by = winner's element_id. knn_search() skips these by default.
+    The entry is kept for audit/history but excluded from recall.
+    """
+    # Get current attrs first
+    try:
+        results = await r.execute_command(
+            "VSIM", FACT_KEY, "ELE", element_id, "COUNT", 1, "WITHATTRIBS"
+        )
+    except Exception:
+        results = []
+
+    # Use VSETATTR to update superseded_by
+    # We need current attrs to avoid losing other fields
+    # Fall back to minimal update
+    try:
+        # Fetch attrs via VSIM with zero vector to find the entry
+        seed = np.zeros(DIMS, dtype=np.float32)
+        scan = await r.execute_command(
+            "VSIM", FACT_KEY, "FP32", seed.tobytes(),
+            "COUNT", 2000, "WITHSCORES", "WITHATTRIBS"
+        )
+        i = 0
+        while i + 2 < len(scan):
+            elem = scan[i]
+            raw = scan[i + 2]
+            i += 3
+            elem_str = elem.decode() if isinstance(elem, bytes) else elem
+            if elem_str != element_id:
+                continue
+            try:
+                attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+                attrs["superseded_by"] = superseded_by
+                attrs["importance"] = min(attrs.get("importance", 0.5) * 0.1, 0.05)
+                await r.execute_command(
+                    "VSETATTR", FACT_KEY, element_id, json.dumps(attrs)
+                )
+            except Exception:
+                pass
+            break
+    except Exception:
+        pass
 
 
 async def save_procedure(
@@ -196,8 +284,6 @@ async def save_procedure(
 ) -> str:
     """
     Store a successful procedure/workflow in mem:procedures.
-    Procedures are embeddings of the *task description* so we can retrieve
-    'how to do X' when facing a similar task.
     """
     uid = str(ULID())
     attr = json.dumps({

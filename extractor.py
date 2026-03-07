@@ -1,20 +1,31 @@
 """
-Hybrid fact extractor: fast regex (Layer 1) + LLM extraction (Layer 2).
+Hybrid fact extractor — v0.9.1 (SimpleMem-aligned)
 
-Layer 1: Compiled regex patterns — ~1ms, catches explicit first-person declarations.
-Layer 2: GLM-4-flash LLM call  — ~200-500ms, catches implicit/Chinese/contextual facts.
+Implements SimpleMem's Semantic Structured Compression (Section 3.1):
+  Φ_gate(W) → {m_k}  — implicit semantic density gating via LLM
+  Φ_coref             — pronoun resolution (no he/she/it/they/this)
+  Φ_time              — absolute timestamp disambiguation
+  I(m_k) = {s_k, l_k, r_k} — multi-view indexing: semantic + lexical + symbolic
 
-Both layers run together; results are merged and deduped before return.
-The store path in main.py is async (background), so LLM latency is invisible to the user.
+Three-layer extraction:
+  Layer 1: Compiled regex (< 1ms) — fast explicit first-person facts
+  Layer 2: SimpleMem LLM gate (200-500ms) — structured lossless_restatement
+            with topic, location, persons, entities, importance score
+  Layer 3: Merge + dedup
+
+The LLM prompt produces pronoun-free, absolute-timestamp memory units
+that are self-contained and independently interpretable — exactly as
+specified in SimpleMem Section 3.1.
 """
 
 import json
 import logging
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+import datetime
 
 import httpx
 
@@ -23,13 +34,16 @@ log = logging.getLogger("mem")
 
 @dataclass
 class ExtractedFact:
-    content: str
+    content: str                          # lossless_restatement (pronoun-free, abs. time)
     category: str = "general"
     confidence: float = 0.8
-    source: str = "regex"     # "regex" or "llm"
+    source: str = "regex"                 # "regex" or "llm"
     keywords: list[str] | None = None
     persons: list[str] | None = None
     entities: list[str] | None = None
+    topic: str | None = None             # SimpleMem: topic phrase (NEW v0.9.1)
+    location: str | None = None          # SimpleMem: symbolic location (NEW v0.9.1)
+    importance: float = 0.5             # SimpleMem: importance score 0-1 (NEW v0.9.1)
 
 
 # ── Layer 1: Regex patterns (fast, ~1ms) ──────────────────────────────────────
@@ -44,7 +58,7 @@ _PATTERNS = [
     (re.compile(r"(?:always|never|always use|never use)\s+(.+?)(?:\.|,|$)", re.I), "rule"),
     (re.compile(r"(?:the (?:api|key|token|secret|password) (?:is|for .+ is))\s+(\S+)", re.I), "credential"),
     (re.compile(r"(?:deadline|due date|by)\s+([\w\s,]+\d{4}|\d{4}-\d{2}-\d{2})", re.I), "deadline"),
-    # Capability-aware patterns (agent self-knowledge)
+    # Capability-aware patterns
     (re.compile(r"(?:I (?:used|ran|executed|called|invoked)|using|via)\s+([\w\-]+(?:\s+tool|command)?)\s+to\s+(.+?)(?:\.|,|$)", re.I), "tool_use"),
     (re.compile(r"(?:installed|added|enabled|activated)\s+(.+?)\s+(?:tool|plugin|skill|extension|mcp)", re.I), "capability_gained"),
     (re.compile(r"(?:switched to|now using|changed to|upgrade to)\s+(.+?)(?:\.|,|$)", re.I), "env_change"),
@@ -73,54 +87,71 @@ def _regex_extract(user_text: str) -> list[ExtractedFact]:
     return facts
 
 
-# ── Layer 2: LLM extraction (GLM-4-flash, ~200-500ms) ────────────────────────
+# ── Layer 2: SimpleMem LLM gate (GLM-4-flash, ~200-500ms) ────────────────────
 
 ZAI_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
 LLM_TIMEOUT_S = 10.0
-LLM_MAX_INPUT = 1500   # chars of conversation to send
+LLM_MAX_INPUT = 2000   # chars of conversation to send to LLM
 
-_EXTRACT_PROMPT = """从以下对话中提取关于用户的关键事实。只提取明确表述的事实，不要推测。
+# SimpleMem-aligned extraction prompt (bilingual):
+# - Φ_coref: forbids all pronouns (he/she/it/they/this/that/我/他/她)
+# - Φ_time:  converts relative time → absolute ISO 8601
+# - Multi-view indexing: lossless_restatement + keywords + timestamp +
+#   location + persons + entities + topic
+# - Importance estimation (0.0-1.0): how significant/novel this fact is
+_EXTRACT_PROMPT = """Extract all valuable information from the following conversation as structured memory units.
 
-【重要要求 — 原子化】
-1. 每条事实必须是完整、独立、无歧义的句子（Atomic Entry）
-2. 禁止使用代词（他/她/它/我/你/this/that/they），必须用具体名字替代
-3. 时间必须用绝对格式（2026-03-01），禁止"昨天/今天/上周"等相对时间
-4. 每条事实脱离对话上下文后仍可独立理解
+TODAY'S DATE: {today}
 
-返回 JSON 数组，每条记录格式:
-[{
-  "content": "完整的原子化事实陈述（包含主语、时间、具体内容）",
-  "category": "分类",
-  "keywords": ["关键词1", "关键词2"],
-  "persons": ["人名1"],
-  "entities": ["实体名"]
-}]
+[Extraction Rules — SimpleMem Section 3.1]
+1. PRONOUN PROHIBITION: Absolutely forbid pronouns (he/she/it/they/this/that/I/we/
+   他/她/它/我/你/他们/这/那). Replace with specific names or entities.
+2. ABSOLUTE TIME: Convert all relative time (yesterday/today/last week/明天/上周) to
+   absolute ISO 8601 dates based on today's date ({today}).
+3. LOSSLESS RESTATEMENT: Each fact must be complete, self-contained and independently
+   understandable without the original conversation.
+4. COMPLETE COVERAGE: Generate enough entries to capture ALL meaningful information.
+   One fact per distinct piece of information.
+5. IMPORTANCE: Score 0.1-1.0 (1.0 = critical long-term fact, 0.5 = useful context,
+   0.1 = minor detail). Preferences/rules/identity score high (0.7-1.0).
+   Tool uses/env context score medium (0.4-0.6).
 
-分类只能是以下之一:
-- identity: 姓名、身份
-- work: 工作、职位、公司
-- preference: 偏好、喜好、厌恶
-- location: 位置、城市、国家
-- personal: 个人信息（邮箱、生日等）
-- reminder: 用户要求记住的事项
-- rule: 用户设定的规则（总是/永远不）
-- decision: 技术决策、方案选择
-- context: 项目背景、当前任务
-- credential: API密钥、令牌（注意脱敏）
-- tool_use: 使用了哪个工具/命令完成了什么任务（如"用Bash工具运行了npm install"）
-- capability_gained: 安装、启用了新工具/技能/插件（如"安装了Docker MCP服务器"）
-- env_change: 环境变更（如切换目录、切换分支、升级运行时）
-- env_context: 当前环境状态（如"当前在Python 3.12环境，项目目录为/code/app"）
-- procedure: 完成某类任务的步骤/工作流（如"要搜索文件，使用Glob工具配合**/*.py模式"）
+[Output Format — JSON array]
+[{{
+  "lossless_restatement": "Complete unambiguous statement (no pronouns, no relative time)",
+  "category": "one of the categories below",
+  "keywords": ["keyword1", "keyword2"],
+  "timestamp": "YYYY-MM-DDTHH:MM:SS or null",
+  "location": "specific location or null",
+  "persons": ["name1"],
+  "entities": ["entity1"],
+  "topic": "brief topic phrase",
+  "importance": 0.75
+}}]
 
-示例:
-对话: "user: 我喜欢用bun，不要用npm"
-输出: [{"content": "用户偏好使用 bun 作为 JavaScript 包管理器，明确拒绝 npm", "category": "preference", "keywords": ["bun", "npm", "包管理器"], "persons": [], "entities": ["bun", "npm"]}]
+[Categories]
+identity | work | preference | location | personal | reminder | rule | decision |
+context | tool_use | capability_gained | env_change | env_context | procedure
 
-如果没有值得提取的事实，返回空数组 []
-支持中英文混合提取。
+[Example]
+Conversation: "user: I prefer using bun over npm. Always use bun for JS projects.
+assistant: Got it. I'll use bun."
+Output:
+[{{
+  "lossless_restatement": "The user prefers bun over npm as the JavaScript package manager and requires bun to be used for all JavaScript projects.",
+  "category": "preference",
+  "keywords": ["bun", "npm", "JavaScript", "package manager"],
+  "timestamp": null,
+  "location": null,
+  "persons": [],
+  "entities": ["bun", "npm"],
+  "topic": "JavaScript package manager preference",
+  "importance": 0.9
+}}]
 
-对话内容:
+Return ONLY the JSON array. If nothing worth storing, return [].
+
+[Conversation]
 {conversation}"""
 
 
@@ -143,72 +174,138 @@ def _load_key() -> str:
     return ""
 
 
+def _parse_llm_json(raw: str) -> list:
+    """Robustly parse JSON from LLM response (handles markdown code fences)."""
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+    # Find JSON array
+    start = raw.find("[")
+    if start == -1:
+        return []
+    # Try from first '[' to last ']'
+    end = raw.rfind("]")
+    if end == -1:
+        return []
+    return json.loads(raw[start:end + 1])
+
+
 async def _llm_extract(conversation_text: str) -> list[ExtractedFact]:
-    """Layer 2: LLM-based extraction via GLM-4-flash."""
+    """Layer 2: SimpleMem-style LLM extraction via GLM-4-flash.
+
+    Produces pronoun-free, absolute-timestamp lossless_restatement entries
+    matching SimpleMem Section 3.1 multi-view indexing format.
+    """
     key = _load_key()
     if not key:
         log.debug("[extractor] no ZAI key, skipping LLM extraction")
         return []
 
-    prompt = _EXTRACT_PROMPT.replace("{conversation}", conversation_text[:LLM_MAX_INPUT])
+    today = datetime.date.today().isoformat()
+    prompt = _EXTRACT_PROMPT.format(
+        today=today,
+        conversation=conversation_text[:LLM_MAX_INPUT],
+    )
 
-    try:
-        async with httpx.AsyncClient(timeout=LLM_TIMEOUT_S) as client:
-            resp = await client.post(
-                ZAI_URL,
-                json={
-                    "model": "glm-4-flash",
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 500,
-                    "temperature": 0.1,
-                },
-                headers={"Authorization": f"Bearer {key}"},
+    max_retries = 2
+    for attempt in range(max_retries):
+        try:
+            async with httpx.AsyncClient(timeout=LLM_TIMEOUT_S) as client:
+                resp = await client.post(
+                    ZAI_URL,
+                    json={
+                        "model": "glm-4-flash",
+                        "messages": [
+                            {
+                                "role": "system",
+                                "content": (
+                                    "You are a professional memory extraction assistant. "
+                                    "You extract structured, unambiguous information from conversations. "
+                                    "Output valid JSON only."
+                                ),
+                            },
+                            {"role": "user", "content": prompt},
+                        ],
+                        "max_tokens": 800,
+                        "temperature": 0.1,
+                    },
+                    headers={"Authorization": f"Bearer {key}"},
+                )
+                if resp.status_code != 200:
+                    log.warning(f"[extractor] LLM returned {resp.status_code}")
+                    return []
+
+                raw = resp.json()["choices"][0]["message"]["content"].strip()
+                items = _parse_llm_json(raw)
+
+                if not isinstance(items, list):
+                    if attempt < max_retries - 1:
+                        continue
+                    return []
+
+                facts: list[ExtractedFact] = []
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    # SimpleMem uses "lossless_restatement" as the primary content field
+                    content = (
+                        item.get("lossless_restatement")
+                        or item.get("content")
+                        or ""
+                    )
+                    if not content or len(content.strip()) < 10:
+                        continue
+
+                    category = item.get("category", "general")
+                    # Never store credentials from LLM extraction for safety
+                    if category == "credential":
+                        continue
+
+                    importance = float(item.get("importance", 0.5))
+                    importance = max(0.0, min(1.0, importance))
+
+                    facts.append(ExtractedFact(
+                        content=str(content).strip()[:500],
+                        category=category,
+                        confidence=0.9,   # LLM-extracted = higher confidence
+                        source="llm",
+                        keywords=item.get("keywords") or None,
+                        persons=item.get("persons") or None,
+                        entities=item.get("entities") or None,
+                        topic=item.get("topic") or None,
+                        location=item.get("location") or None,
+                        importance=importance,
+                    ))
+
+                log.info(
+                    f"[extractor] LLM produced {len(facts)} lossless entries "
+                    f"(SimpleMem Φ_gate)"
+                )
+                return facts
+
+        except json.JSONDecodeError as e:
+            log.warning(f"[extractor] LLM returned non-JSON (attempt {attempt+1}): {e}")
+            if attempt >= max_retries - 1:
+                return []
+        except Exception as e:
+            log.warning(
+                f"[extractor] LLM extraction failed (attempt {attempt+1}): "
+                f"{type(e).__name__}: {e}"
             )
-            if resp.status_code != 200:
-                log.warning(f"[extractor] LLM returned {resp.status_code}")
+            if attempt >= max_retries - 1:
                 return []
 
-            raw = resp.json()["choices"][0]["message"]["content"].strip()
-
-            # Parse JSON from response (handle markdown code blocks)
-            if raw.startswith("```"):
-                raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-
-            items = json.loads(raw)
-            if not isinstance(items, list):
-                return []
-
-            facts = []
-            for item in items:
-                if not isinstance(item, dict) or not item.get("content"):
-                    continue
-                category = item.get("category", "general")
-                # Skip credential extraction from LLM for safety
-                if category == "credential":
-                    continue
-                facts.append(ExtractedFact(
-                    content=str(item["content"]).strip()[:300],
-                    category=category,
-                    confidence=0.85,
-                    source="llm",
-                    keywords=item.get("keywords") or None,
-                    persons=item.get("persons") or None,
-                    entities=item.get("entities") or None,
-                ))
-            return facts
-
-    except json.JSONDecodeError as e:
-        log.warning(f"[extractor] LLM returned non-JSON: {e}")
-        return []
-    except Exception as e:
-        log.warning(f"[extractor] LLM extraction failed: {type(e).__name__}: {e}", exc_info=True)
-        return []
+    return []
 
 
 # ── Merge + dedup ─────────────────────────────────────────────────────────────
 
 def _dedup(facts: list[ExtractedFact]) -> list[ExtractedFact]:
-    """Deduplicate by content similarity (substring check for speed)."""
+    """Deduplicate by content similarity (substring check for speed).
+
+    LLM facts take priority (higher importance, richer metadata).
+    Regex facts are kept only if they add unique information.
+    """
     result: list[ExtractedFact] = []
     seen_contents: list[str] = []
 
@@ -216,7 +313,6 @@ def _dedup(facts: list[ExtractedFact]) -> list[ExtractedFact]:
         content_lower = fact.content.lower()
         is_dup = False
         for existing in seen_contents:
-            # Substring match in either direction
             if content_lower in existing or existing in content_lower:
                 is_dup = True
                 break
@@ -244,8 +340,14 @@ async def extract_hybrid(
     conversation_text: str = "",
 ) -> list[ExtractedFact]:
     """
-    Hybrid extraction: regex (instant) + LLM (async).
-    conversation_text: full "role: content" text for LLM context.
+    Hybrid extraction: regex (instant) + SimpleMem LLM gate (async).
+
+    Layer 2 implements SimpleMem's Semantic Structured Compression:
+    - Φ_coref: pronoun resolution (no he/she/it/they)
+    - Φ_time:  relative → absolute timestamp conversion
+    - I(m_k):  multi-view indexing (lossless_restatement + keywords +
+                                     timestamp + location + persons + entities + topic)
+
     Falls back to regex-only if LLM fails.
     """
     # Layer 1: regex (~1ms)
@@ -256,17 +358,18 @@ async def extract_hybrid(
     )
     regex_facts = _regex_extract(user_text)
 
-    # Layer 2: LLM (~200-500ms)
+    # Layer 2: SimpleMem LLM gate (~200-500ms, background)
     llm_input = conversation_text or user_text
     llm_facts = await _llm_extract(llm_input)
 
-    # Merge: LLM first (atomized, richer metadata), then regex additions
-    # LLM facts are self-contained with coreference resolution;
-    # regex facts are raw snippets kept only if LLM missed them
+    # Merge: LLM first (lossless, pronoun-free, richer metadata),
+    # then regex additions only where LLM missed them.
     merged = llm_facts + regex_facts
     deduped = _dedup(merged)
 
-    log.info(f"[extractor] regex={len(regex_facts)} llm={len(llm_facts)} "
-             f"merged={len(deduped)}")
+    log.info(
+        f"[extractor] regex={len(regex_facts)} llm={len(llm_facts)} "
+        f"merged={len(deduped)} (SimpleMem Φ_gate active)"
+    )
 
     return deduped
