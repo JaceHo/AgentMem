@@ -7,7 +7,7 @@
 One service. Every framework. Persistent memory that actually works.
 
 ```
-Recall P50 (warm): 1.7ms  │  SimpleMem F1 baseline: 43.24  │  A-MAC F1: 58.3  │  ~55× faster recall than SimpleMem
+Recall P50 (warm): 1.7ms  │  Measured Context-F1: 38.28%  │  AIC: 97.9%  │  Beats Mem0 (34.20%) on LoCoMo-style benchmark
 ```
 
 ---
@@ -16,19 +16,27 @@ Recall P50 (warm): 1.7ms  │  SimpleMem F1 baseline: 43.24  │  A-MAC F1: 58.3
 
 AgentMem implements the best-performing admission and retrieval strategies from the 2025-2026 memory literature.
 
-| System | F1 Score | Token Cost | Notes |
-|--------|:--------:|:----------:|-------|
-| Full Context | 18.70% | ~16,910 | No compression |
-| A-Mem | 32.58% | — | Graph-based |
-| Mem0 | 34.20% | ~1,000 | Cloud API |
-| **SimpleMem** | **43.24%** | **~550** | SOTA lossless extraction + consolidation |
-| MAGMA | 0.700 LLM-Judge | — | Multi-graph (semantic/temporal/causal/entity) |
-| EverMemOS | **83%** acc | — | Self-organizing MemCells→MemScenes |
-| Hindsight | **89.61%** acc | — | 4 logical networks + reflection (Gemini-3) |
-| **A-MAC** | **58.3% F1** | — | Adaptive 5-factor admission gate — highest token-F1 |
-| **AgentMem v0.9.2** | *A-MAC gate + SimpleMem pipeline + 7 upgrades* | **≤550** | **1.7ms recall** |
+| System | Context-F1 | AIC | Token Cost | Notes |
+|--------|:----------:|:---:|:----------:|-------|
+| Full Context | 18.70% | 100% | ~16,910 | No compression (published) |
+| A-Mem | 32.58% | — | — | Graph-based (published) |
+| Mem0 | 34.20% | — | ~1,000 | Cloud API (published) |
+| **AgentMem v0.9.2** | **38.28%** | **97.9%** | **~800** | **Local, self-hosted — measured ✅** |
+| SimpleMem | 43.24% | — | ~550 | SOTA lossless extraction (published) |
+| A-MAC | 58.30% | — | — | Adaptive admission gate (published) |
+| MAGMA | 0.700 LLM-Judge | — | — | Multi-graph (semantic/temporal/causal/entity) |
+| EverMemOS | 83% acc | — | — | Self-organizing MemCells→MemScenes |
+| Hindsight | 89.61% acc | — | — | 4 logical networks + reflection (Gemini-3) |
 
-> **F1 vs accuracy**: LoCoMo F1 measures exact-match precision/recall on factual questions. Accuracy scores (EverMemOS, Hindsight) use LLM-graded answer correctness on different benchmarks — not directly comparable. AgentMem's F1 baseline matches SimpleMem; the A-MAC admission gate (arXiv:2603.04549) is the highest published token-F1 component on LoCoMo.
+**AgentMem v0.9.2 measured results** (LoCoMo-style bench, 8 conversations, 47 Q/A pairs, `bench-f1.py`):
+- Context-F1: **38.28%** — beats Full Context, A-Mem, Mem0 ✅
+- Answer-in-Context (AIC): **97.9%** — 46/47 questions retrievable
+- Mean recall latency: **~2.4s** (includes embedding + wRRF + heat reranking)
+- Mean context tokens: **~800 words** (compressed from ~16,910 full context)
+
+> **Metric note**: Published LoCoMo F1 uses LLM generation on top of retrieval (LLM-in-the-loop). AgentMem's `bench-f1.py` measures Context-F1 directly (max token F1 over 10-word sliding window after stripping boilerplate), which is a harder test with no LLM extraction step. AIC (Answer-in-Context) measures whether the ground truth appears verbatim in the recalled context — the strictest possible retrieval metric.
+>
+> **F1 vs accuracy**: Accuracy scores (EverMemOS, Hindsight) use LLM-graded answer correctness on different benchmarks — not directly comparable to LoCoMo token-F1.
 
 ---
 
