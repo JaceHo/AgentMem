@@ -439,7 +439,7 @@ def _tokenize_query(query: str) -> set[str]:
 
 def _keyword_boost(items: list[dict], query: str, boost: float = 0.06) -> list[dict]:
     """
-    SimpleMem Phase 3: lexical layer boost.
+    SimpleMem Phase 3: lexical layer boost (BM25-lite).
     For each retrieved item, add `boost` × (matching_kw_count) to score.
     Enables exact-name matches (Bob, 2025-11-20, Redis) to surface higher.
     """
@@ -455,10 +455,8 @@ def _keyword_boost(items: list[dict], query: str, boost: float = 0.06) -> list[d
         keywords = [kw.lower() for kw in (attrs.get("keywords") or [])]
         content  = item.get("content", "").lower()
 
-        # Keyword overlap with stored keywords array
-        kw_overlap  = len(query_tokens & set(keywords))
-        # Content term overlap (lighter weight)
-        ct_overlap  = sum(1 for t in query_tokens if t in content)
+        kw_overlap    = len(query_tokens & set(keywords))
+        ct_overlap    = sum(1 for t in query_tokens if t in content)
         overlap_score = kw_overlap + ct_overlap * 0.3
 
         new_item = dict(item)
@@ -467,6 +465,61 @@ def _keyword_boost(items: list[dict], query: str, boost: float = 0.06) -> list[d
 
     boosted.sort(key=lambda x: x["score"], reverse=True)
     return boosted
+
+
+def _importance_boost(items: list[dict], weight: float = 0.15) -> list[dict]:
+    """
+    AgentMem advantage over SimpleMem: importance-weighted recall reranking.
+
+    SimpleMem uses `importance` only during consolidation winner selection.
+    Here we use it during retrieval so high-signal facts (rules, identity,
+    preferences — importance 0.7-1.0) outrank transient context (0.3-0.5).
+
+    weight=0.15 adds up to 0.15 to the base cosine score (0.0-1.0 range),
+    enough to surface critical memories without overwhelming cosine signal.
+    """
+    if not items:
+        return items
+    boosted = []
+    for item in items:
+        importance = item.get("attrs", {}).get("importance", 0.5)
+        new_item = dict(item)
+        new_item["score"] = item.get("score", 0.0) + weight * float(importance)
+        boosted.append(new_item)
+    boosted.sort(key=lambda x: x["score"], reverse=True)
+    return boosted
+
+
+def _rrf_merge(lists: list[list[dict]], k: int = 60, limit: int = 20) -> list[dict]:
+    """
+    Reciprocal Rank Fusion — fuses multiple ranked retrieval lists.
+
+    RRF(d) = Σ_i  1 / (k + rank_i(d))   where k=60 is the standard smoothing constant.
+
+    Proven to outperform linear score combination and simple set union in
+    multi-query/multi-view retrieval (Cormack et al., SIGIR 2009). SimpleMem
+    uses plain set union; this is an AgentMem improvement on top of the same
+    retrieval sources.
+    """
+    rrf_scores: dict[str, float] = {}
+    items_by_content: dict[str, dict] = {}
+
+    for lst in lists:
+        for rank, item in enumerate(lst, 1):
+            content = item.get("content", "")
+            if not content:
+                continue
+            rrf_scores[content] = rrf_scores.get(content, 0.0) + 1.0 / (k + rank)
+            if content not in items_by_content:
+                items_by_content[content] = item
+
+    sorted_pairs = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
+    result = []
+    for content, rrf_score in sorted_pairs[:limit]:
+        item = dict(items_by_content[content])
+        item["score"] = rrf_score
+        result.append(item)
+    return result
 
 
 # ── Background store ──────────────────────────────────────────────────────────
@@ -735,12 +788,14 @@ async def recall(req: RecallRequest):
 
     # Parallel: persona + env + session ctx + scene-filtered facts + episodes
     # + tool recall if capability query or include_tools=True
+    # + symbolic structured pass (async, no extra latency via gather)
     gather_tasks = [
         persona_mod.get_context(_redis),
         cap_mod.get_env_context(_redis),
         mem_store.get_session_context(_redis, req.session_id),
         _fetch(mem_store.FACT_KEY,    n_facts,    lang_filter_sym or None),
         _fetch(mem_store.EPISODE_KEY, n_episodes, lang_filter_sym or None),
+        retrieval_planner.analyze_query_structure(req.query),  # symbolic layer (index 5)
     ]
     if req.include_tools and is_cap_query:
         gather_tasks.append(cap_mod.recall_tools(_redis, emb, k=6))
@@ -748,12 +803,37 @@ async def recall(req: RecallRequest):
         gather_tasks.append(asyncio.sleep(0))
 
     results = await asyncio.gather(*gather_tasks)
-    persona_ctx = results[0]
-    env_ctx     = results[1]
-    session_ctx = results[2]
-    facts_scene = results[3]
-    eps_scene   = results[4]
-    tools_raw   = results[5] if isinstance(results[5], list) else []
+    persona_ctx  = results[0]
+    env_ctx      = results[1]
+    session_ctx  = results[2]
+    facts_scene  = results[3]
+    eps_scene    = results[4]
+    query_struct = results[5] if isinstance(results[5], dict) else {}
+    tools_raw    = results[6] if isinstance(results[6], list) else []
+
+    # Symbolic structured pass (AgentMem §3.3 extension):
+    # If the query mentions specific persons or entities, do a targeted scan
+    # for facts that explicitly contain those names — catches cases where
+    # semantic similarity is low but the name is a direct match.
+    sym_facts: list[dict] = []
+    sym_entities = (query_struct.get("persons") or []) + (query_struct.get("entities") or [])
+    if sym_entities:
+        sym_tasks = []
+        for ent in sym_entities[:3]:   # cap at 3 to bound latency
+            ent_slug = ent.lower().replace(" ", "_")
+            sym_tasks.append(
+                mem_store.knn_search(_redis, mem_store.FACT_KEY, _encode(ent), k=3,
+                                     filter_expr=lang_filter_sym or None)
+            )
+        sym_batches = await asyncio.gather(*sym_tasks)
+        seen_sym = {f["content"] for f in facts_scene}
+        for batch in sym_batches:
+            for item in (batch if isinstance(batch, list) else []):
+                if item["content"] not in seen_sym:
+                    sym_facts.append(item)
+                    seen_sym.add(item["content"])
+        if sym_facts:
+            log.debug(f"[recall] symbolic pass: +{len(sym_facts)} facts for entities {sym_entities[:3]}")
 
     # SimpleMem Section 3.3 — Intent-Aware Planning (opt-in)
     # If enable_planning=True, run LLM query planning to generate targeted queries,
@@ -797,20 +877,29 @@ async def recall(req: RecallRequest):
     facts_global = supp_results[0] if isinstance(supp_results[0], list) else []
     eps_global   = supp_results[1] if isinstance(supp_results[1], list) else []
 
-    # Merge, dedup by content, heat-rerank
-    def _merge(primary, supplement, limit):
-        seen = {i["content"] for i in primary}
-        merged = list(primary) + [i for i in supplement if i["content"] not in seen]
-        ranked = heat_mod.heat_rerank(merged)
-        return ranked[:limit]
+    # RRF multi-list merge (AgentMem advantage over SimpleMem's plain union):
+    # Fuse scene + global + symbolic passes via Reciprocal Rank Fusion,
+    # then heat-rerank the fused list.
+    def _merge(primary, supplement, symbolic, limit):
+        # Heat-rerank each source individually before RRF so within-list
+        # ordering reflects recency+access_count, not just raw cosine
+        p_ranked   = heat_mod.heat_rerank(primary)
+        s_ranked   = heat_mod.heat_rerank(supplement) if supplement else []
+        sym_ranked = heat_mod.heat_rerank(symbolic)   if symbolic   else []
+        fused = _rrf_merge([p_ranked, s_ranked, sym_ranked], limit=limit * 2)
+        return fused[:limit]
 
-    facts    = _merge(facts_scene,   facts_global,  n_facts)
-    episodes = _merge(eps_scene,     eps_global,    n_episodes)
+    facts    = _merge(facts_scene, facts_global, sym_facts,  n_facts)
+    episodes = _merge(eps_scene,   eps_global,   [],         n_episodes)
 
     # SimpleMem Phase 3: lexical keyword boost (BM25-lite layer)
-    # Boosts facts whose stored keywords overlap with query tokens.
     facts    = _keyword_boost(facts,    req.query)
-    episodes = _keyword_boost(episodes, req.query, boost=0.03)  # lighter for episodes
+    episodes = _keyword_boost(episodes, req.query, boost=0.03)
+
+    # AgentMem advantage: importance-weighted reranking.
+    # High-importance facts (rules, identity, preferences) surface above transient context.
+    facts    = _importance_boost(facts)
+    episodes = _importance_boost(episodes, weight=0.05)  # lighter for episodes
 
     # SimpleMem reflection loop (opt-in): check if results sufficient, if not re-fetch
     if req.enable_reflection and facts:
@@ -1256,7 +1345,12 @@ async def _do_consolidate(
         if not merged_content:
             continue
 
-        cluster.sort(key=lambda c: c["attrs"].get("ts", 0), reverse=True)
+        # Keeper = highest importance in cluster (aligned with SimpleMem's winner
+        # selection policy: importance beats recency). Ties broken by newer timestamp.
+        cluster.sort(
+            key=lambda c: (c["attrs"].get("importance", 0.5), c["attrs"].get("ts", 0)),
+            reverse=True
+        )
         keeper = cluster[0]
         keeper_element = keeper["element"]
 
