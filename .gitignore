@@ -5,3 +5,6 @@ __pycache__/
 .env
 *.log
 .DS_Store
+# Runtime state — digest ingestion progress trackers
+.digest-state.json
+.digest-claudecode-state.json
