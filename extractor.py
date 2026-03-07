@@ -155,15 +155,22 @@ Return ONLY the JSON array. If nothing worth storing, return [].
 {conversation}"""
 
 
-def _load_key() -> str:
-    """Re-read on every call so key rotation is picked up without restart."""
-    if k := os.environ.get("ZAI_API_KEY"):
-        return k
+def _load_env_var(name: str) -> str:
+    """Read a var from environment → .env file → return empty string."""
+    if v := os.environ.get(name):
+        return v
     local_env = Path(__file__).parent / ".env"
     if local_env.exists():
         for line in local_env.read_text().splitlines():
-            if line.startswith("ZAI_API_KEY="):
+            if line.startswith(f"{name}="):
                 return line.split("=", 1)[1].strip().strip("\"'")
+    return ""
+
+
+def _load_key() -> str:
+    """Re-read on every call so key rotation is picked up without restart."""
+    if k := _load_env_var("ZAI_API_KEY"):
+        return k
     cfg = Path.home() / ".openclaw" / "openclaw.json"
     if cfg.exists():
         try:
@@ -172,6 +179,12 @@ def _load_key() -> str:
         except Exception:
             pass
     return ""
+
+
+def _load_proxy() -> str | None:
+    """Return proxy URL for ZAI requests, or None to use direct connection."""
+    p = _load_env_var("ZAI_PROXY") or _load_env_var("HTTPS_PROXY") or _load_env_var("HTTP_PROXY")
+    return p or None
 
 
 def _parse_llm_json(raw: str) -> list:
@@ -207,10 +220,11 @@ async def _llm_extract(conversation_text: str) -> list[ExtractedFact]:
         conversation=conversation_text[:LLM_MAX_INPUT],
     )
 
+    proxy = _load_proxy()
     max_retries = 2
     for attempt in range(max_retries):
         try:
-            async with httpx.AsyncClient(timeout=LLM_TIMEOUT_S) as client:
+            async with httpx.AsyncClient(timeout=LLM_TIMEOUT_S, proxy=proxy) as client:
                 resp = await client.post(
                     ZAI_URL,
                     json={

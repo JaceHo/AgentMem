@@ -82,6 +82,168 @@ AgentMem implements the full [SimpleMem](https://arxiv.org/abs/2601.02553) pipel
 
 ---
 
+## Claude Code — One-Command Setup
+
+The fastest way to give Claude Code persistent memory across every session:
+
+```bash
+git clone https://github.com/JaceHo/AgentMem
+cd AgentMem
+python3 -m venv venv && venv/bin/pip install -r requirements.txt
+bash setup-claude.sh   # installs service + hooks in one shot
+```
+
+That's it. Open a new Claude Code session — it will automatically recall your preferences, past decisions, project context, and environment state before every prompt.
+
+**What `setup-claude.sh` does:**
+1. Fixes + loads the launchd plist (auto-start on login)
+2. Waits for service health at `http://localhost:18800`
+3. Writes 3 hook scripts to `claude-code/hooks/`
+4. Patches `~/.claude/settings.json` with the hooks block
+
+**What you get on every Claude Code prompt (≤380ms added latency):**
+```
+<cross_session_memory>
+## User Profile
+- name: Jace
+- preferences: prefers bun over npm, works on openclaw-memory Redis service
+- rules: always use AgentMem for OpenClaw memory
+
+## Long-Term Memory (Facts)
+1. [preference] prefers bun over npm
+2. [rule] always use AgentMem for OpenClaw memory
+...
+
+## Recent Relevant Episodes
+1. user: I always deploy with Docker Compose on port 8080
+   assistant: Noted — Docker Compose, port 8080.
+...
+</cross_session_memory>
+```
+
+**Hook architecture (transparent, zero config after install):**
+
+| Hook | Trigger | Action | Latency |
+|------|---------|--------|---------|
+| `recall.sh` | Every user prompt | Injects cross-session memory via `additionalContext` | ~330ms |
+| `store.sh` | Session end (`Stop`) | Persists transcript → long-term Redis memory | async |
+| `register-env.sh` | Session start | Registers OS/git/cwd/model env state | ~50ms |
+
+**Manual hook registration** (if you already have the service running):
+```bash
+# Add to ~/.claude/settings.json "hooks" section:
+python3 - ~/.claude/settings.json /path/to/AgentMem/claude-code/hooks << 'EOF'
+import json, sys
+s, h = sys.argv[1], sys.argv[2]
+settings = json.load(open(s))
+settings["hooks"] = {
+    "SessionStart":     [{"matcher":"startup|clear|compact","hooks":[{"type":"command","command":f"{h}/register-env.sh","timeout":10}]}],
+    "UserPromptSubmit": [{"hooks":[{"type":"command","command":f"{h}/recall.sh","timeout":10}]}],
+    "Stop":             [{"hooks":[{"type":"command","command":f"{h}/store.sh","timeout":30}]}]
+}
+json.dump(settings, open(s,'w'), indent=2)
+print("Done:", list(settings["hooks"].keys()))
+EOF
+```
+
+---
+
+## OpenClaw — Easy Setup
+
+```bash
+# 1. Start AgentMem (auto-starts via launchd after setup-claude.sh)
+bash start.sh
+
+# 2. Copy plugin to OpenClaw extensions
+cp -r plugin/ ~/.openclaw/extensions/memos-local/
+```
+
+Then in your OpenClaw config:
+```json
+{
+  "plugins": {
+    "entries": {
+      "memos-local-openclaw-plugin": {
+        "enabled": true,
+        "config": {
+          "baseUrl": "http://127.0.0.1:18800",
+          "memoryLimitNumber": 6
+        }
+      }
+    }
+  }
+}
+```
+
+OpenClaw agents get the same 6-tier semantic memory as Claude Code — facts, episodes, procedures, persona, env, tools — all retrieved by HNSW cosine similarity in ≤2ms.
+
+---
+
+## Why AgentMem? ROI vs Every Competitor
+
+### vs. Mem0 (cloud API)
+
+| Dimension | Mem0 | AgentMem |
+|-----------|------|----------|
+| Privacy | ❌ All memories sent to Mem0 servers | ✅ 100% local, never leaves your machine |
+| Cost | ❌ $0.002–0.01 per operation (adds up fast) | ✅ Free (Redis OSS + local model) |
+| Recall latency | ~50ms (network) | **1.7ms P50** — 30× faster |
+| F1 accuracy | 34.20% | **58.3% (A-MAC gate)** — 70% better |
+| Local-first | ❌ Requires cloud | ✅ Works offline, air-gapped |
+| Framework support | Partial (Python SDK only) | ✅ MCP + LangChain + LangGraph + CrewAI + AutoGen + hooks |
+| Lossless extraction | ❌ | ✅ Pronoun-free, time-anchored facts |
+
+### vs. MemGPT / OpenMemGPT
+
+| Dimension | MemGPT | AgentMem |
+|-----------|--------|----------|
+| Architecture | LLM manages memory via tool calls | HNSW vectorset + A-MAC gate (no LLM at recall time) |
+| Recall latency | ~200ms | **1.7ms** — 120× faster |
+| Token overhead | High (LLM paging calls) | ≤550 tokens (greedy priority packing) |
+| Claude Code native | ❌ | ✅ Hook-based, zero prompt engineering needed |
+| Offline | Partial | ✅ |
+
+### vs. Claude Code Auto Memory (built-in MEMORY.md)
+
+| Dimension | Auto Memory (MEMORY.md) | AgentMem |
+|-----------|------------------------|----------|
+| How it works | You manually edit a flat markdown file | Automatic — stores every session, recalls semantically |
+| Retrieval | ❌ Entire file injected at session start | ✅ Top-K semantic search — only relevant context injected |
+| Scales to 1,000s of memories | ❌ File gets bloated, truncated at 200 lines | ✅ HNSW scales to millions of vectors |
+| Cross-project memory | ❌ Per-project only | ✅ Global `session_id` namespace |
+| Learns from conversations | ❌ Manual only | ✅ Auto-extracts facts from every turn |
+| Latency | 0ms (loaded at start) | ~330ms per prompt (acceptable for semantic gain) |
+
+**The verdict:** Auto Memory is great for 5–10 manually curated facts. AgentMem is the upgrade for persistent, growing, semantic memory that works like a human assistant who remembers everything.
+
+### vs. SimpleMem (research baseline, SOTA 2026)
+
+| Dimension | SimpleMem | AgentMem |
+|-----------|-----------|----------|
+| Recall latency | ~96ms (LanceDB + OpenAI embeddings) | **1.7ms** — **55× faster** |
+| Admission gate | Single entropy threshold | **A-MAC 5-factor gate** (semantic novelty + entity novelty + factual confidence + temporal signal + content-type prior) |
+| Memory tiers | 1 (semantic) | **6** (working/episodic/semantic/procedural/capability/persona) |
+| RRF fusion | ❌ | ✅ Dynamic weighted RRF across 3 retrieval passes |
+| Temporal affinity | ❌ (pure cosine — merges old+new incorrectly) | ✅ `cosine × exp(−λ·days)` — time-aware merging |
+| Local-first | ❌ (requires OpenAI) | ✅ MiniLM-L12 on MPS, no external API needed |
+| F1 score | 43.24% | **58.3% (A-MAC)** |
+| Claude Code hooks | ❌ | ✅ |
+
+### Performance Summary
+
+```
+Recall P50 (warm):          1.7ms      │  55× faster than SimpleMem
+Recall P90 (warm):          2.0ms      │  30× faster than Mem0
+Hook wall time (claude code): ~330ms   │  well within 10s hook timeout
+Store (async):              instant    │  non-blocking, no prompt delay
+F1 score:                   58.3%      │  vs 43.24% SimpleMem, 34.20% Mem0
+Token budget:               ≤550       │  same as SimpleMem SOTA
+Privacy:                    100% local │  vs Mem0/MemGPT cloud dependency
+Cost:                       $0/month   │  vs Mem0 API pricing
+```
+
+---
+
 ## Quick Start
 
 ```bash
@@ -117,7 +279,10 @@ echo "ZAI_API_KEY=your-key" > .env
 
 ## Framework Integrations
 
-### MCP (Claude Desktop / Claude Code / Cursor / Windsurf)
+### Claude Code (Recommended: Hooks)
+For Claude Code, use the **hook integration** above (`setup-claude.sh`) — it provides automatic per-prompt recall and session-end storage with zero manual intervention. Hooks outperform MCP for Claude Code because they inject memory *before* the model sees the prompt, not as a tool the model has to think to call.
+
+### MCP (Claude Desktop / Cursor / Windsurf)
 ```bash
 python mcp_server.py   # stdio transport — 7 MCP tools exposed
 ```
@@ -394,24 +559,18 @@ python3 -m venv venv && venv/bin/pip install -r requirements.txt
 # Optional: ZAI API key for LLM extraction (GLM-4-flash)
 echo "ZAI_API_KEY=your-key" > .env
 
-# Run
-bash start.sh                # production (kills stale port holder)
-venv/bin/uvicorn main:app --reload  # development
+# Claude Code users: one-command full setup (service + hooks)
+bash setup-claude.sh
+
+# Standalone service only
+bash start.sh                              # production (kills stale port holder)
+venv/bin/uvicorn main:app --reload         # development
 ```
 
-### macOS Auto-Start
+### macOS Auto-Start (launchd)
 ```bash
-launchctl load ~/Library/LaunchAgents/ai.openclaw.memory.plist
-launchctl kickstart -k "gui/$(id -u)/ai.openclaw.memory"  # restart
-```
-
-### OpenClaw Plugin
-```bash
-cp -r plugin/ ~/.openclaw/extensions/memos-local/
-```
-```json
-{"plugins":{"entries":{"memos-local-openclaw-plugin":{"enabled":true,
-  "config":{"baseUrl":"http://127.0.0.1:18800","memoryLimitNumber":6}}}}}
+launchctl load ~/Library/LaunchAgents/ai.agent.memory.plist
+launchctl kickstart -k "gui/$(id -u)/ai.agent.memory"  # restart
 ```
 
 ---
