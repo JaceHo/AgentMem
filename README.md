@@ -82,6 +82,23 @@ AgentMem implements the full [SimpleMem](https://arxiv.org/abs/2601.02553) pipel
 
 ---
 
+## Claude Code — Integration Status (Verified ✅)
+
+As of 2026-03-07, all three hooks are verified working end-to-end:
+
+| Hook | Event | Status | What it does |
+|------|-------|--------|--------------|
+| `register-env.sh` | `SessionStart` | ✅ Verified | Registers OS/git/cwd/model env before each session |
+| `recall.sh` | `UserPromptSubmit` | ✅ Verified | Injects cross-session memory via `additionalContext` before every prompt |
+| `store.sh` | `Stop` | ✅ Verified | Persists transcript → Redis long-term memory on session end |
+
+Confirmed via service logs — every Claude Code session now fires:
+```
+POST /register-env  →  POST /recall  →  (conversation)  →  POST /store  →  POST /session/compress
+```
+
+---
+
 ## Claude Code — One-Command Setup
 
 The fastest way to give Claude Code persistent memory across every session:
@@ -144,6 +161,38 @@ settings["hooks"] = {
 json.dump(settings, open(s,'w'), indent=2)
 print("Done:", list(settings["hooks"].keys()))
 EOF
+```
+
+---
+
+## Bootstrap from OpenClaw Chat History
+
+Already have hundreds of OpenClaw sessions? Ingest them all into AgentMem in one shot:
+
+```bash
+# Dry run — see what would be ingested without touching Redis
+python3 digest-openclaw.py --dry-run
+
+# Ingest all sessions (incremental — skips already-processed sessions)
+python3 digest-openclaw.py
+
+# Force re-ingest everything
+python3 digest-openclaw.py --reset
+
+# Custom sessions directory or API URL
+python3 digest-openclaw.py --sessions-dir ~/.openclaw/agents/main/sessions --api http://localhost:18800
+```
+
+The script:
+- Parses OpenClaw's JSONL session format (`message` events → `{role, content}` pairs)
+- Strips injected `<cross_session_memory>` blocks to avoid circular echo ingestion
+- Skips trivial sessions (< 2 turns by default, configurable with `--min-turns`)
+- Tracks processed sessions in `.digest-state.json` — reruns are incremental
+- Rate-limits at 200ms between `/store` calls to avoid overwhelming Redis
+
+After ingestion, run consolidation to merge semantically duplicate facts:
+```bash
+curl -X POST http://localhost:18800/consolidate/sync
 ```
 
 ---
