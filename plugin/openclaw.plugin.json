@@ -1,8 +1,8 @@
 {
   "id": "memos-local-openclaw-plugin",
   "name": "Local Memory (Redis HNSW + MiniLM)",
-  "description": "Long-term memory via local FastAPI sidecar + Redis vector search. No cloud dependency.",
-  "version": "0.1.0",
+  "description": "Long-term memory + capability registry via local FastAPI sidecar + Redis vector search.",
+  "version": "0.2.0",
   "kind": "lifecycle",
   "main": "./index.js",
   "configSchema": {

@@ -1,18 +1,30 @@
 /**
- * memos-local-openclaw-plugin
+ * memos-local-openclaw-plugin  v0.3.0
  * Local long-memory via Redis HNSW + MiniLM FastAPI sidecar.
  * Drop-in replacement for memos-cloud-openclaw-plugin.
+ *
+ * v0.3.0 additions (2026 layered controlled architecture):
+ *   - Session Tier 1→2 promotion: calls /session/compress on agent_end
+ *     so accumulated session context is crystallised into long-term memory
+ *     before the 4h TTL expires and data is lost
+ *   - Store still queued in parallel (fire-and-forget)
+ *
+ * v0.2.0 additions (capability registry):
+ *   - Registers tool/skill index on before_agent_start
+ *   - Registers environment state on before_agent_start
+ *   - Uses /recall-tools for capability-style queries
  */
 
 const DEFAULT_BASE_URL = "http://127.0.0.1:18790";
 const DEFAULT_LIMIT    = 6;
 const RECALL_TIMEOUT   = 3000;   // ms — block agent start if exceeded
 const STORE_TIMEOUT    = 500;    // ms — fire-and-forget, don't block
+const REG_TIMEOUT      = 2000;   // ms — tool/env registration (non-blocking)
 
 export default {
   id:          "memos-local-openclaw-plugin",
   name:        "Local Memory (Redis HNSW + MiniLM)",
-  description: "Long-term memory via local FastAPI sidecar + Redis vector search. No cloud dependency.",
+  description: "Long-term memory + agent capability registry via local FastAPI sidecar + Redis.",
   kind:        "lifecycle",
 
   register(api) {
@@ -22,9 +34,110 @@ export default {
     const limit  = cfg.memoryLimitNumber ?? DEFAULT_LIMIT;
     const tag    = "[memos-local]";
 
-    // ── before_agent_start: recall relevant memories ────────────────────────
+    // ── Helpers ─────────────────────────────────────────────────────────────
+    const post = (path, body, timeout = RECALL_TIMEOUT) =>
+      fetch(`${base}${path}`, {
+        method:  "POST",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify(body),
+        signal:  AbortSignal.timeout(timeout),
+      }).catch(e => {
+        log.warn?.(`${tag} ${path} error: ${e?.message}`);
+        return null;
+      });
+
+    /**
+     * Normalize tool definitions from various OpenClaw/MCP formats
+     * into the memory service ToolDefinition schema.
+     */
+    const normalizeTool = (t) => {
+      if (!t) return null;
+      const name = t.name || t.id || t.title || "";
+      const description = t.description || t.desc || t.summary || "";
+      if (!name) return null;
+
+      // Detect source from tool metadata
+      let source = "builtin";
+      if (t.source === "mcp" || t.server || t.mcpServer) source = "mcp";
+      else if (t.source === "plugin" || t.pluginId)      source = "plugin";
+      else if (t.source === "skill"  || t.isSkill)       source = "skill";
+
+      // Extract parameter names
+      const parameters = [];
+      if (t.inputSchema?.properties) {
+        parameters.push(...Object.keys(t.inputSchema.properties));
+      } else if (t.parameters) {
+        parameters.push(...(Array.isArray(t.parameters)
+          ? t.parameters.map(p => p.name || p)
+          : Object.keys(t.parameters)));
+      }
+
+      return {
+        name,
+        description: description.slice(0, 400),
+        category:    t.category || "",
+        source,
+        parameters:  parameters.slice(0, 10),
+      };
+    };
+
+    /**
+     * Extract environment state from the agent context.
+     * Handles multiple possible context shapes from different OpenClaw versions.
+     */
+    const extractEnv = (ctx, event) => {
+      const env = {};
+      // Agent model info
+      if (ctx?.modelId || ctx?.model)     env.agent_model   = ctx.modelId || ctx.model;
+      if (ctx?.agentVersion)              env.agent_version = ctx.agentVersion;
+      if (ctx?.sessionId || ctx?.sessionKey) {
+        env.session_id = ctx.sessionId || ctx.sessionKey;
+      }
+      // Connected MCPs
+      if (ctx?.mcpServers?.length)        env.active_mcps   = ctx.mcpServers.map(s => s.name || s.id || s);
+      if (ctx?.plugins?.length)           env.active_plugins = ctx.plugins.map(p => p.id || p);
+      if (ctx?.skills?.length)            env.active_skills  = ctx.skills.map(s => s.id || s.name || s);
+      // Environment from event or system info
+      if (event?.cwd || ctx?.cwd)         env.cwd           = event?.cwd || ctx?.cwd;
+      if (event?.gitBranch || ctx?.gitBranch) env.git_branch = event?.gitBranch || ctx?.gitBranch;
+      if (event?.gitRepo   || ctx?.gitRepo)   env.git_repo   = event?.gitRepo   || ctx?.gitRepo;
+      // Runtime platform info (if available)
+      if (typeof process !== "undefined") {
+        env.runtime      = `node${process.version}`;
+        env.os           = process.platform;
+        env.os_version   = process.release?.name || "";
+      }
+      return env;
+    };
+
+    // ── before_agent_start: recall + register capability ────────────────────
     api.on("before_agent_start", async (event, ctx) => {
       const query = event?.prompt;
+
+      // 1. Register tools (fire-and-forget — don't block agent start)
+      const rawTools = event?.tools || ctx?.tools || ctx?.availableTools || [];
+      const rawSkills = event?.skills || ctx?.skills || [];
+      const allTools = [
+        ...rawTools.map(t => normalizeTool(t)),
+        ...rawSkills.map(s => normalizeTool({ ...s, source: "skill" })),
+      ].filter(Boolean);
+
+      if (allTools.length > 0) {
+        post("/register-tools", {
+          tools:    allTools,
+          agent_id: ctx?.sessionId || ctx?.sessionKey || "",
+        }, REG_TIMEOUT).then(res => {
+          if (res?.ok) log.info?.(`${tag} registered ${allTools.length} tools`);
+        });
+      }
+
+      // 2. Register environment state (fire-and-forget)
+      const envState = extractEnv(ctx, event);
+      if (Object.keys(envState).length > 0) {
+        post("/register-env", envState, REG_TIMEOUT).catch(() => {});
+      }
+
+      // 3. Recall memories (blocking — result goes into prependContext)
       if (!query) return;
 
       try {
@@ -35,6 +148,7 @@ export default {
             query,
             session_id:          ctx?.sessionId ?? ctx?.sessionKey ?? "",
             memory_limit_number: limit,
+            include_tools:       true,
           }),
           signal: AbortSignal.timeout(RECALL_TIMEOUT),
         });
@@ -58,24 +172,35 @@ export default {
       }
     });
 
-    // ── agent_end: store conversation (fire-and-forget) ─────────────────────
+    // ── agent_end: store + promote Tier 1 → Tier 2 ──────────────────────────
     api.on("agent_end", async (event, ctx) => {
       if (!event?.success) return;
-      const messages = event?.messages;
+      const messages  = event?.messages;
+      const sessionId = ctx?.sessionId ?? ctx?.sessionKey ?? "";
       if (!messages?.length) return;
 
-      // Fire and forget — don't await, don't block response
+      // 1. Queue turn storage (async background, non-blocking)
       fetch(`${base}/store`, {
         method:  "POST",
         headers: { "Content-Type": "application/json" },
-        body:    JSON.stringify({
-          messages,
-          session_id: ctx?.sessionId ?? ctx?.sessionKey ?? "",
-        }),
-        signal: AbortSignal.timeout(STORE_TIMEOUT),
-      }).catch(() => {}); // intentional silent ignore
+        body:    JSON.stringify({ messages, session_id: sessionId }),
+        signal:  AbortSignal.timeout(STORE_TIMEOUT),
+      }).catch(() => {});
+
+      // 2. Promote Tier 1 session KV → Tier 2 long-term memory.
+      //    This crystallises the accumulated session summary into an episode
+      //    + extracts facts before the 4h TTL expires.
+      //    Fire-and-forget: don't block the agent_end response.
+      if (sessionId) {
+        fetch(`${base}/session/compress`, {
+          method:  "POST",
+          headers: { "Content-Type": "application/json" },
+          body:    JSON.stringify({ session_id: sessionId, wait: false }),
+          signal:  AbortSignal.timeout(STORE_TIMEOUT),
+        }).catch(() => {});
+      }
     });
 
-    log.info?.(`${tag} registered (base=${base}, limit=${limit})`);
+    log.info?.(`${tag} v0.3.0 registered (base=${base}, limit=${limit})`);
   },
 };
