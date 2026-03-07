@@ -383,20 +383,25 @@ def _estimate_depth(query: str, base_limit: int) -> tuple[int, int]:
 
 # ── A-MAC 5-Factor Admission Gate (arXiv:2603.04549) ─────────────────────────
 #
-# A-MAC (Adaptive Memory Admission Control, March 2026) achieves 58.3 F1 on
-# LoCoMo — highest token-F1 published — by decomposing admission into 5
-# complementary factors. Ablation shows ALL 5 are necessary; removing any one
-# reduces F1. We implement all 5 with zero extra LLM calls.
+# A-MAC (Adaptive Memory Admission Control, March 2026) achieves F1=0.583 on
+# a LoCoMo *admission classification* task (binary: should this memory be stored?
+# precision=0.417, recall=0.972). NOTE: this 0.583 is NOT the same metric as
+# SimpleMem's 43.24 QA token-F1 — they measure different things on different
+# task definitions and cannot be compared on the same leaderboard.
 #
-# Factors (weights calibrated to match A-MAC precision/recall balance):
-#   F1 — semantic_novelty    (w=0.30): how different from recently-stored episodes
-#   F2 — entity_novelty      (w=0.20): new named entities, dates, file refs
-#   F3 — factual_confidence  (w=0.20): declarative density (entities + predicates)
-#   F4 — temporal_signal     (w=0.15): explicit dates/times → fresh, high-value
-#   F5 — content_type_prior  (w=0.15): patterns suggesting high-value categories
+# Ablation reveals factor importance order:
+#   type_prior > novelty > utility > confidence > recency
+# We implement all 5 with zero extra LLM calls (no LLM utility scoring).
+# Weight order follows A-MAC ablation (dominant factor gets highest weight):
+#   F1 — semantic_novelty    (w=0.25): novelty vs. recently-stored episodes
+#   F2 — entity_novelty      (w=0.15): new named entities / dates / file refs
+#   F3 — factual_confidence  (w=0.20): declarative predicate density (confidence)
+#   F4 — temporal_signal     (w=0.10): explicit dates/times (recency proxy)
+#   F5 — content_type_prior  (w=0.30): high-value category patterns — DOMINANT
+#                                       (A-MAC ablation: most influential factor)
 #
-# Threshold: 0.30 (broader than SimpleMem's 0.35 — richer gate = fewer false
-# negatives; extraction layer handles quality post-gate)
+# Threshold: 0.40 (between SimpleMem 0.35 and A-MAC's learned θ*=0.55;
+# balances recall coverage vs. precision for a local non-LLM gate)
 
 _ENTITY_RE = re.compile(
     r'\b[A-Z][a-z]{1,}\b'              # Capitalized words (names, places)
@@ -433,7 +438,7 @@ async def _admission_gate(user_text: str) -> bool:
     """
     text = user_text[:400]
 
-    # F1 — Semantic novelty (strongest signal, w=0.30)
+    # F1 — Semantic novelty (w=0.25)
     emb = _encode(text)
     recent = await mem_store.knn_search(_redis, mem_store.EPISODE_KEY, emb, k=3)
     if recent:
@@ -442,7 +447,7 @@ async def _admission_gate(user_text: str) -> bool:
     else:
         semantic_novelty = 1.0  # first store → always novel
 
-    # F2 — Entity novelty (w=0.20)
+    # F2 — Entity novelty (w=0.15)
     entities = set(_ENTITY_RE.findall(text))
     entity_novelty = min(1.0, len(entities) / 4)
 
@@ -455,21 +460,24 @@ async def _admission_gate(user_text: str) -> bool:
     fact_hits = len(_FACT_RE.findall(text))
     factual_confidence = min(1.0, fact_hits / max(words * 0.15, 1))
 
-    # F4 — Temporal signal: explicit date/time references (w=0.15)
+    # F4 — Temporal signal: explicit date/time references (w=0.10)
     temporal_signal = min(1.0, len(_DATE_RE.findall(text)) / 2)
 
-    # F5 — Content type prior: high-value category patterns (w=0.15)
-    content_type_prior = 1.0 if _HIGH_VALUE_RE.search(text) else 0.0
+    # F5 — Content type prior: high-value category patterns (w=0.30, DOMINANT)
+    # A-MAC ablation: type_prior is the single most influential factor.
+    # Scalar 1.0/0.0 is coarse; use 0.5 for partial matches (soft categories).
+    high_value_hits = len(_HIGH_VALUE_RE.findall(text))
+    content_type_prior = min(1.0, high_value_hits * 0.5) if high_value_hits else 0.0
 
     score = (
-        0.30 * semantic_novelty
-        + 0.20 * entity_novelty
+        0.25 * semantic_novelty
+        + 0.15 * entity_novelty
         + 0.20 * factual_confidence
-        + 0.15 * temporal_signal
-        + 0.15 * content_type_prior
+        + 0.10 * temporal_signal
+        + 0.30 * content_type_prior
     )
 
-    _gate_threshold = float(_os.getenv("AMAC_THRESHOLD", "0.30"))
+    _gate_threshold = float(_os.getenv("AMAC_THRESHOLD", "0.40"))
     if score < _gate_threshold:
         log.info(
             f"[store] admission gate filtered (score={score:.2f} "
@@ -618,9 +626,9 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
             log.info(f"[store] skipped trivial exchange: {user_text_raw[:40]!r}")
             return
 
-        # 2c. SimpleMem entropy gate: H(W_t) = α×entity_novelty + β×semantic_divergence
-        #     Discards low-entropy inputs before heavy processing (summarize/embed/LLM).
-        #     Threshold 0.35 from SimpleMem paper (UNC/UCB/UCSC).
+        # 2c. A-MAC 5-factor admission gate (arXiv:2603.04549).
+        #     Discards low-value inputs before heavy processing (summarize/embed/LLM).
+        #     type_prior is dominant (w=0.30); threshold 0.40.
         if not await _admission_gate(user_text_raw):
             return  # low-entropy input, skip (not worth storing)
 
