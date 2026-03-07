@@ -25,7 +25,12 @@ from ulid import ULID
 REDIS_URL    = "redis://localhost:6379"
 EPISODE_KEY  = "mem:episodes"
 FACT_KEY     = "mem:facts"
+TOOL_KEY     = "mem:tools"      # capability: tool/skill definitions
+PROC_KEY     = "mem:procedures" # procedural: successful workflows/patterns (4th cognitive tier)
+ENV_KEY      = "mem:env"        # capability: environment state hash
+AGENT_KEY    = "mem:agent"      # capability: agent self-model hash
 SESSION_PRE  = "mem:session:"
+PERSONA_KEY  = "mem:persona"
 DIMS         = 384
 
 
@@ -48,6 +53,17 @@ async def ensure_indexes(r: aioredis.Redis) -> None:
                                "access_count": 0, "ts": 0})
             await r.execute_command("VADD", key, "FP32", _blob(seed), "__seed__",
                                     "SETATTR", attr)
+    # Tool capability vectorset
+    from capability import ensure_tool_index
+    await ensure_tool_index(r, DIMS)
+    # Procedural memory vectorset
+    card = await r.execute_command("VCARD", PROC_KEY)
+    if not card:
+        seed = np.zeros(DIMS, dtype=np.float32)
+        attr = json.dumps({"_seed": True, "task": "", "procedure": "",
+                           "tools_used": [], "success_count": 0, "ts": 0})
+        await r.execute_command("VADD", PROC_KEY, "FP32", _blob(seed), "__seed__",
+                                "SETATTR", attr)
 
 
 async def knn_search(
@@ -166,6 +182,35 @@ async def save_fact(
         attr_dict["entities"] = entities[:5]
     await r.execute_command("VADD", FACT_KEY, "FP32", _blob(embedding), uid,
                             "SETATTR", json.dumps(attr_dict))
+    return uid
+
+
+async def save_procedure(
+    r: aioredis.Redis,
+    task: str,
+    procedure: str,
+    embedding: np.ndarray,
+    tools_used: list[str] | None = None,
+    domain: str = "general",
+    language: str = "en",
+) -> str:
+    """
+    Store a successful procedure/workflow in mem:procedures.
+    Procedures are embeddings of the *task description* so we can retrieve
+    'how to do X' when facing a similar task.
+    """
+    uid = str(ULID())
+    attr = json.dumps({
+        "task":          task[:300],
+        "procedure":     procedure[:1000],
+        "tools_used":    (tools_used or [])[:10],
+        "domain":        domain,
+        "language":      language,
+        "success_count": 1,
+        "ts":            int(time.time() * 1000),
+    })
+    await r.execute_command("VADD", PROC_KEY, "FP32", _blob(embedding), uid,
+                            "SETATTR", attr)
     return uid
 
 
