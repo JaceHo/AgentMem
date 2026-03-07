@@ -49,25 +49,48 @@ class ExtractedFact:
 # ── Layer 1: Regex patterns (fast, ~1ms) ──────────────────────────────────────
 
 _PATTERNS = [
+    # Identity
     (re.compile(r"(?:my name is|I am|I'm)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)", re.I), "identity"),
+    # Work / profession — covers "I work at X", "I work as X", "I'm a/an X", "I'm an X at Y"
     (re.compile(r"(?:I (?:work|am working) (?:at|for)|I work as)\s+(.+?)(?:\.|,|$)", re.I), "work"),
-    (re.compile(r"(?:I (?:like|love|prefer|enjoy|hate|dislike))\s+(.+?)(?:\.|,|$)", re.I), "preference"),
-    (re.compile(r"(?:I (?:live|am|stay) in|I'm from|I'm based in)\s+(.+?)(?:\.|,|$)", re.I), "location"),
+    (re.compile(r"I'?m (?:a|an)\s+([^,.]+?)\s+(?:at|for|in)\s+(.+?)(?:\.|,|$)", re.I),           "work"),
+    (re.compile(r"I'?m (?:a|an)\s+([A-Za-z][\w\s]{3,30})(?:\.|,|$)", re.I),                       "work"),
+    (re.compile(r"I(?:'ve been| have been) (?:working|teaching|practicing|researching)\s+(?:at|for|as|in)\s+(.+?)(?:\.|,|$)", re.I), "work"),
+    (re.compile(r"I(?:'ve been| have been) (?:a|an)\s+([^,.]+?)\s+for\s+(\d+\s+\w+)", re.I),      "work"),
+    # Where someone works (named institution)
+    (re.compile(r"(?:at|for)\s+([A-Z][A-Za-z\s&]{2,40}),?\s+(?:I(?:'m| am)|my role)", re.I),      "work"),
+    # Location
+    (re.compile(r"(?:I (?:live|am|stay) in|I'm from|I'm based in)\s+(.+?)(?:\.|,|$)", re.I),       "location"),
+    (re.compile(r"(?:I (?:bought|rent|own|moved to))\s+(?:a\s+\w+\s+in|to)\s+(.+?)(?:\.|,|$)", re.I), "location"),
+    # Broader property/residence pattern: "bought/purchased/renting a [noun] in [Place]"
+    (re.compile(r"\b(?:bought|purchased|own|renting|rented|moved to)\s+(?:a|an|my)\s+\w+\s+in\s+([A-Z][A-Za-z\s]{2,30}?)(?:\s+(?:last|this|two|three|four)|[.,]|$)", re.I), "location"),
+    # Education
+    (re.compile(r"I (?:studied|went to|graduated from|did my (?:PhD|degree|masters?|MBA|MFA|BA|BS) at)\s+(.+?)(?:\.|,|$)", re.I), "personal"),
+    (re.compile(r"my (?:PhD|degree|masters?|MFA|MBA|BA|BS)\s+(?:is|was|from)\s+(?:at\s+)?(.+?)(?:\.|,|$)", re.I), "personal"),
+    # Duration / experience — "I've been doing X for N years/months"
+    (re.compile(r"(?:I've been|I have been)\s+(.+?)\s+for\s+(\w+\s+(?:years?|months?|weeks?))", re.I), "personal"),
+    # Preferences
+    (re.compile(r"(?:I (?:like|love|prefer|enjoy|hate|dislike))\s+(.+?)(?:\.|,|$)", re.I),         "preference"),
+    # Named relations / people
+    (re.compile(r"(?:my (?:partner|wife|husband|sister|brother|friend|coworker|colleague|neighbor))\s+([A-Z][a-z]+)", re.I), "personal"),
+    # Personal facts
     (re.compile(r"(?:my (?:phone|email|address|birthday|goal|project) is)\s+(.+?)(?:\.|,|$)", re.I), "personal"),
-    (re.compile(r"(?:remember|note|important):\s*(.+?)(?:\.|$)", re.I), "reminder"),
-    (re.compile(r"(?:always|never|always use|never use)\s+(.+?)(?:\.|,|$)", re.I), "rule"),
-    (re.compile(r"(?:the (?:api|key|token|secret|password) (?:is|for .+ is))\s+(\S+)", re.I), "credential"),
-    (re.compile(r"(?:deadline|due date|by)\s+([\w\s,]+\d{4}|\d{4}-\d{2}-\d{2})", re.I), "deadline"),
-    # Capability-aware patterns
+    # Reminders / rules
+    (re.compile(r"(?:remember|note|important):\s*(.+?)(?:\.|$)", re.I),                            "reminder"),
+    (re.compile(r"(?:always|never|always use|never use)\s+(.+?)(?:\.|,|$)", re.I),                 "rule"),
+    # Credentials (regex only, never via LLM for safety)
+    (re.compile(r"(?:the (?:api|key|token|secret|password) (?:is|for .+ is))\s+(\S+)", re.I),      "credential"),
+    (re.compile(r"(?:deadline|due date|by)\s+([\w\s,]+\d{4}|\d{4}-\d{2}-\d{2})", re.I),           "deadline"),
+    # Capability patterns
     (re.compile(r"(?:I (?:used|ran|executed|called|invoked)|using|via)\s+([\w\-]+(?:\s+tool|command)?)\s+to\s+(.+?)(?:\.|,|$)", re.I), "tool_use"),
     (re.compile(r"(?:installed|added|enabled|activated)\s+(.+?)\s+(?:tool|plugin|skill|extension|mcp)", re.I), "capability_gained"),
-    (re.compile(r"(?:switched to|now using|changed to|upgrade to)\s+(.+?)(?:\.|,|$)", re.I), "env_change"),
+    (re.compile(r"(?:switched to|now using|changed to|upgrade to)\s+(.+?)(?:\.|,|$)", re.I),       "env_change"),
     (re.compile(r"(?:the (?:current|active) (?:environment|env|dir|directory|branch|project|workspace) is)\s+(.+?)(?:\.|,|$)", re.I), "env_context"),
-    # Procedural memory patterns
+    # Procedural patterns
     (re.compile(r"(?:to (?:fix|solve|handle|do|implement|run|search|find|create|build))\s+(.+?),?\s+(?:I|you should|we|use|run|try)\s+(.+?)(?:\.|$)", re.I), "procedure"),
     (re.compile(r"(?:the (?:best|correct|right) way to)\s+(.+?)\s+is\s+(?:to\s+)?(.+?)(?:\.|$)", re.I), "procedure"),
-    (re.compile(r"(?:workflow|steps?|process) (?:for|to)\s+(.+?):\s*(.+?)(?:\.|$)", re.I), "procedure"),
-    (re.compile(r"(?:always|when)\s+(.+?),\s+(?:use|run|call|execute)\s+(.+?)(?:\.|,|$)", re.I), "procedure"),
+    (re.compile(r"(?:workflow|steps?|process) (?:for|to)\s+(.+?):\s*(.+?)(?:\.|$)", re.I),        "procedure"),
+    (re.compile(r"(?:always|when)\s+(.+?),\s+(?:use|run|call|execute)\s+(.+?)(?:\.|,|$)", re.I),  "procedure"),
 ]
 
 
@@ -389,12 +412,14 @@ async def extract_hybrid(
     Falls back to regex-only if LLM fails.
     """
     # Layer 1: regex (~1ms)
-    user_text = " ".join(
+    # Run regex across ALL roles — assistant messages contain key facts too
+    # (e.g. "I'm a marine biologist", "I bought a condo in Palo Alto")
+    all_text = " ".join(
         m["content"] if isinstance(m["content"], str)
         else " ".join(b.get("text", "") for b in m["content"] if isinstance(b, dict))
-        for m in messages if m.get("role") == "user"
+        for m in messages
     )
-    regex_facts = _regex_extract(user_text)
+    regex_facts = _regex_extract(all_text)
 
     # Layer 2: SimpleMem LLM gate (~200-500ms, background)
     llm_input = conversation_text or user_text

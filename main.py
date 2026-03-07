@@ -628,7 +628,9 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
             ep_saved = 1
 
         # 5. Hybrid fact extraction (regex + LLM) → dedup → save → update persona
-        raw_msgs = [m.model_dump() for m in clean if m.role == "user"]
+        # Extract from all roles: assistant messages contain rich facts too
+        # (e.g. "I work at NovaPay", "I live in Oakland" are in assistant turns)
+        raw_msgs = [m.model_dump() for m in clean]
         facts = await extractor.extract_hybrid(raw_msgs, turn_text)
         fact_saved = 0
         for fact in facts:
