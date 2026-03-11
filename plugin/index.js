@@ -17,7 +17,7 @@
 
 const DEFAULT_BASE_URL = "http://127.0.0.1:18800";
 const DEFAULT_LIMIT    = 6;
-const RECALL_TIMEOUT   = 3000;   // ms — block agent start if exceeded
+const RECALL_TIMEOUT   = 7000;   // ms — block agent start if exceeded (raised from 3000: avg recall is 4-6s)
 const STORE_TIMEOUT    = 500;    // ms — fire-and-forget, don't block
 const REG_TIMEOUT      = 2000;   // ms — tool/env registration (non-blocking)
 
