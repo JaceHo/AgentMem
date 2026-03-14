@@ -58,5 +58,11 @@ if len(tool_sequence) >= 2:
         headers={"Content-Type": "application/json"}, method="POST")
     try: urllib.request.urlopen(req3, timeout=2)
     except: pass
+    # 4. AWO meta-tool detection (v0.9.6): synthesize composite procedures from TIG chains.
+    #    Idempotent — knn_search dedup prevents re-adding existing meta-tool entries.
+    req4 = urllib.request.Request("http://localhost:18800/tool-graph/detect-meta-tools?threshold=5",
+        data=b"{}", headers={"Content-Type": "application/json"}, method="POST")
+    try: urllib.request.urlopen(req4, timeout=3)
+    except: pass
 PYEOF
 exit 0

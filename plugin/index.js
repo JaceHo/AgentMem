@@ -1,5 +1,5 @@
 /**
- * agentmem-openclaw-plugin  v0.5.0
+ * agentmem-openclaw-plugin  v0.5.1
  * AgentMem — local persistent memory via Redis HNSW + MiniLM FastAPI sidecar.
  * Drop-in replacement for memos-cloud-openclaw-plugin.
  *
@@ -173,7 +173,10 @@ export default {
       }
     });
 
-    // ── tool_end: ToolMem feedback — record success/fail per tool use ────────
+    // ── tool_end: ToolMem feedback + mid-session compact (v0.9.5/v0.9.6) ─────
+    // Mirrors compact.sh PostToolUse hook for Claude Code parity:
+    //   1. /tool-feedback — record success/fail for ToolMem capability tracking
+    //   2. /session/compact — trim Tier 1 KV if > 3000 chars (fire-and-forget)
     api.on("tool_end", async (event, ctx) => {
       const toolName = event?.toolName || event?.tool?.name || event?.name || "";
       if (!toolName) return;
@@ -185,8 +188,16 @@ export default {
                           "permission denied", "timeout", "command not found"];
       const success = !errorWords.some(w => output.toLowerCase().includes(w));
 
+      // 1. ToolMem feedback
       post("/tool-feedback", { tool_name: toolName, success, session_id: sessionId },
            REG_TIMEOUT).catch(() => {});
+
+      // 2. Mid-session compact (same as compact.sh PostToolUse hook)
+      if (sessionId) {
+        post("/session/compact",
+             { session_id: sessionId, threshold_chars: 3000 },
+             REG_TIMEOUT).catch(() => {});
+      }
     });
 
     // ── agent_end: compact + store + promote Tier 1 → Tier 2 + TIG ─────────
@@ -240,10 +251,20 @@ export default {
             body:    JSON.stringify({ sequence: toolSeq, session_id: sessionId }),
             signal:  AbortSignal.timeout(STORE_TIMEOUT),
           }).catch(() => {});
+
+          // 5. AWO meta-tool detection (v0.9.6): after recording TIG transitions,
+          //    trigger chain detection to synthesize composite procedure entries.
+          //    Idempotent — knn_search dedup prevents re-adding existing chains.
+          fetch(`${base}/tool-graph/detect-meta-tools?threshold=5`, {
+            method:  "POST",
+            headers: { "Content-Type": "application/json" },
+            body:    "{}",
+            signal:  AbortSignal.timeout(STORE_TIMEOUT),
+          }).catch(() => {});
         }
       }
     });
 
-    log.info?.(`${tag} v0.5.0 registered (ToolMem+TIG+MACLA, base=${base}, limit=${limit})`);
+    log.info?.(`${tag} v0.5.1 registered (ToolMem+TIG+MACLA+AWO, base=${base}, limit=${limit})`);
   },
 };
