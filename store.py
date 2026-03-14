@@ -33,8 +33,10 @@ from ulid import ULID
 REDIS_URL    = os.getenv("REDIS_URL", "redis://localhost:6379")
 EPISODE_KEY  = "mem:episodes"
 FACT_KEY     = "mem:facts"
-TOOL_KEY     = "mem:tools"      # capability: tool/skill definitions
-PROC_KEY     = "mem:procedures" # procedural: successful workflows/patterns (4th cognitive tier)
+TOOL_KEY        = "mem:tools"          # capability: tool/skill definitions
+TOOL_GRAPH_KEY  = "mem:tool_graph"     # AutoTool TIG: tool transition counts hash (a:b → count)
+PROC_KEY        = "mem:procedures"     # procedural: successful workflows/patterns (4th cognitive tier)
+PROC_BY_TOOL_PRE = "mem:proc_by_tool:" # reverse index: tool_name → Set of proc element IDs
 ENV_KEY      = "mem:env"        # capability: environment state hash
 AGENT_KEY    = "mem:agent"      # capability: agent self-model hash
 SESSION_PRE  = "mem:session:"
@@ -314,6 +316,68 @@ async def soft_delete_fact(
         pass
 
 
+async def link_proc_to_tools(
+    r: aioredis.Redis,
+    proc_uid: str,
+    tools_used: list[str],
+) -> None:
+    """
+    Add proc_uid to each tool's reverse-index set (mem:proc_by_tool:<tool>).
+    Enables O(1) lookup: "which procedures use tool X?"
+    """
+    for tool in tools_used:
+        if not tool:
+            continue
+        key = f"{PROC_BY_TOOL_PRE}{tool.lower()}"
+        await r.sadd(key, proc_uid)
+
+
+async def get_procs_for_tool(
+    r: aioredis.Redis,
+    tool_name: str,
+) -> list[str]:
+    """
+    Return list of procedure UIDs that are indexed under tool_name.
+    """
+    key = f"{PROC_BY_TOOL_PRE}{tool_name.lower()}"
+    members = await r.smembers(key)
+    return [m.decode() if isinstance(m, bytes) else m for m in members]
+
+
+async def scan_all_procedures(r: aioredis.Redis, max_count: int = 1000) -> list[dict]:
+    """
+    Scan all entries in mem:procedures and return list of
+    {uid, task, tools_used, ...attrs}.  Used by the backfill endpoint.
+    """
+    card = await r.execute_command("VCARD", PROC_KEY)
+    if not card or int(card) <= 1:
+        return []
+    seed = np.zeros(DIMS, dtype=np.float32)
+    try:
+        results = await r.execute_command(
+            "VSIM", PROC_KEY, "FP32", _blob(seed),
+            "COUNT", min(int(card), max_count), "WITHSCORES", "WITHATTRIBS"
+        )
+    except Exception:
+        return []
+    procs: list[dict] = []
+    i = 0
+    while i + 2 < len(results):
+        elem = results[i]; raw = results[i + 2]
+        i += 3
+        elem_str = elem.decode() if isinstance(elem, bytes) else elem
+        if elem_str == "__seed__":
+            continue
+        try:
+            attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+        except Exception:
+            continue
+        if attrs.get("_seed") or not attrs.get("task"):
+            continue
+        procs.append({"uid": elem_str, **attrs})
+    return procs
+
+
 async def save_procedure(
     r: aioredis.Redis,
     task: str,
@@ -325,12 +389,14 @@ async def save_procedure(
 ) -> str:
     """
     Store a successful procedure/workflow in mem:procedures.
+    Also updates the reverse index mem:proc_by_tool:<tool> for each tool.
     """
     uid = str(ULID())
+    tools = (tools_used or [])[:10]
     attr = json.dumps({
         "task":          task[:300],
         "procedure":     procedure[:1000],
-        "tools_used":    (tools_used or [])[:10],
+        "tools_used":    tools,
         "domain":        domain,
         "language":      language,
         "success_count": 1,
@@ -338,6 +404,9 @@ async def save_procedure(
     })
     await r.execute_command("VADD", PROC_KEY, "FP32", _blob(embedding), uid,
                             "SETATTR", attr)
+    # Populate reverse index for each tool
+    if tools:
+        await link_proc_to_tools(r, uid, tools)
     return uid
 
 

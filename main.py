@@ -1,5 +1,5 @@
 """
-AgentMem — Local Agent Memory Service  v0.9.4
+AgentMem — Local Agent Memory Service  v0.9.6
 ==============================================
 Replaces memos-cloud-openclaw-plugin with fully local, persistent memory.
 
@@ -57,6 +57,13 @@ Endpoints:
   GET  /graph/stats         — knowledge graph: node/edge counts
   GET  /config              — service configuration + auto-consolidation state
   POST /session/compact     — mid-session compress Tier 1 KV if > threshold (v0.9.3)
+  POST /tool-feedback       — ToolMem: record success/fail per tool invocation (v0.9.5)
+  POST /record-tool-sequence — AutoTool TIG: record tool transition sequence (v0.9.5)
+  GET  /tool-graph/{name}   — AutoTool TIG: outgoing transitions from tool (v0.9.5)
+  POST /tool-graph/detect-meta-tools — AWO: synthesize composite procedures from TIG chains (v0.9.6)
+  POST /procedure-feedback  — MACLA Beta: record procedure success/fail (v0.9.5)
+  GET  /tool-procedures/{name} — reverse index: procedures that use a given tool (v0.9.6)
+  POST /proc-backfill-index — backfill proc_by_tool reverse index for existing procedures (v0.9.6)
   GET  /health
   GET  /stats
 """
@@ -165,12 +172,12 @@ async def lifespan(app: FastAPI):
     log.info("Ensuring vectorset indexes…")
     await mem_store.ensure_indexes(_redis)
     asyncio.create_task(_periodic_consolidate())
-    log.info("AgentMem v0.9.4 ready (A-MAC + wRRF + episode taxonomy + causal chains + compact + MetaClaw skills)")
+    log.info("AgentMem v0.9.6 ready (ToolMem+TIG+MACLA+proc_by_tool reverse index+AWO meta-tools)")
     yield
     await _redis.aclose()
 
 
-app = FastAPI(title="AgentMem — Local Agent Memory Service", version="0.9.4", lifespan=lifespan)
+app = FastAPI(title="AgentMem — Local Agent Memory Service", version="0.9.5", lifespan=lifespan)
 
 # ── Static files + SSE log router ─────────────────────────────────────────────
 import os as _os
@@ -254,6 +261,21 @@ class StoreProcedureRequest(BaseModel):
     procedure: str                      # the step-by-step procedure
     tools_used: list[str] = []          # tools/skills involved
     domain: str = ""
+    session_id: str = ""
+
+# ── ToolMem + TIG + MACLA request models (v0.9.5) ─────────────────────────────
+class ToolFeedbackRequest(BaseModel):
+    tool_name: str                      # slugified tool name (e.g. "web_search_prime")
+    success: bool                       # did the tool invocation succeed?
+    session_id: str = ""
+
+class ToolSequenceRequest(BaseModel):
+    sequence: list[str]                 # ordered list of tool names used in session
+    session_id: str = ""
+
+class ProcedureFeedbackRequest(BaseModel):
+    task_prefix: str                    # first ~80 chars of task to identify procedure
+    success: bool
     session_id: str = ""
 
 
@@ -758,19 +780,23 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
 
         # 6. Extract and store procedures (the 4th cognitive tier)
         proc_facts = [f for f in facts if f.category == "procedure"]
+        # Known tool name whitelist — matched case-insensitively against procedure text.
+        # Using a whitelist (not heuristic capitalization) avoids storing random words
+        # like ['When', 'HEARTBEAT.md,'] as "tool names" (bug fixed v0.9.5).
+        _KNOWN_TOOLS = {
+            "bash", "glob", "grep", "read", "edit", "write", "websearch", "webfetch",
+            "agent", "task", "notebook", "notebookedit", "mcp", "skill",
+        }
         for pf in proc_facts:
             p_emb = _encode(pf.content)
             existing = await mem_store.knn_search(_redis, mem_store.PROC_KEY, p_emb, k=1)
             if not existing or existing[0].get("score", 0.0) < 0.90:
-                # Extract tools mentioned in the procedure fact
-                tools_in_proc = [
-                    w for w in pf.content.split()
-                    if (len(w) > 2 and w[0].isupper()) or w.lower() in
-                    ("bash","glob","grep","read","edit","write","search","fetch")
-                ]
+                # Match only known tool names mentioned in the procedure text
+                content_lower = pf.content.lower()
+                tools_in_proc = [t for t in _KNOWN_TOOLS if t in content_lower]
                 await mem_store.save_procedure(
                     _redis, task=pf.content, procedure=pf.content,
-                    embedding=p_emb, tools_used=tools_in_proc[:5],
+                    embedding=p_emb, tools_used=tools_in_proc[:8],
                     domain=domain, language=lang,
                 )
 
@@ -1011,7 +1037,7 @@ async def answer(req: AnswerRequest):
 async def health():
     try:
         await _redis.ping()
-        return {"status": "ok", "redis": "ok", "version": "0.9.4"}
+        return {"status": "ok", "redis": "ok", "version": "0.9.6"}
     except Exception as e:
         return {"status": "degraded", "error": str(e)}
 
@@ -1093,9 +1119,15 @@ async def recall(req: RecallRequest):
     # Procedure recall (index 7): fire in parallel if include_procedures=True
     # Uses raw VSIM (not knn_search) because procedures store 'task' not 'content'.
     async def _fetch_procs(embedding, k: int = 2) -> list[dict]:
+        """Fetch top-k procedures with MACLA Beta posterior scoring (v0.9.5).
+
+        Beta(success+1, fail+1) × cosine_sim reranks procedures by both
+        relevance AND historical success rate (arXiv:2512.18950).
+        """
         blob = embedding.astype("float32").tobytes()
+        # Fetch more than needed so Beta reranking can reorder
         cmd  = ["VSIM", mem_store.PROC_KEY, "FP32", blob,
-                "COUNT", k + 1, "WITHSCORES", "WITHATTRIBS"]
+                "COUNT", max(k * 3, 6), "WITHSCORES", "WITHATTRIBS"]
         try:
             results = await _redis.execute_command(*cmd)
         except Exception:
@@ -1114,8 +1146,21 @@ async def recall(req: RecallRequest):
                 continue
             if attrs.get("_seed") or not attrs.get("task"):
                 continue
-            procs.append({"task": attrs.get("task", ""), "procedure": attrs.get("procedure", "")})
-        return procs
+            cosine = float(score) if score else 0.0
+            # MACLA Beta posterior: E[Beta(α,β)] = α/(α+β) with α=success+1, β=fail+1
+            success = attrs.get("success_count", 0)
+            fail    = attrs.get("fail_count", 0)
+            total   = success + fail
+            beta_mean = (success + 1) / (total + 2) if total >= 3 else 1.0
+            procs.append({
+                "task":          attrs.get("task", ""),
+                "procedure":     attrs.get("procedure", ""),
+                "_adjusted_score": cosine * beta_mean,
+                "_cosine":       cosine,
+            })
+        # Re-sort by Beta-weighted score
+        procs.sort(key=lambda x: x["_adjusted_score"], reverse=True)
+        return procs[:k]
 
     if req.include_procedures:
         gather_tasks.append(_fetch_procs(emb))
@@ -1281,8 +1326,33 @@ async def recall(req: RecallRequest):
                         seen_contents.add(gf["content"])
             facts = facts[:n_facts + 3]
 
+    # AutoTool TIG: get transition hints from most-used recalled tool (v0.9.5)
+    tig_hints: list[str] = []
+    if tools_raw:
+        top_tool_elem = tools_raw[0].get("_element", "")
+        if top_tool_elem:
+            try:
+                all_tig = await _redis.hgetall(mem_store.TOOL_GRAPH_KEY)
+                prefix  = f"{top_tool_elem}:"
+                trans: dict[str, int] = {}
+                for k_b, v_b in all_tig.items():
+                    key_s = k_b.decode() if isinstance(k_b, bytes) else k_b
+                    if key_s.startswith(prefix):
+                        target = key_s[len(prefix):]
+                        trans[target] = int(v_b)
+                if trans:
+                    total_trans = sum(trans.values())
+                    sorted_trans = sorted(trans.items(), key=lambda x: x[1], reverse=True)
+                    tig_hints = [
+                        f"{t} ({round(c/total_trans*100)}%)"
+                        for t, c in sorted_trans[:3]
+                        if c / total_trans >= 0.15  # only show ≥15% probability edges
+                    ]
+            except Exception:
+                pass
+
     # Format tool context (only include env if it's non-trivial)
-    tool_ctx = cap_mod.format_tool_context(tools_raw) if tools_raw else ""
+    tool_ctx = cap_mod.format_tool_context(tools_raw, tig_hints=tig_hints or None) if tools_raw else ""
     env_ctx_formatted = env_ctx if env_ctx and is_cap_query else ""
 
     # proc_ctx: already decoded by _fetch_procs (list of {task, procedure} dicts)
@@ -1531,6 +1601,358 @@ async def store_procedure(req: StoreProcedureRequest, background_tasks: Backgrou
 
     background_tasks.add_task(_do_store_proc)
     return {"status": "queued"}
+
+
+# ── ToolMem feedback endpoint (v0.9.5) ────────────────────────────────────────
+
+@app.post("/tool-feedback")
+async def tool_feedback(req: ToolFeedbackRequest):
+    """
+    Record success/failure for a tool invocation (ToolMem arXiv:2510.06664).
+
+    Called from PostToolUse hook after each tool use. Updates success_count /
+    fail_count on the tool's mem:tools entry and refreshes capability_summary
+    once enough data is available (≥5 uses).
+
+    Example: {"tool_name": "web_search_prime", "success": true}
+    """
+    elem_key = req.tool_name.lower().replace(" ", "_").replace("/", "_")[:64]
+    try:
+        raw = await _redis.execute_command("VGETATTR", cap_mod.TOOL_KEY, elem_key)
+    except Exception:
+        return {"ok": False, "reason": "redis error"}
+    if not raw:
+        return {"ok": False, "reason": "tool not found"}
+
+    try:
+        attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+    except Exception:
+        return {"ok": False, "reason": "parse error"}
+
+    if req.success:
+        attrs["success_count"] = attrs.get("success_count", 0) + 1
+    else:
+        attrs["fail_count"]    = attrs.get("fail_count", 0) + 1
+    attrs["use_count"] = attrs.get("use_count", 0) + 1
+
+    # Refresh capability_summary once ≥5 feedback data points exist
+    total = attrs.get("success_count", 0) + attrs.get("fail_count", 0)
+    if total >= 5:
+        rate = attrs.get("success_count", 0) / total
+        if   rate >= 0.85: quality = "reliable"
+        elif rate >= 0.60: quality = "mostly reliable"
+        elif rate >= 0.40: quality = "mixed"
+        else:              quality = "often fails"
+        attrs["capability_summary"] = f"{quality} ({attrs.get('success_count',0)}/{total}✓)"
+
+    try:
+        await _redis.execute_command("VSETATTR", cap_mod.TOOL_KEY, elem_key, json.dumps(attrs))
+    except Exception as e:
+        return {"ok": False, "reason": str(e)}
+
+    log.debug(f"[tool-feedback] {elem_key} success={req.success} "
+              f"s={attrs.get('success_count',0)} f={attrs.get('fail_count',0)}")
+    return {
+        "ok":           True,
+        "tool":         elem_key,
+        "success_count": attrs.get("success_count", 0),
+        "fail_count":    attrs.get("fail_count", 0),
+        "capability_summary": attrs.get("capability_summary", ""),
+    }
+
+
+# ── AutoTool TIG endpoints (v0.9.5) ───────────────────────────────────────────
+
+@app.post("/record-tool-sequence")
+async def record_tool_sequence(req: ToolSequenceRequest):
+    """
+    Record an ordered tool-use sequence into the Tool Inertia Graph (AutoTool arXiv:2511.14650).
+
+    Called from Stop hook after each session. For each consecutive pair (A→B),
+    increments HINCRBY on mem:tool_graph key "A:B". These transition counts
+    are used at recall time to suggest likely-next tools.
+
+    Example: {"sequence": ["Glob", "Read", "Edit", "Bash"]}
+    → increments Glob:Read, Read:Edit, Edit:Bash
+    """
+    seq = [t.strip() for t in req.sequence if t.strip()]
+    if len(seq) < 2:
+        return {"ok": False, "transitions": 0}
+    count = 0
+    for i in range(len(seq) - 1):
+        a = seq[i].lower().replace(" ", "_")[:64]
+        b = seq[i + 1].lower().replace(" ", "_")[:64]
+        if a == b:
+            continue
+        await _redis.hincrby(mem_store.TOOL_GRAPH_KEY, f"{a}:{b}", 1)
+        count += 1
+    log.debug(f"[tig] recorded {count} transitions for session={req.session_id}")
+    return {"ok": True, "transitions": count}
+
+
+@app.get("/tool-graph/{tool_name}")
+async def tool_graph(tool_name: str, k: int = 5):
+    """
+    Return the top-k outgoing transitions from tool_name in the Tool Inertia Graph.
+
+    Example: GET /tool-graph/glob → [{"next": "read", "count": 42, "prob": 0.72}]
+    """
+    elem_key = tool_name.lower().replace(" ", "_")[:64]
+    try:
+        all_entries = await _redis.hgetall(mem_store.TOOL_GRAPH_KEY)
+    except Exception:
+        return {"tool": tool_name, "transitions": []}
+    prefix = f"{elem_key}:"
+    trans: dict[str, int] = {}
+    for k_b, v_b in all_entries.items():
+        key_s = k_b.decode() if isinstance(k_b, bytes) else k_b
+        if key_s.startswith(prefix):
+            target = key_s[len(prefix):]
+            trans[target] = int(v_b)
+    total = sum(trans.values())
+    sorted_t = sorted(trans.items(), key=lambda x: x[1], reverse=True)[:k]
+    return {
+        "tool":        tool_name,
+        "transitions": [
+            {"next": t, "count": c, "prob": round(c / total, 2) if total else 0}
+            for t, c in sorted_t
+        ],
+        "total_transitions": total,
+    }
+
+
+# ── AWO meta-tool detection (v0.9.6) ──────────────────────────────────────────
+
+@app.post("/tool-graph/detect-meta-tools")
+async def detect_meta_tools(threshold: int = 5, background_tasks: BackgroundTasks = None):
+    """
+    AWO meta-tool detection (Autonomous Workflow Optimization arXiv:2601.22037).
+
+    Scans the Tool Inertia Graph for high-frequency 2-hop chains A→B→C
+    where both A:B and B:C have count ≥ threshold. Each discovered chain is
+    auto-synthesized into a composite procedure in mem:procedures so future
+    recall surfaces it as a recommended workflow pattern.
+
+    Example: Glob→Read (28) + Read→Edit (23) → synthesize "Glob-Read-Edit pattern"
+    Returns: {"detected": N, "chains": [...], "new_procedures": M}
+    """
+    try:
+        all_entries = await _redis.hgetall(mem_store.TOOL_GRAPH_KEY)
+    except Exception:
+        return {"detected": 0, "chains": [], "new_procedures": 0}
+
+    if not all_entries:
+        return {"detected": 0, "chains": [], "new_procedures": 0}
+
+    # Build adjacency: from_tool → {to_tool: count}
+    adj: dict[str, dict[str, int]] = {}
+    for k_b, v_b in all_entries.items():
+        key_s = k_b.decode() if isinstance(k_b, bytes) else k_b
+        val   = int(v_b) if v_b else 0
+        if ":" not in key_s:
+            continue
+        a, b = key_s.split(":", 1)
+        adj.setdefault(a, {})[b] = val
+
+    # Find 2-hop chains: A→B (≥ threshold) + B→C (≥ threshold), A≠C
+    chains: list[dict] = []
+    for a, a_neighbors in adj.items():
+        for b, ab_count in a_neighbors.items():
+            if ab_count < threshold:
+                continue
+            b_neighbors = adj.get(b, {})
+            for c, bc_count in b_neighbors.items():
+                if bc_count < threshold or c == a:
+                    continue
+                chains.append({
+                    "chain":    [a, b, c],
+                    "ab_count": ab_count,
+                    "bc_count": bc_count,
+                    "strength": min(ab_count, bc_count),  # bottleneck strength
+                })
+
+    # Sort by bottleneck strength descending
+    chains.sort(key=lambda x: x["strength"], reverse=True)
+
+    if not chains:
+        return {"detected": 0, "chains": [], "new_procedures": 0}
+
+    async def _synthesize_chains(chains_to_add: list[dict]):
+        new_count = 0
+        for ch in chains_to_add[:20]:   # cap at 20 new meta-tools per run
+            a, b, c = ch["chain"]
+            task = f"[meta-tool] {a} → {b} → {c} workflow"
+            procedure = (
+                f"High-frequency tool chain discovered by AWO analysis "
+                f"(TIG count: {a}→{b}={ch['ab_count']}, {b}→{c}={ch['bc_count']}).\n"
+                f"1. Use {a}\n2. Use {b}\n3. Use {c}"
+            )
+            emb = _encode(task)
+            # Check for near-duplicate before storing
+            existing = await mem_store.knn_search(_redis, mem_store.PROC_KEY, emb, k=1)
+            if existing and existing[0].get("score", 0.0) > 0.90:
+                continue
+            await mem_store.save_procedure(
+                _redis,
+                task=task,
+                procedure=procedure,
+                embedding=emb,
+                tools_used=[a, b, c],
+                domain="meta",
+                language="en",
+            )
+            new_count += 1
+        log.info(f"[awo] synthesized {new_count} meta-tool procedures from {len(chains_to_add)} chains")
+
+    if background_tasks is not None:
+        background_tasks.add_task(_synthesize_chains, chains)
+        synthesis_status = "queued"
+        new_procs = None
+    else:
+        await _synthesize_chains(chains)
+        synthesis_status = "done"
+        new_procs = min(len(chains), 20)
+
+    return {
+        "detected":       len(chains),
+        "chains":         chains[:10],   # return top-10 for inspection
+        "new_procedures": new_procs,
+        "synthesis":      synthesis_status,
+        "threshold":      threshold,
+    }
+
+
+# ── MACLA procedure feedback endpoint (v0.9.5) ────────────────────────────────
+
+@app.post("/procedure-feedback")
+async def procedure_feedback(req: ProcedureFeedbackRequest):
+    """
+    Record success/failure for a procedure retrieval (MACLA arXiv:2512.18950).
+
+    Finds the best matching procedure by semantic similarity to task_prefix,
+    then updates its fail_count. (success_count is already bumped by /store-procedure.)
+    Used by agents after a recalled procedure was followed and succeeded/failed.
+
+    Example: {"task_prefix": "how to search files by pattern", "success": false}
+    """
+    emb = _encode(req.task_prefix[:80])
+    blob = emb.astype("float32").tobytes()
+    try:
+        results = await _redis.execute_command(
+            "VSIM", mem_store.PROC_KEY, "FP32", blob,
+            "COUNT", 3, "WITHSCORES", "WITHATTRIBS"
+        )
+    except Exception:
+        return {"ok": False, "reason": "redis error"}
+
+    best_elem = None
+    best_score = 0.0
+    best_attrs: dict = {}
+    idx = 0
+    while idx + 2 < len(results):
+        elem  = results[idx]; score = results[idx+1]; raw = results[idx+2]
+        idx += 3
+        elem_str = elem.decode() if isinstance(elem, bytes) else elem
+        if elem_str == "__seed__":
+            continue
+        try:
+            attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+        except Exception:
+            continue
+        if attrs.get("_seed") or not attrs.get("task"):
+            continue
+        s = float(score) if score else 0.0
+        if s > best_score:
+            best_score = s; best_elem = elem_str; best_attrs = attrs
+
+    if not best_elem or best_score < 0.50:
+        return {"ok": False, "reason": "no matching procedure found", "best_score": best_score}
+
+    if req.success:
+        best_attrs["success_count"] = best_attrs.get("success_count", 0) + 1
+    else:
+        best_attrs["fail_count"]    = best_attrs.get("fail_count", 0) + 1
+
+    try:
+        await _redis.execute_command("VSETATTR", mem_store.PROC_KEY, best_elem, json.dumps(best_attrs))
+    except Exception as e:
+        return {"ok": False, "reason": str(e)}
+
+    log.debug(f"[proc-feedback] {best_elem[:40]} success={req.success} score={best_score:.2f}")
+    return {
+        "ok":           True,
+        "matched_task": best_attrs.get("task", "")[:60],
+        "score":        best_score,
+        "success_count": best_attrs.get("success_count", 0),
+        "fail_count":    best_attrs.get("fail_count", 0),
+    }
+
+
+@app.get("/tool-procedures/{tool_name}")
+async def tool_procedures(tool_name: str):
+    """
+    Return all procedures that use a given tool (reverse index lookup).
+
+    Uses mem:proc_by_tool:<tool> Redis Sets populated by save_procedure()
+    and the /proc-backfill-index endpoint.
+
+    Example: GET /tool-procedures/bash
+    → [{"uid": "...", "task": "...", "tools_used": [...], "success_count": N}]
+    """
+    uids = await mem_store.get_procs_for_tool(_redis, tool_name)
+    if not uids:
+        return {"tool": tool_name, "procedures": [], "count": 0}
+
+    procs = []
+    for uid in uids:
+        try:
+            raw = await _redis.execute_command("VGETATTR", mem_store.PROC_KEY, uid)
+        except Exception:
+            continue
+        if not raw:
+            continue
+        try:
+            attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+        except Exception:
+            continue
+        if not attrs.get("task"):
+            continue
+        procs.append({
+            "uid":           uid,
+            "task":          attrs.get("task", ""),
+            "procedure":     attrs.get("procedure", "")[:200],
+            "tools_used":    attrs.get("tools_used", []),
+            "domain":        attrs.get("domain", ""),
+            "success_count": attrs.get("success_count", 1),
+            "fail_count":    attrs.get("fail_count", 0),
+        })
+
+    return {"tool": tool_name, "procedures": procs, "count": len(procs)}
+
+
+@app.post("/proc-backfill-index")
+async def proc_backfill_index(background_tasks: BackgroundTasks):
+    """
+    Backfill mem:proc_by_tool reverse index for all existing procedures.
+
+    Run once after upgrading to v0.9.6 to populate the reverse index for
+    procedures that were stored before link_proc_to_tools() was added.
+    Idempotent — SADD is a no-op for already-present members.
+    """
+    async def _do_backfill():
+        procs = await mem_store.scan_all_procedures(_redis)
+        count = 0
+        for p in procs:
+            uid   = p.get("uid", "")
+            tools = p.get("tools_used", [])
+            if uid and tools:
+                await mem_store.link_proc_to_tools(_redis, uid, tools)
+                count += len(tools)
+        log.info(f"[backfill] reverse-indexed {len(procs)} procedures, {count} tool→proc links")
+        return len(procs), count
+
+    background_tasks.add_task(_do_backfill)
+    return {"status": "queued", "message": "backfilling proc_by_tool reverse index in background"}
 
 
 @app.get("/capabilities/context")
