@@ -1,5 +1,5 @@
 /**
- * agentmem-openclaw-plugin  v0.3.0
+ * agentmem-openclaw-plugin  v0.4.0
  * AgentMem — local persistent memory via Redis HNSW + MiniLM FastAPI sidecar.
  * Drop-in replacement for memos-cloud-openclaw-plugin.
  *
@@ -172,7 +172,7 @@ export default {
       }
     });
 
-    // ── agent_end: store + promote Tier 1 → Tier 2 ──────────────────────────
+    // ── agent_end: compact + store + promote Tier 1 → Tier 2 ───────────────
     api.on("agent_end", async (event, ctx) => {
       if (!event?.success) return;
       const messages  = event?.messages;
@@ -187,11 +187,21 @@ export default {
         signal:  AbortSignal.timeout(STORE_TIMEOUT),
       }).catch(() => {});
 
-      // 2. Promote Tier 1 session KV → Tier 2 long-term memory.
-      //    This crystallises the accumulated session summary into an episode
-      //    + extracts facts before the 4h TTL expires.
-      //    Fire-and-forget: don't block the agent_end response.
       if (sessionId) {
+        // 2. Mid-session compact (v0.9.3): trim Tier 1 KV before promotion.
+        //    Inspired by claude-mem Endless Mode — keeps session context O(N).
+        //    Fire-and-forget: no blocking.
+        fetch(`${base}/session/compact`, {
+          method:  "POST",
+          headers: { "Content-Type": "application/json" },
+          body:    JSON.stringify({ session_id: sessionId, threshold_chars: 3000 }),
+          signal:  AbortSignal.timeout(STORE_TIMEOUT),
+        }).catch(() => {});
+
+        // 3. Promote Tier 1 session KV → Tier 2 long-term memory.
+        //    Crystallises the accumulated session summary into an episode
+        //    + extracts facts before the 4h TTL expires.
+        //    Fire-and-forget: don't block the agent_end response.
         fetch(`${base}/session/compress`, {
           method:  "POST",
           headers: { "Content-Type": "application/json" },
@@ -201,6 +211,6 @@ export default {
       }
     });
 
-    log.info?.(`${tag} v0.3.0 registered (base=${base}, limit=${limit})`);
+    log.info?.(`${tag} v0.4.0 registered (base=${base}, limit=${limit}, compact+chain enabled)`);
   },
 };

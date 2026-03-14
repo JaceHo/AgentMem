@@ -1,8 +1,8 @@
 {
   "name": "memos-local-openclaw-plugin",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "type": "module",
-  "description": "AgentMem v0.9.2 — local persistent memory for OpenClaw via Redis HNSW + MiniLM.",
+  "description": "AgentMem v0.9.3 — local persistent memory for OpenClaw via Redis HNSW + MiniLM.",
   "openclaw": {
     "extensions": ["./index.js"]
   }
