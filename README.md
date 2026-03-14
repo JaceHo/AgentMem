@@ -1,426 +1,159 @@
 # AgentMem
 
-**Local persistent memory for any AI agent framework — MCP · LangChain · LangGraph · CrewAI · AutoGen · Claude API**
+**Local persistent memory for Claude Code, OpenClaw, and any AI agent framework.**
 
-[![Version](https://img.shields.io/badge/version-0.9.2-blue)](.) [![A-MAC](https://img.shields.io/badge/algorithm-A--MAC%20%2B%20wRRF-brightgreen)](https://arxiv.org/abs/2603.04549) [![Redis 8](https://img.shields.io/badge/backend-Redis%208%20vectorset-red)](https://redis.io) [![License](https://img.shields.io/badge/license-MIT-yellow)](.)
-
-One service. Every framework. Persistent memory that actually works.
+[![Version](https://img.shields.io/badge/version-0.9.3-blue)](.) [![A-MAC](https://img.shields.io/badge/algorithm-A--MAC%20%2B%20wRRF-brightgreen)](https://arxiv.org/abs/2603.04549) [![Redis 8](https://img.shields.io/badge/backend-Redis%208%20HNSW-red)](https://redis.io) [![License](https://img.shields.io/badge/license-MIT-yellow)](.)
 
 ```
-Recall P50 (warm): 1.7ms  │  Context-F1: 32.64%  │  LLM-F1: 64.70%†  │  AIC: 97.9%  │  CJK/Chinese supported
+LLM-F1: 64.70%†  │  Context-F1: 32.64%  │  AIC: 97.9%  │  Recall P50: 1.7ms  │  $0/month
 ```
 
 ---
 
-## Research Leaderboard (LoCoMo Benchmark, 2026)
+## How it works — two layers, zero conflict
 
-AgentMem implements the best-performing admission and retrieval strategies from the 2025-2026 memory literature.
+Your AI framework (Claude Code / OpenClaw) manages the **LLM context window**. AgentMem manages everything **below** it:
 
-> **Metric key**: *LLM-F1* = LLM extracts short answer from recalled context → token F1 vs GT (how SimpleMem is scored). *Context-F1* = max token F1 in 10-word sliding window, no LLM step (harder; measures raw fact density). Run `bench-f1.py` for both.
->
-> ⚠️ **A-MAC's 0.583 is NOT QA F1.** It is binary admission classification F1 (precision=0.417/recall=0.972 over *whether to store* each memory). A-MAC never reports QA token-F1 and cannot be placed on the same row as SimpleMem's 43.24%. See [arXiv:2603.04549](https://arxiv.org/abs/2603.04549).
->
-> †  **AgentMem's 71.00% LLM-F1 is measured on our internal LoCoMo-style bench** (8 short conversations, 47 single-hop Q/A pairs, GLM-4-plus backbone). SimpleMem's 43.24% and AriadneMem's 46.30% are measured on the **real LoCoMo dataset** (1,986 questions, 200-400 turn conversations, multi-hop + temporal + open-domain, GPT-4.1-mini backbone). These benchmarks are not directly comparable in difficulty — the real LoCoMo is significantly harder. Our score demonstrates strong retrieval + answer extraction quality on our bench; run `bench-f1.py` to reproduce.
-
-**LoCoMo QA Token-F1 leaderboard** (SimpleMem metric):
-
-| System | LLM-F1 | Context-F1 | AIC | Token Cost | Notes |
-|--------|:------:|:----------:|:---:|:----------:|-------|
-| Full Context | 18.70% | — | 100% | ~16,910 | No compression (published, real LoCoMo) |
-| A-Mem | 32.58% | — | — | — | Graph-based (published, real LoCoMo) |
-| Mem0 | 34.20% | — | ~1,000 | — | Cloud API (published, real LoCoMo) |
-| SimpleMem | 43.24% | — | — | ~550 | Lossless extraction (published, real LoCoMo) |
-| AriadneMem | 46.30% | — | — | ~497 | Graph bridge discovery (published, real LoCoMo, **SOTA**) |
-| **AgentMem [OURS]** | **64.70%†** | **32.64%** | **97.9%** | **~1,064** | **Local, self-hosted ✅ CJK ✅ (internal bench†, GLM-4-flash; 71.00% with GLM-4-plus)** |
-
-**Admission quality leaderboard** (A-MAC metric — binary classification F1):
-
-| System | Admission F1 | Precision | Recall | Notes |
-|--------|:------------:|:---------:|:------:|-------|
-| A-MAC | 0.583 | 0.417 | 0.972 | Learned weights + LLM utility call (published) |
-| **AgentMem [OURS]** | **run bench** | — | — | **Rule-based (no LLM gate call), threshold=0.40** |
-
-**AgentMem measured results** (LoCoMo-style bench, 8 conversations, 47 Q/A pairs, `bench-f1.py`):
-- LLM-F1: **64.70%†** (GLM-4-flash) / **71.00%†** (GLM-4-plus) — both beat SimpleMem (43.24%) and AriadneMem SOTA (46.30%) on internal bench
-- Context-F1: **32.64%** — raw retrieval quality (no LLM step; harder metric)
-- Answer-in-Context (AIC): **97.9%** — 46/47 questions retrievable from recalled context
-- Mean recall latency: **~9s** with planning+reflection+answer LLM; **~1.7ms** P50 retrieval-only
-- Mean context tokens: **~1,064 words** (compressed from ~16,910 full context)
-
-**Other systems** (different benchmarks, not directly comparable):
-
-| System | Score | Metric | Notes |
-|--------|------:|--------|-------|
-| A-MAC | 0.583 F1 | Admission classification F1 | Binary store/discard gate quality |
-| MAGMA | 0.700 | LLM-Judge | Multi-graph (semantic/temporal/causal/entity) |
-| EverMemOS | 83% | Answer accuracy | Self-organizing MemCells→MemScenes |
-| Hindsight | 89.61% | Answer accuracy | 4 logical networks + reflection (Gemini-3) |
-
-> **Why two F1 metrics?** SimpleMem uses LLM extraction (model reads recalled context → 1-5 word answer → token F1 vs GT). This is implemented in AgentMem's `/answer` endpoint. Context-F1 measures token overlap directly in raw recalled text — harder, no LLM step, not directly comparable to SimpleMem's published number.
->
-> **† Internal bench disclaimer**: AgentMem's 71.00% LLM-F1 uses our hand-written LoCoMo-style dataset (8 conversations, 47 single-hop QA pairs) with GLM-4-plus for answer extraction. Published systems use the real LoCoMo dataset (1,986 questions, 200-400 conversation turns, multi-hop/temporal reasoning) with GPT-4.1-mini. Direct score comparison is not valid — we expect our score on the real dataset to be lower, as multi-hop and temporal reasoning are the hardest sub-tasks.
->
-> **F1 vs accuracy**: Accuracy scores (EverMemOS, Hindsight) use LLM-graded correctness on different benchmarks — not directly comparable to LoCoMo token-F1.
-
----
-
-## vs. SimpleMem: What We Implement — and Where We Go Further
-
-AgentMem implements the full [SimpleMem](https://arxiv.org/abs/2601.02553) pipeline (UNC-Chapel Hill / UC Berkeley / UCSC, 2026) and adds **7 architectural upgrades** on top, drawing from A-MAC (2603.04549), wRRF (2511.18194), and MAGMA (2601.03236).
-
-### v0.9.2 Additions (New)
-
-| # | Upgrade | Paper | Impact |
-|---|---------|-------|--------|
-| 5 | **A-MAC 5-factor admission gate** | [arXiv:2603.04549](https://arxiv.org/abs/2603.04549) | Replaces single entropy threshold with 5-factor weighted gate: semantic novelty, entity novelty, factual confidence, temporal signal, content type prior (dominant, w=0.30 per A-MAC ablation) |
-| 6 | **Dynamic weighted RRF (wRRF)** | [arXiv:2511.18194](https://arxiv.org/abs/2511.18194) | Per-query-type weights for RRF fusion: entity queries boost symbolic pass (w=1.2→1.4), semantic-only queries downweight it (w=0.6) |
-| 7 | **Category importance floors** | A-MAC content_type_prior | 15-tier floor map: identity/rule pinned ≥0.80, general ≥0.30 — prevents important facts from being pruned by consolidation |
-
-### Full Upgrade Table (v0.9.0–v0.9.2)
-
-| # | Upgrade | SimpleMem | AgentMem | Source |
-|---|---------|-----------|----------|--------|
-| 1 | **RRF multi-list fusion** | Plain set union | RRF (k=60) across semantic+lexical+symbolic | Cormack SIGIR 2009 |
-| 2 | **Importance-weighted recall** | Used in consolidation only | `score += 0.15 × importance` at query time | AgentMem |
-| 3 | **Temporal affinity in consolidation** | Pure cosine ≥ 0.95 | `cosine × exp(−λ·days) ≥ 0.85` | AgentMem |
-| 4 | **6-tier cognitive memory** | 1 tier (semantic) | Episodic + Semantic + Procedural + Session + Capability + Persona | arXiv:2602.19320 |
-| 5 | **A-MAC 5-factor admission gate** | Single entropy H(W_t) | 5-factor weighted gate, threshold 0.30 | arXiv:2603.04549 |
-| 6 | **Dynamic weighted RRF** | N/A | Query-type-adaptive weights per retrieval pass | arXiv:2511.18194 |
-| 7 | **Category importance floors** | No floors | 15-tier minimum importance by category | arXiv:2603.04549 |
-
-### Full Feature Comparison
-
-| Feature | SimpleMem | Mem0 | MemGPT | **AgentMem** |
-|---------|-----------|------|--------|------------|
-| Lossless restatement (Φ_coref + Φ_time) | ✅ | ❌ | ❌ | ✅ |
-| Multi-view indexing (semantic+lexical+symbolic) | ✅ | ❌ | ❌ | ✅ |
-| 3-phase consolidation (decay/merge/prune) | ✅ | ❌ | ❌ | ✅ |
-| Intent-aware retrieval planning | ✅ | ❌ | ❌ | ✅ |
-| A-MAC 5-factor admission gate | ❌ | ❌ | ❌ | ✅ |
-| Dynamic weighted RRF (wRRF) | ❌ | ❌ | ❌ | ✅ |
-| Category importance floors | ❌ | ❌ | ❌ | ✅ |
-| RRF multi-list fusion | ❌ | ❌ | ❌ | ✅ |
-| Importance-weighted recall | ❌ | ❌ | ❌ | ✅ |
-| Temporal affinity in consolidation | ❌ | ❌ | ❌ | ✅ |
-| Procedural memory (how-to tier) | ❌ | ❌ | Partial | ✅ |
-| Session tier (TTL→promotion) | ❌ | ❌ | Partial | ✅ |
-| Entity knowledge graph | ❌ | ❌ | ❌ | ✅ |
-| Heat-tiered access reranking | ❌ | ❌ | ❌ | ✅ |
-| Auto-consolidation (counter+timer) | Manual | ❌ | ❌ | ✅ |
-| MCP server | ✅ | ❌ | ❌ | ✅ |
-| Framework adapters (LangChain/LangGraph/CrewAI/AutoGen) | ❌ | Partial | ❌ | ✅ |
-| Local-first (no cloud API required) | ❌ (needs OpenAI) | ❌ | ❌ | ✅ |
-| Recall latency | ~96ms/q avg | ~50ms | ~200ms | **1.7ms P50** |
-
----
-
-## Claude Code — Integration Status (Verified ✅)
-
-As of 2026-03-07, all three hooks are verified working end-to-end:
-
-| Hook | Event | Status | What it does |
-|------|-------|--------|--------------|
-| `register-env.sh` | `SessionStart` | ✅ Verified | Registers OS/git/cwd/model env before each session |
-| `recall.sh` | `UserPromptSubmit` | ✅ Verified | Injects cross-session memory via `additionalContext` before every prompt |
-| `store.sh` | `Stop` | ✅ Verified | Persists transcript → Redis long-term memory on session end |
-
-Confirmed via service logs — every Claude Code session now fires:
 ```
-POST /register-env  →  POST /recall  →  (conversation)  →  POST /store  →  POST /session/compress
+┌──────────────────────────────────────────────────────────────┐
+│  Tier 0 — LLM Context Window  (framework manages this)       │
+│  Claude Code / OpenClaw:  sliding window · summary · pointer  │
+│  AgentMem injects:        <cross_session_memory>…</…>        │
+│                           ~1,064 tokens vs ~16,910 raw (94%↓) │
+├──────────────────────────────────────────────────────────────┤
+│  Tier 1 — Session KV  (Redis, 4h TTL)                        │
+│  rolling summary · auto-compacted when >3K chars (v0.9.3)    │
+├──────────────────────────────────────────────────────────────┤
+│  Tier 2 — Episodic  mem:episodes                             │
+│  conversation turns · typed (decision/procedure/discovery…)   │
+│  causal chain: prev_episode_id ↔ next_episode_id (v0.9.3)    │
+├──────────────────────────────────────────────────────────────┤
+│  Tier 3 — Semantic  mem:facts                                 │
+│  lossless facts · pronoun-free · ISO-timestamped             │
+├──────────────────────────────────────────────────────────────┤
+│  Tier 4 — Procedural  mem:procedures                         │
+│  how-to workflows · tool recipes                              │
+├──────────────────────────────────────────────────────────────┤
+│  Tier 5 — Capability + Persona  mem:tools · mem:env          │
+│  tool index · environment state · evolving user profile       │
+└──────────────────────────────────────────────────────────────┘
 ```
 
+The framework prunes **Tier 0** (context window) — AgentMem is never touched. AgentMem's `before_agent_start` / `UserPromptSubmit` hook re-injects the **most relevant** fragments every turn.
+
 ---
 
-## Claude Code — One-Command Setup
+## Benchmark Results
 
-The fastest way to give Claude Code persistent memory across every session:
+> ⚠️ AgentMem's 64.70% is on an **internal bench** (8 convs, 47 Q/A, GLM-4-flash). SimpleMem/AriadneMem scores are on the harder real LoCoMo dataset (1,986 Q, 200-400 turn convs). Not directly comparable — our real-dataset score will be lower. Run `bench-f1.py` to reproduce.
+
+| System | LLM-F1 | Dataset | Notes |
+|--------|:------:|---------|-------|
+| Full Context | 18.70% | real LoCoMo | No compression baseline |
+| Mem0 | 34.20% | real LoCoMo | Cloud API |
+| SimpleMem | 43.24% | real LoCoMo | SOTA research baseline |
+| AriadneMem | 46.30% | real LoCoMo | **Published SOTA** |
+| **AgentMem** | **64.70%†** | internal† | Local · GLM-4-flash · 97.9% AIC |
+
+---
+
+## vs. Everything
+
+| | Mem0 | SimpleMem | claude-mem | MEMORY.md | **AgentMem** |
+|---|:---:|:---:|:---:|:---:|:---:|
+| **Local / offline** | ❌ | ❌ | ✅ | ✅ | ✅ |
+| **Cost** | $0.002–0.01/op | needs OpenAI | free | free | **free** |
+| **Recall latency** | ~50ms | ~96ms | varies | 0ms (static) | **1.7ms P50** |
+| **Scales to 1,000s of memories** | ✅ | ✅ | ✅ | ❌ (truncates) | ✅ |
+| **Auto-extracts facts** | ✅ | ✅ | ✅ | ❌ manual | ✅ |
+| **Lossless restatement (Φ_coref + Φ_time)** | ❌ | ✅ | ❌ | ❌ | ✅ |
+| **3-phase consolidation** | ❌ | ✅ | ❌ | ❌ | ✅ |
+| **A-MAC 5-factor admission gate** | ❌ | ❌ | ❌ | ❌ | ✅ |
+| **Dynamic weighted RRF (wRRF)** | ❌ | ❌ | ❌ | ❌ | ✅ |
+| **6-tier cognitive memory** | ❌ | ❌ | ❌ | ❌ | ✅ |
+| **Knowledge graph** | ❌ | ❌ | ❌ | ❌ | ✅ |
+| **Episode type taxonomy** | ❌ | ❌ | ✅ | ❌ | ✅ |
+| **Causal episode chaining** | ❌ | ❌ | ✅ | ❌ | ✅ |
+| **Mid-session compact (O(N) context)** | ❌ | ❌ | ✅ Endless | ❌ | ✅ |
+| **Claude Code hooks** | ❌ | ❌ | ✅ | ✅ built-in | ✅ |
+| **CJK / Chinese** | ❌ | ❌ | ❌ | ❌ | ✅ |
+| **MCP server** | ❌ | ✅ | ✅ | ❌ | ✅ |
+| **LangChain/LangGraph/CrewAI/AutoGen** | Partial | ❌ | ❌ | ❌ | ✅ |
+| **Benchmarked F1** | 34.20% | 43.24% | ❌ | ❌ | 64.70%† |
+
+> claude-mem inspired v0.9.3's episode taxonomy, causal chaining, and mid-session compact. What AgentMem adds: research-grade retrieval (wRRF + A-MAC + consolidation), 6 memory tiers, knowledge graph, and benchmark-verified quality.
+
+---
+
+## Claude Code — One Command
 
 ```bash
 git clone https://github.com/JaceHo/AgentMem
 cd AgentMem
 python3 -m venv venv && venv/bin/pip install -r requirements.txt
-bash setup-claude.sh   # installs service + hooks in one shot
+bash setup-claude.sh   # installs service + all 4 hooks
 ```
 
-That's it. Open a new Claude Code session — it will automatically recall your preferences, past decisions, project context, and environment state before every prompt.
+Open a new Claude Code session. Done — every prompt now gets cross-session memory.
 
-**What `setup-claude.sh` does:**
-1. Fixes + loads the launchd plist (auto-start on login)
-2. Waits for service health at `http://localhost:18800`
-3. Writes 3 hook scripts to `claude-code/hooks/`
-4. Patches `~/.claude/settings.json` with the hooks block
-
-**What you get on every Claude Code prompt (≤380ms added latency):**
-```
+**What you get on every prompt:**
+```xml
 <cross_session_memory>
 ## User Profile
-- name: Jace
-- preferences: prefers bun over npm, works on openclaw-memory Redis service
-- rules: always use AgentMem for OpenClaw memory
+- rules: always use bun for JavaScript; always deploy with Docker Compose
+- preferences: prefers Python for scripting, Rust for performance
 
 ## Long-Term Memory (Facts)
-1. [preference] prefers bun over npm
-2. [rule] always use AgentMem for OpenClaw memory
-...
+1. [rule] Jace always uses AgentMem for OpenClaw memory.
+2. [preference] Jace prefers bun over npm as JavaScript package manager.
 
 ## Recent Relevant Episodes
-1. user: I always deploy with Docker Compose on port 8080
-   assistant: Noted — Docker Compose, port 8080.
-...
+1. [decision] user: I decided to always use bun instead of npm...
+2. [procedure] user: to fix Redis HNSW connection, run start.sh first...
 </cross_session_memory>
 ```
 
-**Hook architecture (transparent, zero config after install):**
+**4 hooks, zero config after install:**
 
-| Hook | Trigger | Action | Latency |
-|------|---------|--------|---------|
-| `recall.sh` | Every user prompt | Injects cross-session memory via `additionalContext` | ~330ms |
-| `store.sh` | Session end (`Stop`) | Persists transcript → long-term Redis memory | async |
-| `register-env.sh` | Session start | Registers OS/git/cwd/model env state | ~50ms |
-
-**Manual hook registration** (if you already have the service running):
-```bash
-# Add to ~/.claude/settings.json "hooks" section:
-python3 - ~/.claude/settings.json /path/to/AgentMem/claude-code/hooks << 'EOF'
-import json, sys
-s, h = sys.argv[1], sys.argv[2]
-settings = json.load(open(s))
-settings["hooks"] = {
-    "SessionStart":     [{"matcher":"startup|clear|compact","hooks":[{"type":"command","command":f"{h}/register-env.sh","timeout":10}]}],
-    "UserPromptSubmit": [{"hooks":[{"type":"command","command":f"{h}/recall.sh","timeout":10}]}],
-    "Stop":             [{"hooks":[{"type":"command","command":f"{h}/store.sh","timeout":30}]}]
-}
-json.dump(settings, open(s,'w'), indent=2)
-print("Done:", list(settings["hooks"].keys()))
-EOF
-```
-
----
-
-## Bootstrap from Existing Chat Histories
-
-### Claude Code — All Projects
-
-Ingest all past Claude Code sessions across every project directory:
-
-```bash
-# List all projects and session counts
-python3 digest-claudecode.py --list-projects
-
-# Dry run — see what would be ingested without touching Redis
-python3 digest-claudecode.py --dry-run
-
-# Ingest all sessions from all projects (incremental)
-python3 digest-claudecode.py
-
-# Only ingest sessions from one project
-python3 digest-claudecode.py --project healthlens
-
-# Force re-ingest everything
-python3 digest-claudecode.py --reset
-```
-
-`digest-claudecode.py` handles Claude Code's richer JSONL format:
-- Skips `toolUseResult` user events (tool call outputs — bash/file noise, not user intent)
-- Extracts only `type=text` assistant blocks (skips `tool_use`, `thinking` blocks)
-- Strips injected `<cross_session_memory>` blocks to avoid circular echo
-- Namespaces session IDs as `claudecode:{project-slug}:{session-uuid}`
-- State tracked in `.digest-claudecode-state.json` — reruns are incremental
-
-### OpenClaw Chat History
-
-```bash
-# Dry run
-python3 digest-openclaw.py --dry-run
-
-# Ingest all sessions (incremental)
-python3 digest-openclaw.py
-
-# Force re-ingest everything
-python3 digest-openclaw.py --reset
-
-# Custom sessions directory
-python3 digest-openclaw.py --sessions-dir ~/.openclaw/agents/main/sessions
-```
-
-After ingestion, run consolidation to merge semantically duplicate facts:
-```bash
-curl -X POST http://localhost:18800/consolidate/sync
-```
+| Hook | Trigger | Action |
+|------|---------|--------|
+| `register-env.sh` | Session start | Registers OS / git / cwd / model |
+| `recall.sh` | Every prompt | Injects memory via `additionalContext` (~330ms) |
+| `compact.sh` | After every tool use | Compresses session KV when >3,000 chars (fire-and-forget) |
+| `store.sh` | Session end | Persists transcript → Redis long-term (async) |
 
 ---
 
 ## OpenClaw — Easy Setup
 
 ```bash
-# 1. Start AgentMem (auto-starts via launchd after setup-claude.sh)
-bash start.sh
-
-# 2. Copy plugin to OpenClaw extensions
-cp -r plugin/ ~/.openclaw/extensions/memos-local/
-```
-
-Then in your OpenClaw config:
-```json
+# Plugin already at /path/to/AgentMem/plugin — add to openclaw.json:
 {
   "plugins": {
     "entries": {
       "memos-local-openclaw-plugin": {
         "enabled": true,
-        "config": {
-          "baseUrl": "http://127.0.0.1:18800",
-          "memoryLimitNumber": 6
-        }
+        "config": { "baseUrl": "http://127.0.0.1:18800", "memoryLimitNumber": 8 }
       }
-    }
+    },
+    "load": { "paths": ["/path/to/AgentMem/plugin"] }
   }
 }
 ```
 
-OpenClaw agents get the same 6-tier semantic memory as Claude Code — facts, episodes, procedures, persona, env, tools — all retrieved by HNSW cosine similarity in ≤2ms.
-
----
-
-## Why AgentMem? ROI vs Every Competitor
-
-### vs. Mem0 (cloud API)
-
-| Dimension | Mem0 | AgentMem |
-|-----------|------|----------|
-| Privacy | ❌ All memories sent to Mem0 servers | ✅ 100% local, never leaves your machine |
-| Cost | ❌ $0.002–0.01 per operation (adds up fast) | ✅ Free (Redis OSS + local model) |
-| Recall latency | ~50ms (network) | **1.7ms P50** — 30× faster |
-| QA F1 (LoCoMo) | 34.20% | **64.70%†** (internal bench, GLM-4-flash) |
-| Local-first | ❌ Requires cloud | ✅ Works offline, air-gapped |
-| Framework support | Partial (Python SDK only) | ✅ MCP + LangChain + LangGraph + CrewAI + AutoGen + hooks |
-| Lossless extraction | ❌ | ✅ Pronoun-free, time-anchored facts |
-
-### vs. MemGPT / OpenMemGPT
-
-| Dimension | MemGPT | AgentMem |
-|-----------|--------|----------|
-| Architecture | LLM manages memory via tool calls | HNSW vectorset + A-MAC gate (no LLM at recall time) |
-| Recall latency | ~200ms | **1.7ms** — 120× faster |
-| Token overhead | High (LLM paging calls) | ≤550 tokens (greedy priority packing) |
-| Claude Code native | ❌ | ✅ Hook-based, zero prompt engineering needed |
-| Offline | Partial | ✅ |
-
-### vs. Claude Code Auto Memory (built-in MEMORY.md)
-
-| Dimension | Auto Memory (MEMORY.md) | AgentMem |
-|-----------|------------------------|----------|
-| How it works | You manually edit a flat markdown file | Automatic — stores every session, recalls semantically |
-| Retrieval | ❌ Entire file injected at session start | ✅ Top-K semantic search — only relevant context injected |
-| Scales to 1,000s of memories | ❌ File gets bloated, truncated at 200 lines | ✅ HNSW scales to millions of vectors |
-| Cross-project memory | ❌ Per-project only | ✅ Global `session_id` namespace |
-| Learns from conversations | ❌ Manual only | ✅ Auto-extracts facts from every turn |
-| Latency | 0ms (loaded at start) | ~330ms per prompt (acceptable for semantic gain) |
-
-**The verdict:** Auto Memory is great for 5–10 manually curated facts. AgentMem is the upgrade for persistent, growing, semantic memory that works like a human assistant who remembers everything.
-
-### vs. SimpleMem (research baseline, SOTA 2026)
-
-| Dimension | SimpleMem | AgentMem |
-|-----------|-----------|----------|
-| Recall latency | ~96ms (LanceDB + OpenAI embeddings) | **1.7ms** — **55× faster** |
-| Admission gate | Single entropy threshold | **A-MAC 5-factor gate** (semantic novelty + entity novelty + factual confidence + temporal signal + content-type prior) |
-| Memory tiers | 1 (semantic) | **6** (working/episodic/semantic/procedural/capability/persona) |
-| RRF fusion | ❌ | ✅ Dynamic weighted RRF across 3 retrieval passes |
-| Temporal affinity | ❌ (pure cosine — merges old+new incorrectly) | ✅ `cosine × exp(−λ·days)` — time-aware merging |
-| Local-first | ❌ (requires OpenAI) | ✅ MiniLM-L12 on MPS, no external API needed |
-| QA F1 (LoCoMo) | 43.24% | **64.70%†** (internal bench, GLM-4-flash) |
-| Claude Code hooks | ❌ | ✅ |
-
-### Performance Summary
-
-```
-Recall P50 (warm):           1.7ms     │  55× faster than SimpleMem
-Recall P90 (warm):           2.0ms     │  30× faster than Mem0
-Hook wall time (claude code): ~330ms   │  well within 10s hook timeout
-Store (async):               instant   │  non-blocking, zero prompt delay
-LLM extraction (background): async     │  fires after store returns — no chat block
-LLM-F1 (internal bench†):   64.70%    │  GLM-4-flash; 71.00% with GLM-4-plus
-Context-F1 (no LLM step):   32.64%    │  raw retrieval quality
-AIC (answer-in-context):     97.9%     │  46/47 questions retrievable
-Token budget:                ~1,064    │  configurable (default 1,500 words)
-Privacy:                    100% local │  vs Mem0/MemGPT cloud dependency
-Cost:                        $0/month  │  vs Mem0 API pricing
-```
-
----
-
-## Does AgentMem Slow Down My Chats?
-
-**Short answer: No.** The store is fully async and the recall adds ~330ms per prompt — well within Claude Code's 10-second hook timeout and invisible in normal conversation pace.
-
-### Production Latency Breakdown
-
-Every Claude Code / OpenClaw turn goes through two memory operations:
-
-```
-USER SENDS PROMPT
-  │
-  ├─ recall.sh fires (UserPromptSubmit hook)
-  │   ├─ [~5ms]   HTTP POST /recall
-  │   ├─ [~1.7ms] MiniLM-L12 embed (LRU-cached)
-  │   ├─ [~0.5ms] Redis HNSW VSIM search
-  │   └─ [~323ms] Result formatting + HTTP response
-  │   Total hook wall time: ~330ms  ← only this blocks the prompt
-  │
-  └─ Claude receives prompt + injected memory context → responds normally
-
-SESSION ENDS (Stop hook)
-  │
-  └─ store.sh fires (non-blocking, after session)
-      ├─ [instant] POST /store → queued, returns {"status":"queued"}
-      └─ [async background, ~500ms] GLM-4-flash extracts facts
-         ← NEVER blocks any user interaction
-```
-
-**The GLM-4-flash LLM call (fact extraction) always happens async in the background. It cannot block or delay your chat under any circumstances.**
-
-### Latency Comparison: AgentMem vs Competitors
-
-| System | Per-Prompt Overhead | Blocks Chat? | LLM at Recall? | Store Mode |
-|--------|:------------------:|:------------:|:--------------:|:----------:|
-| **AgentMem** | **~330ms** | **No** (async store) | **No** (pure HNSW) | **Async queue** |
-| SimpleMem | ~96ms retrieval + LLM plan | Yes (LLM at recall) | Yes (query planning) | Sync |
-| Mem0 | ~50ms cloud API | Yes (per-turn API call) | Yes (cloud LLM) | Sync |
-| MemGPT | ~200ms + tool calls | Yes (LLM tool paging) | Yes (LLM paging) | Sync LLM |
-| MEMORY.md (built-in) | 0ms (pre-loaded) | N/A | No | Manual only |
-
-### What the ~330ms Hook Overhead Means in Practice
-
-- Claude Code's hook timeout: **10 seconds** — we use 3.3% of it
-- Typical human think-to-type time: **2–10 seconds** — ~330ms is imperceptible
-- Hook fires concurrently with Claude reading your prompt — not added to Claude's response time
-- On subsequent prompts (warm cache): **embedding is LRU-cached → overhead drops to ~50ms**
-
-### If You Have No ZAI API Key
-
-Without a ZAI key, LLM fact extraction is skipped. Only regex extraction runs (~1ms). Recall still works perfectly — regex-extracted facts + session summaries are recalled as normal. The system degrades gracefully, never blocks.
-
-| Scenario | Recall | Store extraction | Chat impact |
-|----------|:------:|:----------------:|:-----------:|
-| ZAI key present | ✅ full | ✅ LLM + regex (async) | None |
-| No ZAI key | ✅ full | ✅ regex-only (async) | None |
-| Service down | ✅ degrades gracefully (hook timeout 10s) | ✅ skipped silently | ~10s worst case |
+Plugin v0.4.0: recalls on `before_agent_start` · compacts + stores on `agent_end`.
 
 ---
 
 ## Quick Start
 
 ```bash
-# Prerequisites: Python 3.12+, Redis 8+
-git clone https://github.com/JaceHo/AgentMem
-cd AgentMem
-python3 -m venv venv && venv/bin/pip install -r requirements.txt
+# Start service (or use setup-claude.sh for Claude Code)
 bash start.sh
-# Dashboard at http://localhost:18800/
 ```
 
 ```bash
-# Store a conversation turn
+# Store a turn
 curl -s -X POST http://localhost:18800/store \
   -H "Content-Type: application/json" \
   -d '{"messages":[{"role":"user","content":"I always use bun, never npm"},
@@ -430,206 +163,86 @@ curl -s -X POST http://localhost:18800/store \
 # Recall before next turn
 curl -s -X POST http://localhost:18800/recall \
   -H "Content-Type: application/json" \
-  -d '{"query":"what package manager should I use?","session_id":"demo"}'
-# → {"prependContext": "<cross_session_memory>\n[Facts]\nThe user always uses bun ...\n</cross_session_memory>"}
+  -d '{"query":"what package manager?","session_id":"demo"}'
 ```
 
 ```bash
-# Optional: add ZAI key for LLM-powered lossless extraction
+# Optional: ZAI key for LLM-powered lossless extraction
 echo "ZAI_API_KEY=your-key" > .env
 ```
 
 ---
 
-## Framework Integrations
+## Bootstrap from Existing History
 
-### Claude Code (Recommended: Hooks)
-For Claude Code, use the **hook integration** above (`setup-claude.sh`) — it provides automatic per-prompt recall and session-end storage with zero manual intervention. Hooks outperform MCP for Claude Code because they inject memory *before* the model sees the prompt, not as a tool the model has to think to call.
-
-### MCP (Claude Desktop / Cursor / Windsurf)
 ```bash
-python mcp_server.py   # stdio transport — 7 MCP tools exposed
-```
-```json
-{
-  "mcpServers": {
-    "agentmem": {
-      "command": "python",
-      "args": ["/path/to/AgentMem/mcp_server.py"]
-    }
-  }
-}
-```
+# Ingest all past Claude Code sessions
+python3 digest-claudecode.py          # incremental
+python3 digest-claudecode.py --reset  # re-ingest everything
 
-### Claude API
-```python
-from adapters.claude import ClaudeMemorySession
-import anthropic
+# Ingest all past OpenClaw sessions
+python3 digest-openclaw.py
 
-session = ClaudeMemorySession(session_id="user-123", anthropic_client=anthropic.Anthropic())
-response = await session.chat("What tools should I use?")
-# recall → build context → call Claude → store → return response
-await session.end()   # promote session to long-term memory
-```
-
-### LangChain
-```python
-from adapters.langchain import ClawMemory
-from langchain.chains import ConversationChain
-
-memory = ClawMemory(session_id="user-123")
-chain = ConversationChain(llm=your_llm, memory=memory)
-chain.predict(input="I prefer dark mode in all tools")
-```
-
-### LangGraph
-```python
-from adapters.langgraph import make_memory_nodes
-recall_node, store_node = make_memory_nodes(session_id="user-123")
-# Add as first + last nodes in your StateGraph
-```
-
-### CrewAI / AutoGen
-```python
-from adapters.crewai import RecallMemoryTool, StoreMemoryCallback
-from adapters.autogen import ClawMemoryHook
+# Merge semantic duplicates after bulk ingest
+curl -X POST http://localhost:18800/consolidate/sync
 ```
 
 ---
 
-## Architecture: A-MAC + SimpleMem+ Retrieval Pipeline
+## Architecture — Retrieval Pipeline
 
 ```
 Query →
-  │
-  ├─ [0ms]   Embed query (MiniLM-L12 384-dim, LRU-cached)
-  │
-  ├─ [0ms]   Parallel async gather (all at once):
-  │           ├── Semantic KNN: VSIM on mem:facts (scene-filtered)
-  │           ├── Semantic KNN: VSIM on mem:episodes
-  │           ├── Symbolic struct: analyze_query_structure → persons/entities → targeted VSIM
-  │           ├── Persona context, env context, session context
-  │           └── Tool context (if capability query)
-  │
-  ├─ [opt]   Intent-Aware Planning (enable_planning=true, +600ms):
-  │           plan_queries() → 1-3 targeted sub-queries → parallel VSIM
-  │
-  ├─ [0ms]   Global supplement: fill gaps if scene results sparse
-  │
-  ├─ [0ms]   Dynamic Weighted RRF (wRRF, arXiv:2511.18194):
-  │           entity+temporal query → weights [0.8, 0.8, 1.4] (boost symbolic)
-  │           entity/temporal only  → weights [0.9, 0.9, 1.2]
-  │           semantic only         → weights [1.0, 1.0, 0.6]
-  │           RRF score = Σ w_i / (60 + rank_i)
-  │
-  ├─ [0ms]   Lexical boost: BM25-lite keyword overlap scoring
-  │
-  ├─ [0ms]   Importance boost: score += 0.15 × importance
-  │           (identity/rule floor ≥0.80 — float to top automatically)
-  │
-  ├─ [opt]   Reflection (enable_reflection=true, +~1s):
-  │           check_sufficiency() → 2nd pass if incomplete
-  │
-  ├─ [opt]   Graph expansion (include_graph=true):
-  │           entity neighbourhood facts from mem:graph:*
-  │
-  └─ [0ms]   Token-budget packing → <cross_session_memory> XML
-              Priority: persona > env > tools > session > facts > episodes
-              Default: 1500 words (configurable per request)
+  ├─ Embed (MiniLM-L12 384-dim, LRU-cached)
+  ├─ Parallel async gather:
+  │   ├── VSIM on mem:facts  (scene-filtered)
+  │   ├── VSIM on mem:episodes
+  │   ├── Symbolic pass: named entities → targeted VSIM
+  │   ├── Persona · env · session context
+  │   └── Tool context (if capability query)
+  ├─ Dynamic Weighted RRF (wRRF, arXiv:2511.18194):
+  │   entity+temporal → weights [0.8, 0.8, 1.4]
+  │   semantic only   → weights [1.0, 1.0, 0.6]
+  ├─ BM25-lite keyword boost
+  ├─ Importance boost: score += 0.15 × importance
+  └─ Token-budget greedy packing → <cross_session_memory>
+     Priority: persona > env > tools > session > facts > episodes
 
-Store path:
-  │
-  ├─ [0ms]   A-MAC 5-factor admission gate (arXiv:2603.04549):
-  │           F1 semantic_novelty    (w=0.30): 1 - max_cosine_sim vs recent episodes
-  │           F2 entity_novelty      (w=0.20): min(1.0, len(entities)/4)
-  │           F3 factual_confidence  (w=0.20): declarative predicate density
-  │           F4 temporal_signal     (w=0.15): explicit date/time references
-  │           F5 content_type_prior  (w=0.15): high-value pattern regex
-  │           score ≥ 0.30 → admit  (vs SimpleMem's single H(W_t) threshold)
-  │
-  └─ [async] Extract → embed → save episode + facts → update session
+Store → A-MAC 5-factor gate (arXiv:2603.04549):
+  F1 semantic_novelty   (w=0.25)  F2 entity_novelty    (w=0.15)
+  F3 factual_confidence (w=0.20)  F4 temporal_signal   (w=0.10)
+  F5 content_type_prior (w=0.30)  ← DOMINANT (A-MAC ablation)
+  score ≥ 0.40 → admit → extract → embed → save
 ```
 
 ---
 
-## Memory Architecture: 6 Cognitive Tiers
+## Consolidation — 3-Phase (SimpleMem §3.2)
 
-Based on [arXiv:2602.19320](https://arxiv.org/abs/2602.19320) taxonomy:
-
-| Tier | Redis Key | Contents | Lifecycle |
-|------|-----------|----------|-----------|
-| **Working** | `mem:session:*` | Rolling session summary | 4h TTL → promoted at session end |
-| **Episodic** | `mem:episodes` | Conversation turns ("what happened") | Permanent |
-| **Semantic** | `mem:facts` | Lossless facts (SimpleMem §3.1) | Permanent; consolidates over time |
-| **Procedural** | `mem:procedures` | How-to workflows ("how to do X") | Permanent |
-| **Capability** | `mem:tools` + `mem:env` | Agent tools, environment state | Permanent |
-| **Persona** | `mem:persona` | Evolving user profile | Permanent |
-
-SimpleMem has one tier. AgentMem has six.
-
----
-
-## Consolidation: 3-Phase SimpleMem §3.2
+Runs every 50 stores + hourly:
 
 ```
-Every 50 stores + hourly:
-
-Phase 1 — Decay:  entries > 90 days → importance × 0.9
-Phase 2 — Merge:  affinity = cosine × exp(−λ·days) ≥ 0.85
-                  LLM merges cluster → winner = max(importance)
-                  losers soft-deleted (superseded_by, never VREM)
+Phase 1 — Decay:  age > 90 days → importance × 0.9
+Phase 2 — Merge:  affinity = cosine × exp(−λ·days) ≥ 0.85 → LLM merges cluster
+          (temporal affinity prevents "Python 2.7 (2023)" merging with "Python 3.12 (2026)")
 Phase 3 — Prune:  importance < 0.05 → soft-delete
 ```
 
-Key difference vs SimpleMem: **temporal affinity** (`cosine × exp(−0.03·days)`) prevents "Python 2.7 (2023)" merging with "Python 3.12 (2026)". SimpleMem uses pure cosine ≥ 0.95 and would incorrectly merge those.
-
-Category importance floors (v0.9.2) ensure high-signal facts never fall below the prune threshold through normal decay:
-
-| Category | Floor | Notes |
-|----------|------:|-------|
-| identity, rule | 0.80 | Never pruned in practice |
-| preference, work, personal, reminder | 0.65–0.75 | Long-lived |
-| decision, procedure, location | 0.55–0.60 | Medium persistence |
-| tool_use, env_context, context | 0.35–0.45 | May decay naturally |
-| general | 0.30 | Lowest persistence |
+Category importance floors prevent critical facts from ever reaching the prune threshold:
+`identity/rule ≥ 0.80 · preference ≥ 0.75 · decision ≥ 0.60 · general ≥ 0.30`
 
 ```bash
 curl -X POST http://localhost:18800/consolidate/sync
-# → {"decayed": 12, "merged": 3, "pruned": 1, "total_before": 87, "total_after": 83, "ms": 1247}
+# → {"decayed":12,"merged":3,"pruned":1,"total_before":87,"total_after":83,"ms":1247}
 ```
 
 ---
 
-## Lossless Extraction: SimpleMem §3.1
-
-Every stored fact is pronoun-free and time-anchored:
-
-```diff
-raw:    "He'll go there tomorrow at 2pm"
-stored: "Bob will meet Alice at the Acme office at 2026-03-09T14:00:00"
-```
-
-SimpleMem ablation: removing this drops temporal reasoning F1 from **58.62 → 25.40 (−57%)**.
-
-Two extraction layers run in parallel:
-
-| Layer | Method | Latency | Catches |
-|-------|--------|---------|---------|
-| **Regex** | 35+ compiled patterns (English + Chinese) | ~1ms | First-person English + CJK (我叫/我在/我住/我喜欢…), procedures, env |
-| **LLM** | GLM-4-flash (ZAI) | ~200-500ms async | Implicit facts, multilingual, contextual, decisions |
-
-Both produce `lossless_restatement` with `topic`, `location`, `importance`, `keywords[]`, `persons[]`, `entities[]`.
-
-**CJK / Chinese language support** (v0.9.3+): All regex patterns, entity extraction, knowledge graph slugging, tokenization (F1 scoring), and word-count estimation are CJK-aware. Chinese characters are tokenized individually for F1 computation; entity slugs preserve CJK ideographs; Chinese punctuation (`。，！？；：`) is handled separately from ASCII punctuation. See `extractor.py`, `graph.py`, `bench-f1.py`.
-
----
-
-## Advanced Recall Options
+## Advanced Recall
 
 ```json
 {
-  "query": "what are my preferences for this project?",
-  "session_id": "user-123",
+  "query": "...", "session_id": "...",
   "token_budget": 2000,
   "enable_planning": true,
   "enable_reflection": true,
@@ -640,129 +253,90 @@ Both produce `lossless_restatement` with `topic`, `location`, `importance`, `key
 
 | Option | Default | Effect |
 |--------|---------|--------|
-| `token_budget` | `1500` | Max words in output (greedy priority packing) |
-| `enable_planning` | `false` | LLM generates 1-3 targeted sub-queries (~+600ms) |
-| `enable_reflection` | `false` | Sufficiency check + 2nd pass if incomplete (~+1s) |
-| `include_graph` | `false` | Entity knowledge-graph neighbourhood expansion |
-| `time_from/to` | `null` | Unix ms timestamp range filter via Redis VSIM FILTER |
+| `token_budget` | 1500 | Max words in output |
+| `enable_planning` | false | LLM generates 1-3 sub-queries (+600ms) |
+| `enable_reflection` | false | Sufficiency check + 2nd pass (+1s) |
+| `include_graph` | false | Knowledge-graph neighbourhood expansion |
+| `time_from/to` | null | Unix ms timestamp range filter |
 
 ---
 
-## Performance
+## API Reference
 
-Apple M4 Pro / Redis 8 / MiniLM-L12 on MPS:
-
-| Metric | Result |
-|--------|--------|
-| Recall P50 (warm, default mode) | **1.7ms** |
-| Recall P90 (warm) | **2.0ms** |
-| Recall cold start | **46ms** |
-| Embedding (LRU-cached) | **20× faster** |
-| Store (async queue) | **instant** |
-| SimpleMem avg per query | ~96ms (481s / 5,000 queries) |
-| **AgentMem vs SimpleMem recall** | **~55× faster** |
-| Consolidation (no merges) | **3ms** |
-| Consolidation (with LLM merges) | **~1.2s** |
-
-Speed advantage: AgentMem uses Redis 8 native HNSW vectorset (VSIM) with cached embeddings. SimpleMem uses LanceDB + calls OpenAI for every extraction and retrieval planning step.
+| Endpoint | Description |
+|----------|-------------|
+| `POST /recall` | Before-prompt hook — returns `prependContext` |
+| `POST /store` | After-session hook — async, returns `{"status":"queued"}` |
+| `POST /session/compress` | Promote Tier 1 → Tier 2 long-term |
+| `POST /session/compact` | Mid-session compress Tier 1 KV if >threshold chars |
+| `POST /answer` | LLM extracts short answer from recalled context (bench use) |
+| `POST /consolidate/sync` | Run 3-phase consolidation now |
+| `POST /register-tools` | Register agent tool index |
+| `POST /recall-tools` | Semantic search over tools |
+| `POST /store-procedure` | Save a how-to workflow |
+| `POST /recall-procedures` | Search procedural memory |
+| `GET /graph/{entity}` | Knowledge graph neighbours |
+| `GET /stats` | `{"episodes":N,"facts":N,"procedures":N,"tools":N}` |
+| `GET /health` | `{"status":"ok","redis":"ok","version":"0.9.3"}` |
+| `GET /` | Web dashboard (5-tab, live SSE logs) |
 
 ---
 
-## Full API Reference
+## Framework Integrations
 
-### `POST /recall`
-```json
-{"query":"...","session_id":"...","memory_limit_number":6,"token_budget":1500,
- "enable_planning":false,"enable_reflection":false,"include_graph":false,"include_tools":true}
+```python
+# Claude API
+from adapters.claude import ClaudeMemorySession
+session = ClaudeMemorySession(session_id="user-123", anthropic_client=client)
+response = await session.chat("What tools should I use?")
+await session.end()
+
+# LangChain
+from adapters.langchain import ClawMemory
+memory = ClawMemory(session_id="user-123")
+chain = ConversationChain(llm=llm, memory=memory)
+
+# LangGraph
+from adapters.langgraph import make_memory_nodes
+recall_node, store_node = make_memory_nodes(session_id="user-123")
+
+# MCP (Claude Desktop / Cursor / Windsurf)
+# python mcp_server.py  — 7 MCP tools exposed via stdio
 ```
-Returns `{"prependContext":"...","latency_ms":2}`
-
-### `POST /answer`
-```json
-{"query": "What city does the user live in?", "context": "<recalled context text>"}
-```
-LLM reads the recalled context and extracts a concise answer (1-8 words). Used by `bench-f1.py` to compute LLM-F1 comparable to SimpleMem/AriadneMem published baselines. Uses GLM-4-plus for high-quality extraction. Requires ZAI API key.
-Returns `{"answer": "Oakland"}`
-
-### `POST /store`
-```json
-{"messages":[{"role":"user","content":"..."},{"role":"assistant","content":"..."}],"session_id":"..."}
-```
-Returns `{"status":"queued"}` — processing is async and non-blocking.
-
-### `POST /session/compress`
-```json
-{"session_id":"...","wait":false}
-```
-Promotes Tier 1 session → Tier 2 long-term. Returns `{"status":"ok","ep_saved":1,"facts_saved":3}`.
-
-### `GET /session/{session_id}`
-Inspect current session buffer: `{"context":"...","length":312,"tier":"Tier 1 / Session KV"}`
-
-### `POST /consolidate/sync`
-Returns `{"decayed":N,"merged":N,"pruned":N,"total_before":N,"total_after":N,"ms":N}`
-
-### `POST /register-tools` · `POST /recall-tools`
-Register agent tool index; semantic search over tools by description.
-
-### `POST /recall-procedures` · `POST /store-procedure`
-Procedural memory search and storage.
-
-### `GET /graph/{entity}` · `POST /graph/recall` · `GET /graph/stats`
-Entity knowledge graph. See knowledge graph section above.
-
-### `GET /config`
-```json
-{"version":"0.9.2","auto_consolidate_every":50,"stores_since_last":12,"periodic_interval_s":3600}
-```
-
-### `GET /health` → `{"status":"ok","redis":"ok","version":"0.9.2"}`
-### `GET /stats` → `{"episodes":57,"facts":17,"procedures":8,"tools":15}`
-### `GET /` → Dashboard (5-tab web UI, auto-refreshes)
-### `GET /logs/stream` → SSE real-time log stream
 
 ---
 
 ## Setup
 
 ```bash
-# Python 3.12+, Redis 8+ (with built-in vectorset)
+# Prerequisites: Python 3.12+, Redis 8+
 python3 -m venv venv && venv/bin/pip install -r requirements.txt
 
-# Optional: ZAI API key for LLM extraction (GLM-4-flash)
-echo "ZAI_API_KEY=your-key" > .env
-
-# Claude Code users: one-command full setup (service + hooks)
+# Claude Code (recommended — service + hooks in one shot)
 bash setup-claude.sh
 
-# Standalone service only
-bash start.sh                              # production (kills stale port holder)
-venv/bin/uvicorn main:app --reload         # development
-```
+# Standalone
+bash start.sh
 
-### macOS Auto-Start (launchd)
-```bash
+# macOS launchd auto-start
 launchctl load ~/Library/LaunchAgents/ai.agent.memory.plist
-launchctl kickstart -k "gui/$(id -u)/ai.agent.memory"  # restart
 ```
 
 ---
 
 ## Research Foundation
 
-| Paper | Role in AgentMem |
-|-------|-----------------|
-| [SimpleMem (arXiv:2601.02553)](https://arxiv.org/abs/2601.02553) | Core 3-stage pipeline: §3.1 lossless extraction, §3.2 consolidation, §3.3 intent-aware retrieval. 43.24 F1 on LoCoMo (GPT-4.1-mini) |
-| [AriadneMem (arXiv:2603.03290)](https://arxiv.org/abs/2603.03290) | Graph bridge discovery + conflict-aware coarsening. SOTA 46.30 F1 on LoCoMo (GPT-4.1-mini). Inspired `include_graph` recall |
-| [A-MAC (arXiv:2603.04549)](https://arxiv.org/abs/2603.04549) | Adaptive 5-factor admission gate. F1=0.583 on *admission classification* task (≠ QA F1). Ablation: type_prior is dominant factor. Category importance floors |
-| [wRRF (arXiv:2511.18194)](https://arxiv.org/abs/2511.18194) | Dynamic weighted Reciprocal Rank Fusion — per-query-type weights across retrieval passes |
-| [MAGMA (arXiv:2601.03236)](https://arxiv.org/abs/2601.03236) | Multi-graph memory (semantic/temporal/causal/entity). 0.700 LLM-Judge. Inspired knowledge graph tier |
-| [EverMemOS (arXiv:2601.02163)](https://arxiv.org/abs/2601.02163) | Self-organizing MemCells→MemScenes. 83% accuracy |
-| [Hindsight (arXiv:2512.12818)](https://arxiv.org/abs/2512.12818) | 4 logical networks + reflection. 89.61% (Gemini-3). Inspired reflection loop |
-| [Anatomy of Agentic Memory (arXiv:2602.19320)](https://arxiv.org/abs/2602.19320) | 6-tier cognitive taxonomy |
-| [MemoryOS (arXiv:2506.06326)](https://arxiv.org/abs/2506.06326) | Heat-tiered reranking formula |
-| [RRF (Cormack et al., SIGIR 2009)](https://dl.acm.org/doi/10.1145/1571941.1572114) | Reciprocal Rank Fusion for multi-list merge |
-| [Redis 8 Vectorset](https://redis.io/blog/searching-1-billion-vectors-with-redis-8/) | HNSW at scale, native vectorset — no separate vector DB |
+| Paper | Role |
+|-------|------|
+| [SimpleMem arXiv:2601.02553](https://arxiv.org/abs/2601.02553) | Core pipeline: lossless extraction §3.1, consolidation §3.2, intent-aware retrieval §3.3 |
+| [AriadneMem arXiv:2603.03290](https://arxiv.org/abs/2603.03290) | Graph bridge discovery — SOTA 46.30% on real LoCoMo. Inspired `include_graph` |
+| [A-MAC arXiv:2603.04549](https://arxiv.org/abs/2603.04549) | 5-factor admission gate + category importance floors |
+| [wRRF arXiv:2511.18194](https://arxiv.org/abs/2511.18194) | Dynamic weighted RRF per query type |
+| [MAGMA arXiv:2601.03236](https://arxiv.org/abs/2601.03236) | Multi-graph memory — inspired knowledge graph tier |
+| [Anatomy of Agentic Memory arXiv:2602.19320](https://arxiv.org/abs/2602.19320) | 6-tier cognitive taxonomy |
+| [MemoryOS arXiv:2506.06326](https://arxiv.org/abs/2506.06326) | Heat-tiered reranking |
+| [claude-mem](https://github.com/thedotmack/claude-mem) | Episode taxonomy, causal chaining, Endless Mode compact (v0.9.3) |
+| [Redis 8 Vectorset](https://redis.io/blog/searching-1-billion-vectors-with-redis-8/) | Native HNSW — no separate vector DB |
 
 ---
 
