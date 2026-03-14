@@ -103,6 +103,10 @@ Open a new Claude Code session. Done — every prompt now gets cross-session mem
 - rules: always use bun for JavaScript; always deploy with Docker Compose
 - preferences: prefers Python for scripting, Rust for performance
 
+## Relevant Skills                          ← v0.9.4: top-2 from mem:procedures (cosine KNN)
+- **Use when diagnosing a bug...**: # Debug Systematically — 1. Reproduce...
+- **Use when reviewing code for security...**: # Secure Code Review Checklist...
+
 ## Long-Term Memory (Facts)
 1. [rule] Jace always uses AgentMem for OpenClaw memory.
 2. [preference] Jace prefers bun over npm as JavaScript package manager.
@@ -198,9 +202,10 @@ curl -X POST http://localhost:18800/consolidate/sync
 ```
 Query →
   ├─ Embed (MiniLM-L12 384-dim, LRU-cached)
-  ├─ Parallel async gather:
-  │   ├── VSIM on mem:facts  (scene-filtered)
+  ├─ Parallel async gather (all fire simultaneously):
+  │   ├── VSIM on mem:facts       (scene-filtered)
   │   ├── VSIM on mem:episodes
+  │   ├── VSIM on mem:procedures  (top-2 skills, if include_procedures=true)  ← v0.9.4
   │   ├── Symbolic pass: named entities → targeted VSIM
   │   ├── Persona · env · session context
   │   └── Tool context (if capability query)
@@ -210,7 +215,7 @@ Query →
   ├─ BM25-lite keyword boost
   ├─ Importance boost: score += 0.15 × importance
   └─ Token-budget greedy packing → <cross_session_memory>
-     Priority: persona > env > tools > session > facts > episodes
+     Priority: persona > env > tools > skills > session > facts > episodes
 
 Store → A-MAC 5-factor gate (arXiv:2603.04549):
   F1 semantic_novelty   (w=0.25)  F2 entity_novelty    (w=0.15)
@@ -248,6 +253,7 @@ curl -X POST http://localhost:18800/consolidate/sync
 {
   "query": "...", "session_id": "...",
   "token_budget": 2000,
+  "include_procedures": true,
   "enable_planning": true,
   "enable_reflection": true,
   "include_graph": true,
@@ -258,6 +264,7 @@ curl -X POST http://localhost:18800/consolidate/sync
 | Option | Default | Effect |
 |--------|---------|--------|
 | `token_budget` | 1500 | Max words in output |
+| `include_procedures` | false | Inject top-2 skills from `mem:procedures` as `## Relevant Skills` |
 | `enable_planning` | false | LLM generates 1-3 sub-queries (+600ms) |
 | `enable_reflection` | false | Sufficiency check + 2nd pass (+1s) |
 | `include_graph` | false | Knowledge-graph neighbourhood expansion |
@@ -281,7 +288,7 @@ curl -X POST http://localhost:18800/consolidate/sync
 | `POST /recall-procedures` | Search procedural memory |
 | `GET /graph/{entity}` | Knowledge graph neighbours |
 | `GET /stats` | `{"episodes":N,"facts":N,"procedures":N,"tools":N}` |
-| `GET /health` | `{"status":"ok","redis":"ok","version":"0.9.3"}` |
+| `GET /health` | `{"status":"ok","redis":"ok","version":"0.9.4"}` |
 | `GET /` | Web dashboard (5-tab, live SSE logs) |
 
 ---
