@@ -2,10 +2,11 @@
 
 **Local persistent memory for Claude Code, OpenClaw, and any AI agent framework.**
 
-[![Version](https://img.shields.io/badge/version-0.9.4-blue)](.) [![A-MAC](https://img.shields.io/badge/algorithm-A--MAC%20%2B%20wRRF-brightgreen)](https://arxiv.org/abs/2603.04549) [![Redis 8](https://img.shields.io/badge/backend-Redis%208%20HNSW-red)](https://redis.io) [![License](https://img.shields.io/badge/license-MIT-yellow)](.)
+[![Version](https://img.shields.io/badge/version-0.9.7-blue)](.) [![A-MAC](https://img.shields.io/badge/algorithm-A--MAC%20%2B%20wRRF-brightgreen)](https://arxiv.org/abs/2603.04549) [![Redis 8](https://img.shields.io/badge/backend-Redis%208%20HNSW-red)](https://redis.io) [![License](https://img.shields.io/badge/license-MIT-yellow)](.)
 
 ```
-LLM-F1: 64.70%†  │  Context-F1: 32.64%  │  AIC: 97.9%  │  Recall P50: 1.7ms  │  $0/month  │  36 behavioral skills
+LLM-F1: 64.70%†  │  Context-F1: 32.64%  │  AIC: 97.9%  │  Recall P50: 1.7ms  │  $0/month
+Episodes: 341  │  Facts: 141  │  Procedures: 281  │  Tools: 32  │  TIG edges: 25+
 ```
 
 ---
@@ -15,37 +16,39 @@ LLM-F1: 64.70%†  │  Context-F1: 32.64%  │  AIC: 97.9%  │  Recall P50: 1.
 Your AI framework (Claude Code / OpenClaw) manages the **LLM context window**. AgentMem manages everything **below** it:
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│  Tier 0 — LLM Context Window  (framework manages this)       │
-│  Claude Code / OpenClaw:  sliding window · summary · pointer  │
-│  AgentMem injects:        <cross_session_memory>…</…>        │
-│                           ~1,064 tokens vs ~16,910 raw (94%↓) │
-├──────────────────────────────────────────────────────────────┤
-│  Tier 1 — Session KV  (Redis, 4h TTL)                        │
-│  rolling summary · auto-compacted when >3K chars (v0.9.3)    │
-├──────────────────────────────────────────────────────────────┤
-│  Tier 2 — Episodic  mem:episodes                             │
-│  conversation turns · typed (decision/procedure/discovery…)   │
-│  causal chain: prev_episode_id ↔ next_episode_id (v0.9.3)    │
-├──────────────────────────────────────────────────────────────┤
-│  Tier 3 — Semantic  mem:facts                                 │
-│  lossless facts · pronoun-free · ISO-timestamped             │
-├──────────────────────────────────────────────────────────────┤
-│  Tier 4 — Procedural  mem:procedures                         │
-│  how-to workflows · tool recipes · MetaClaw behavioral skills │
-├──────────────────────────────────────────────────────────────┤
-│  Tier 5 — Capability + Persona  mem:tools · mem:env          │
-│  tool index · environment state · evolving user profile       │
-└──────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│  Tier 0 — LLM Context Window  (framework manages this)           │
+│  Claude Code / OpenClaw:  sliding window · summary · pointer     │
+│  AgentMem injects:        <cross_session_memory>…</…>            │
+│                           ~1,064 tokens vs ~16,910 raw (94%↓)    │
+├──────────────────────────────────────────────────────────────────┤
+│  Tier 1 — Session KV  (Redis, 4h TTL)                            │
+│  rolling summary · auto-compacted when >3K chars (v0.9.3)        │
+├──────────────────────────────────────────────────────────────────┤
+│  Tier 2 — Episodic  mem:episodes                                  │
+│  typed turns (decision/procedure/discovery…)                      │
+│  causal chain: prev_episode_id ↔ next_episode_id                 │
+├──────────────────────────────────────────────────────────────────┤
+│  Tier 3 — Semantic  mem:facts                                     │
+│  lossless facts · pronoun-free · ISO-timestamped                 │
+├──────────────────────────────────────────────────────────────────┤
+│  Tier 4 — Procedural  mem:procedures                             │
+│  how-to workflows · MetaClaw skills · AWO meta-tools (v0.9.6)    │
+│  MACLA Beta posterior scoring · mem:proc_by_tool reverse index   │
+├──────────────────────────────────────────────────────────────────┤
+│  Tier 5 — Capability + Persona  mem:tools · mem:env · mem:persona│
+│  tool index + ToolMem reliability (v0.9.5) · environment state   │
+│  AutoTool TIG: mem:tool_graph — transition counts (v0.9.5)       │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
-The framework prunes **Tier 0** (context window) — AgentMem is never touched. AgentMem's `before_agent_start` / `UserPromptSubmit` hook re-injects the **most relevant** fragments every turn.
+AgentMem's hooks re-inject the **most relevant** fragments on every prompt — persona → env → tools (with reliability hints + next-tool suggestions) → skills → session → facts → episodes.
 
 ---
 
 ## Benchmark Results
 
-> ⚠️ AgentMem's 64.70% is on an **internal bench** (8 convs, 47 Q/A, GLM-4-flash). SimpleMem/AriadneMem scores are on the harder real LoCoMo dataset (1,986 Q, 200-400 turn convs). Not directly comparable — our real-dataset score will be lower. Run `bench-f1.py` to reproduce.
+> ⚠️ AgentMem's 64.70% is on an **internal bench** (8 convs, 47 Q/A, GLM-4-flash). SimpleMem/AriadneMem scores are on the harder real LoCoMo dataset. Not directly comparable — our real-dataset score will be lower. Run `bench-f1.py` to reproduce.
 
 | System | LLM-F1 | Dataset | Notes |
 |--------|:------:|---------|-------|
@@ -75,13 +78,17 @@ The framework prunes **Tier 0** (context window) — AgentMem is never touched. 
 | **Episode type taxonomy** | ❌ | ❌ | ✅ | ❌ | ✅ |
 | **Causal episode chaining** | ❌ | ❌ | ✅ | ❌ | ✅ |
 | **Mid-session compact (O(N) context)** | ❌ | ❌ | ✅ Endless | ❌ | ✅ |
+| **ToolMem per-tool reliability tracking** | ❌ | ❌ | ❌ | ❌ | ✅ v0.9.5 |
+| **AutoTool TIG (next-tool suggestions)** | ❌ | ❌ | ❌ | ❌ | ✅ v0.9.5 |
+| **AWO meta-tool synthesis** | ❌ | ❌ | ❌ | ❌ | ✅ v0.9.6 |
+| **Tool registration at session start** | ❌ | ❌ | ❌ | ✅ built-in | ✅ v0.9.7 |
 | **Claude Code hooks** | ❌ | ❌ | ✅ | ✅ built-in | ✅ |
 | **CJK / Chinese** | ❌ | ❌ | ❌ | ❌ | ✅ |
 | **MCP server** | ❌ | ✅ | ✅ | ❌ | ✅ |
 | **LangChain/LangGraph/CrewAI/AutoGen** | Partial | ❌ | ❌ | ❌ | ✅ |
 | **Benchmarked F1** | 34.20% | 43.24% | ❌ | ❌ | 64.70%† |
 
-> claude-mem inspired v0.9.3's episode taxonomy, causal chaining, and mid-session compact. What AgentMem adds: research-grade retrieval (wRRF + A-MAC + consolidation), 6 memory tiers, knowledge graph, and benchmark-verified quality.
+> claude-mem inspired v0.9.3's episode taxonomy, causal chaining, and mid-session compact. What AgentMem adds: research-grade retrieval (wRRF + A-MAC + consolidation), 6 memory tiers, knowledge graph, ToolMem, TIG, AWO, and benchmark-verified quality.
 
 ---
 
@@ -91,7 +98,7 @@ The framework prunes **Tier 0** (context window) — AgentMem is never touched. 
 git clone https://github.com/JaceHo/AgentMem
 cd AgentMem
 python3 -m venv venv && venv/bin/pip install -r requirements.txt
-bash setup-claude.sh   # installs service + all 4 hooks
+bash setup-claude.sh   # installs service + all 5 hooks
 ```
 
 Open a new Claude Code session. Done — every prompt now gets cross-session memory.
@@ -101,11 +108,14 @@ Open a new Claude Code session. Done — every prompt now gets cross-session mem
 <cross_session_memory>
 ## User Profile
 - rules: always use bun for JavaScript; always deploy with Docker Compose
-- preferences: prefers Python for scripting, Rust for performance
 
-## Relevant Skills                          ← v0.9.4: top-2 from mem:procedures (cosine KNN)
+## Available Tools (Relevant)
+- **Bash** [system/builtin]: Execute shell commands ⟨reliable (24/26✓)⟩
+- **Read** [filesystem/builtin]: Read files from the local filesystem
+- *Frequent next tools*: edit, bash, glob          ← AutoTool TIG hint
+
+## Relevant Skills                          ← top-2 from mem:procedures (MACLA Beta scored)
 - **Use when diagnosing a bug...**: # Debug Systematically — 1. Reproduce...
-- **Use when reviewing code for security...**: # Secure Code Review Checklist...
 
 ## Long-Term Memory (Facts)
 1. [rule] Jace always uses AgentMem for OpenClaw memory.
@@ -113,18 +123,18 @@ Open a new Claude Code session. Done — every prompt now gets cross-session mem
 
 ## Recent Relevant Episodes
 1. [decision] user: I decided to always use bun instead of npm...
-2. [procedure] user: to fix Redis HNSW connection, run start.sh first...
 </cross_session_memory>
 ```
 
-**4 hooks, zero config after install:**
+**5 hooks, zero config after install:**
 
 | Hook | Trigger | Action |
 |------|---------|--------|
 | `register-env.sh` | Session start | Registers OS / git / cwd / model |
+| `register-tools.sh` | Session start | Registers 18 built-in tools + MCP tools from settings (v0.9.7) |
 | `recall.sh` | Every prompt | Injects memory via `additionalContext` (~330ms) |
-| `compact.sh` | After every tool use | Compresses session KV when >3,000 chars (fire-and-forget) |
-| `store.sh` | Session end | Persists transcript → Redis long-term (async) |
+| `compact.sh` | After every tool use | Session compact + ToolMem feedback per tool (v0.9.5) |
+| `store.sh` | Session end | Store + compress + TIG recording + AWO meta-tool synthesis (v0.9.6) |
 
 ---
 
@@ -145,7 +155,19 @@ Open a new Claude Code session. Done — every prompt now gets cross-session mem
 }
 ```
 
-Plugin v0.4.0: recalls on `before_agent_start` · compacts + stores on `agent_end`.
+Plugin v0.5.1: recalls + registers tools/env on `before_agent_start` · ToolMem feedback + compact on `tool_end` · stores + TIG + AWO on `agent_end`.
+
+**Full parity — Claude Code hooks ↔ OpenClaw plugin:**
+
+| Feature | Claude Code | OpenClaw |
+|---------|:-----------:|:--------:|
+| Register env | ✅ `register-env.sh` | ✅ `before_agent_start` |
+| Register tools | ✅ `register-tools.sh` | ✅ `before_agent_start` |
+| Recall memory | ✅ `recall.sh` | ✅ `before_agent_start` |
+| Tool feedback per tool | ✅ `compact.sh` | ✅ `tool_end` |
+| Session compact per tool | ✅ `compact.sh` | ✅ `tool_end` |
+| Store + compress + TIG | ✅ `store.sh` | ✅ `agent_end` |
+| AWO detect-meta-tools | ✅ `store.sh` | ✅ `agent_end` |
 
 ---
 
@@ -189,10 +211,12 @@ python3 digest-openclaw.py
 
 # Ingest MetaClaw behavioral skills (36 pre-built + any evolved skills)
 python3 digest-metaclaw.py --skills-dir /path/to/MetaClaw/memory_data/skills
-# Skills appear in prependContext as "## Relevant Skills" on every prompt
 
 # Merge semantic duplicates after bulk ingest
 curl -X POST http://localhost:18800/consolidate/sync
+
+# Backfill tool→procedure reverse index (run once after upgrading to v0.9.6)
+curl -X POST http://localhost:18800/proc-backfill-index
 ```
 
 ---
@@ -205,10 +229,10 @@ Query →
   ├─ Parallel async gather (all fire simultaneously):
   │   ├── VSIM on mem:facts       (scene-filtered)
   │   ├── VSIM on mem:episodes
-  │   ├── VSIM on mem:procedures  (top-2 skills, if include_procedures=true)  ← v0.9.4
+  │   ├── VSIM on mem:procedures  (k×3 candidates, MACLA Beta re-ranked)  ← v0.9.5
   │   ├── Symbolic pass: named entities → targeted VSIM
   │   ├── Persona · env · session context
-  │   └── Tool context (if capability query)
+  │   └── Tool context (if capability query) + TIG next-tool hints        ← v0.9.5
   ├─ Dynamic Weighted RRF (wRRF, arXiv:2511.18194):
   │   entity+temporal → weights [0.8, 0.8, 1.4]
   │   semantic only   → weights [1.0, 1.0, 0.6]
@@ -221,7 +245,12 @@ Store → A-MAC 5-factor gate (arXiv:2603.04549):
   F1 semantic_novelty   (w=0.25)  F2 entity_novelty    (w=0.15)
   F3 factual_confidence (w=0.20)  F4 temporal_signal   (w=0.10)
   F5 content_type_prior (w=0.30)  ← DOMINANT (A-MAC ablation)
-  score ≥ 0.40 → admit → extract → embed → save
+  score ≥ 0.15 → admit → extract → embed → save
+
+Tool tracking (v0.9.5–0.9.7):
+  PostToolUse → /tool-feedback → ToolMem success/fail counts
+  Session end → /record-tool-sequence → TIG HINCRBY A:B
+  Session end → /tool-graph/detect-meta-tools → AWO 2-hop chain synthesis
 ```
 
 ---
@@ -254,6 +283,7 @@ curl -X POST http://localhost:18800/consolidate/sync
   "query": "...", "session_id": "...",
   "token_budget": 2000,
   "include_procedures": true,
+  "include_tools": true,
   "enable_planning": true,
   "enable_reflection": true,
   "include_graph": true,
@@ -264,7 +294,8 @@ curl -X POST http://localhost:18800/consolidate/sync
 | Option | Default | Effect |
 |--------|---------|--------|
 | `token_budget` | 1500 | Max words in output |
-| `include_procedures` | false | Inject top-2 skills from `mem:procedures` as `## Relevant Skills` |
+| `include_procedures` | false | Inject top-2 skills (MACLA Beta scored) as `## Relevant Skills` |
+| `include_tools` | false | Inject matched tools with ToolMem reliability hints + TIG next-tool |
 | `enable_planning` | false | LLM generates 1-3 sub-queries (+600ms) |
 | `enable_reflection` | false | Sufficiency check + 2nd pass (+1s) |
 | `include_graph` | false | Knowledge-graph neighbourhood expansion |
@@ -276,20 +307,27 @@ curl -X POST http://localhost:18800/consolidate/sync
 
 | Endpoint | Description |
 |----------|-------------|
-| `POST /recall` | Before-prompt hook — returns `prependContext` (facts + episodes + skills) |
-| `POST /store` | After-session hook — async, returns `{"status":"queued"}` |
+| `POST /recall` | Before-prompt — returns `prependContext` (facts + episodes + tools + skills) |
+| `POST /store` | After-session — async, returns `{"status":"queued"}` |
 | `POST /session/compress` | Promote Tier 1 → Tier 2 long-term |
 | `POST /session/compact` | Mid-session compress Tier 1 KV if >threshold chars |
 | `POST /answer` | LLM extracts short answer from recalled context (bench use) |
 | `POST /consolidate/sync` | Run 3-phase consolidation now |
-| `POST /register-tools` | Register agent tool index |
+| `POST /register-tools` | Register agent tool index into mem:tools |
 | `POST /recall-tools` | Semantic search over tools |
 | `POST /store-procedure` | Save a how-to workflow / MetaClaw skill |
 | `POST /recall-procedures` | Search procedural memory |
-| `GET /graph/{entity}` | Knowledge graph neighbours |
-| `GET /stats` | `{"episodes":N,"facts":N,"procedures":N,"tools":N}` |
-| `GET /health` | `{"status":"ok","redis":"ok","version":"0.9.4"}` |
-| `GET /` | Web dashboard (5-tab, live SSE logs) |
+| `POST /tool-feedback` | Record success/fail for a tool (ToolMem, v0.9.5) |
+| `POST /record-tool-sequence` | Record ordered tool sequence into TIG (v0.9.5) |
+| `GET  /tool-graph/{name}` | TIG outgoing transitions from a tool (v0.9.5) |
+| `POST /tool-graph/detect-meta-tools` | AWO: synthesize composite procedures from TIG 2-hop chains (v0.9.6) |
+| `POST /procedure-feedback` | Record procedure success/fail for MACLA Beta scoring (v0.9.5) |
+| `GET  /tool-procedures/{name}` | Reverse index: procedures that use a given tool (v0.9.6) |
+| `POST /proc-backfill-index` | Backfill proc_by_tool reverse index for existing procedures (v0.9.6) |
+| `GET  /graph/{entity}` | Knowledge graph neighbours |
+| `GET  /stats` | `{"episodes":N,"facts":N,"procedures":N,"tools":N}` |
+| `GET  /health` | `{"status":"ok","redis":"ok","version":"0.9.7"}` |
+| `GET  /` | Web dashboard (5-tab, live SSE logs) |
 
 ---
 
@@ -344,10 +382,14 @@ launchctl load ~/Library/LaunchAgents/ai.agent.memory.plist
 | [A-MAC arXiv:2603.04549](https://arxiv.org/abs/2603.04549) | 5-factor admission gate + category importance floors |
 | [wRRF arXiv:2511.18194](https://arxiv.org/abs/2511.18194) | Dynamic weighted RRF per query type |
 | [MAGMA arXiv:2601.03236](https://arxiv.org/abs/2601.03236) | Multi-graph memory — inspired knowledge graph tier |
+| [ToolMem arXiv:2510.06664](https://arxiv.org/abs/2510.06664) | Per-tool success/fail tracking + capability_summary reliability hints (v0.9.5) |
+| [AutoTool TIG arXiv:2511.14650](https://arxiv.org/abs/2511.14650) | Tool Inertia Graph — mem:tool_graph transition counts → next-tool suggestions (v0.9.5) |
+| [MACLA arXiv:2512.18950](https://arxiv.org/abs/2512.18950) | Beta posterior scoring for procedure recall: cosine × Beta(s+1, f+1) (v0.9.5) |
+| [AWO arXiv:2601.22037](https://arxiv.org/abs/2601.22037) | Autonomous Workflow Optimization — 2-hop TIG chain synthesis → meta-tool procedures (v0.9.6) |
 | [Anatomy of Agentic Memory arXiv:2602.19320](https://arxiv.org/abs/2602.19320) | 6-tier cognitive taxonomy |
 | [MemoryOS arXiv:2506.06326](https://arxiv.org/abs/2506.06326) | Heat-tiered reranking |
 | [claude-mem](https://github.com/thedotmack/claude-mem) | Episode taxonomy, causal chaining, Endless Mode compact (v0.9.3) |
-| [MetaClaw](https://github.com/aiming-lab/MetaClaw) | 36 behavioral SKILL.md library + SkillEvolver pattern — ingested via `digest-metaclaw.py` (v0.9.4) |
+| [MetaClaw](https://github.com/aiming-lab/MetaClaw) | 36 behavioral SKILL.md library + SkillEvolver — ingested via `digest-metaclaw.py` (v0.9.4) |
 | [Redis 8 Vectorset](https://redis.io/blog/searching-1-billion-vectors-with-redis-8/) | Native HNSW — no separate vector DB |
 
 ---
