@@ -1,5 +1,5 @@
 """
-AgentMem — Local Agent Memory Service  v0.9.2
+AgentMem — Local Agent Memory Service  v0.9.3
 ==============================================
 Replaces memos-cloud-openclaw-plugin with fully local, persistent memory.
 
@@ -34,6 +34,12 @@ Features (v0.9.2 — A-MAC + wRRF + importance floors):
                                  factual_confidence + temporal_signal + content_type_prior (v0.9.2)
  18. Dynamic weighted RRF      — per-query-type wRRF weights: entity/temporal/semantic (v0.9.2)
  19. Category importance floors — 15-tier floor map; identity/rule pinned ≥0.80 (v0.9.2)
+ 20. Episode type taxonomy    — 8-type classification per claude-mem: bugfix|feature|
+                                 discovery|decision|change|procedure|preference|context (v0.9.3)
+ 21. Causal episode chaining  — doubly-linked prev/next episode IDs in Redis attrs,
+                                 tracks temporal narrative flow across sessions (v0.9.3)
+ 22. Mid-session compact      — /session/compact: LLM-compress Tier 1 KV when >3000
+                                 chars, PostToolUse hook keeps context O(N) (v0.9.3)
 
 Endpoints:
   POST /recall              — before_agent_start hook (includes tool context + graph)
@@ -50,6 +56,7 @@ Endpoints:
   POST /graph/recall        — knowledge graph: neighbourhood fact retrieval
   GET  /graph/stats         — knowledge graph: node/edge counts
   GET  /config              — service configuration + auto-consolidation state
+  POST /session/compact     — mid-session compress Tier 1 KV if > threshold (v0.9.3)
   GET  /health
   GET  /stats
 """
@@ -158,12 +165,12 @@ async def lifespan(app: FastAPI):
     log.info("Ensuring vectorset indexes…")
     await mem_store.ensure_indexes(_redis)
     asyncio.create_task(_periodic_consolidate())
-    log.info("AgentMem v0.9.2 ready (A-MAC + wRRF + importance floors)")
+    log.info("AgentMem v0.9.3 ready (A-MAC + wRRF + episode taxonomy + causal chains + compact)")
     yield
     await _redis.aclose()
 
 
-app = FastAPI(title="AgentMem — Local Agent Memory Service", version="0.9.2", lifespan=lifespan)
+app = FastAPI(title="AgentMem — Local Agent Memory Service", version="0.9.3", lifespan=lifespan)
 
 # ── Static files + SSE log router ─────────────────────────────────────────────
 import os as _os
@@ -180,7 +187,7 @@ async def dashboard():
     idx = _os.path.join(_static_dir, "index.html")
     if _os.path.exists(idx):
         return FileResponse(idx)
-    return {"message": "AgentMem v0.9.2", "docs": "/docs"}
+    return {"message": "AgentMem v0.9.3", "docs": "/docs"}
 
 
 # ── Request / Response models ──────────────────────────────────────────────────
@@ -335,7 +342,10 @@ def _format_prepend(
     # Priority 6: episodes (lower priority than facts)
     if episodes and _add("## Recent Relevant Episodes"):
         for i, e in enumerate(episodes, 1):
-            line = f"{i}. {e['content'][:300]}"
+            attrs = e.get("attrs", {})
+            ep_type = attrs.get("ep_type", "")
+            type_tag = f"[{ep_type}] " if ep_type and ep_type != "general" else ""
+            line = f"{i}. {type_tag}{e['content'][:300]}"
             if not _add(line):
                 break
         _add("")
@@ -606,6 +616,38 @@ def _rrf_merge(
     return result
 
 
+# ── Episode type taxonomy (claude-mem inspired, v0.9.3) ───────────────────────
+
+def _infer_ep_type(facts: list) -> str:
+    """
+    Map extracted fact categories → claude-mem episode type taxonomy.
+
+    Priority order ensures the most specific/actionable type wins:
+      decision > procedure > feature > change > discovery > preference > context > general
+
+    This mirrors claude-mem's observation type system (bugfix|feature|refactor|
+    discovery|decision|change) but uses AgentMem's existing category vocabulary.
+    """
+    if not facts:
+        return "general"
+    cat_set = {f.category for f in facts}
+    if "decision" in cat_set:
+        return "decision"
+    if "procedure" in cat_set:
+        return "procedure"
+    if "capability_gained" in cat_set:
+        return "feature"
+    if "env_change" in cat_set:
+        return "change"
+    if cat_set & {"identity", "work", "personal", "location"}:
+        return "discovery"
+    if cat_set & {"preference", "rule", "reminder"}:
+        return "preference"
+    if "tool_use" in cat_set:
+        return "context"
+    return "general"
+
+
 # ── Background store ──────────────────────────────────────────────────────────
 async def _do_store(messages: list[Message], session_id: str) -> None:
     t0 = time.time()
@@ -639,15 +681,19 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
         turn_text = _messages_to_text(clean)
         summary = await summarizer.summarize(turn_text)
 
-        # 4. Embed + dedup-check + save episode
+        # 4. Embed + dedup-check + save episode (with type taxonomy + causal chain)
         ep_emb = _encode(summary[:500])
         similar = await mem_store.knn_search(_redis, mem_store.EPISODE_KEY, ep_emb, k=1)
-        # VSIM returns similarity (1=identical). Dedup if score > 0.95.
         is_dup = bool(similar and similar[0].get("score", 0.0) > 0.95)
         ep_saved = 0
+        new_ep_uid = ""
         if not is_dup:
-            await mem_store.save_episode(
-                _redis, session_id, turn_text[:2000], ep_emb, lang, domain
+            # Causal chain: look up the previous episode for this session
+            prev_ep_id = await mem_store.get_last_episode_id(_redis, session_id)
+            new_ep_uid = await mem_store.save_episode(
+                _redis, session_id, turn_text[:2000], ep_emb, lang, domain,
+                ep_type="general",        # placeholder; updated after fact extraction below
+                prev_episode_id=prev_ep_id,
             )
             ep_saved = 1
 
@@ -669,6 +715,30 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
             )
             await persona_mod.update(_redis, fact.category, fact.content)
             fact_saved += 1
+
+        # 5b. Back-fill ep_type on newly saved episode + complete causal chain
+        if new_ep_uid:
+            ep_type = _infer_ep_type(facts)
+            # Update ep_type attr on the episode we just saved
+            try:
+                raw = await _redis.execute_command("VGETATTR", mem_store.EPISODE_KEY, new_ep_uid)
+                if raw:
+                    ep_attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+                    ep_attrs["ep_type"] = ep_type
+                    await _redis.execute_command(
+                        "VSETATTR", mem_store.EPISODE_KEY, new_ep_uid, json.dumps(ep_attrs)
+                    )
+            except Exception:
+                pass  # VGETATTR not critical — ep_type stays "general"
+            # Complete doubly-linked chain: tell prev episode its successor
+            prev_ep_id = (await _redis.get(f"{mem_store.SESSION_PRE}{session_id}:last_ep") or b"").decode()
+            if prev_ep_id and prev_ep_id != new_ep_uid:
+                asyncio.create_task(
+                    mem_store.update_episode_next_id(_redis, prev_ep_id, new_ep_uid)
+                )
+            # Advance the session's last-episode pointer
+            await mem_store.set_last_episode_id(_redis, session_id, new_ep_uid)
+            log.debug(f"[store] episode {new_ep_uid} type={ep_type} prev={prev_ep_id or 'none'}")
 
         # 6. Extract and store procedures (the 4th cognitive tier)
         proc_facts = [f for f in facts if f.category == "procedure"]
@@ -804,6 +874,54 @@ async def _do_compress_session(session_id: str) -> dict:
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
+class CompactRequest(BaseModel):
+    session_id: str
+    threshold_chars: int = 3000   # only compact if session KV exceeds this
+
+
+@app.post("/session/compact")
+async def session_compact(req: CompactRequest):
+    """
+    Mid-session Tier 1 compression (v0.9.3 — inspired by claude-mem Endless Mode).
+
+    Problem: Tier 1 session KV grows linearly with every turn accumulation.
+    At ~1200 chars it is already LLM-compressed by _accumulate_session(), but
+    across many tool uses / recall cycles the KV can still balloon to 3-5K chars.
+
+    This endpoint re-compresses the KV on demand from a PostToolUse hook,
+    keeping context complexity O(N) rather than O(N²).
+
+    Idempotent: no-op if session KV is already below threshold_chars.
+    """
+    if not req.session_id:
+        return {"status": "skipped", "reason": "no session_id"}
+
+    ctx = await mem_store.get_session_context(_redis, req.session_id)
+    if not ctx:
+        return {"status": "skipped", "reason": "no session context"}
+
+    size_before = len(ctx)
+    if size_before <= req.threshold_chars:
+        return {"status": "skipped", "reason": "below threshold",
+                "size": size_before, "threshold": req.threshold_chars}
+
+    compacted = await summarizer.summarize(ctx)
+    await mem_store.set_session_context(_redis, req.session_id, compacted[:1500])
+
+    size_after = len(compacted)
+    log.info(
+        f"[compact] session={req.session_id} {size_before}→{size_after} chars "
+        f"({round(100*(1-size_after/size_before))}% reduction)"
+    )
+    return {
+        "status":        "ok",
+        "session_id":    req.session_id,
+        "size_before":   size_before,
+        "size_after":    size_after,
+        "reduction_pct": round(100 * (1 - size_after / size_before), 1),
+    }
+
+
 class AnswerRequest(BaseModel):
     query:   str
     context: str
@@ -877,7 +995,7 @@ async def answer(req: AnswerRequest):
 async def health():
     try:
         await _redis.ping()
-        return {"status": "ok", "redis": "ok", "version": "0.9.2"}
+        return {"status": "ok", "redis": "ok", "version": "0.9.3"}
     except Exception as e:
         return {"status": "degraded", "error": str(e)}
 

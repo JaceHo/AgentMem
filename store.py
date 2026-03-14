@@ -152,22 +152,56 @@ async def save_episode(
     embedding: np.ndarray,
     language: str = "en",
     domain: str = "general",
+    ep_type: str = "general",          # claude-mem taxonomy: bugfix|feature|discovery|decision|change|procedure|preference|context|general
+    prev_episode_id: str = "",         # causal chain: predecessor episode UID
 ) -> str:
     uid  = str(ULID())
     attr = json.dumps({
-        "content":      content[:2000],
-        "category":     "episode",
-        "language":     language,
-        "domain":       domain,
-        "session_id":   session_id,
-        "ts":           int(time.time() * 1000),
-        "access_count": 0,
-        "importance":   0.5,
-        "superseded_by": "",
+        "content":         content[:2000],
+        "category":        "episode",
+        "ep_type":         ep_type,
+        "language":        language,
+        "domain":          domain,
+        "session_id":      session_id,
+        "ts":              int(time.time() * 1000),
+        "access_count":    0,
+        "importance":      0.5,
+        "superseded_by":   "",
+        "prev_episode_id": prev_episode_id,
+        "next_episode_id": "",         # filled in when a successor is stored
     })
     await r.execute_command("VADD", EPISODE_KEY, "FP32", _blob(embedding), uid,
                             "SETATTR", attr)
     return uid
+
+
+async def get_last_episode_id(r: aioredis.Redis, session_id: str) -> str:
+    """Return the most recently stored episode UID for this session (for causal chaining)."""
+    if not session_id:
+        return ""
+    val = await r.get(f"{SESSION_PRE}{session_id}:last_ep")
+    return val.decode() if val else ""
+
+
+async def set_last_episode_id(r: aioredis.Redis, session_id: str, uid: str) -> None:
+    """Track the most recent episode UID per session (4h TTL matches session KV)."""
+    if not session_id:
+        return
+    await r.set(f"{SESSION_PRE}{session_id}:last_ep", uid.encode(), ex=14400)
+
+
+async def update_episode_next_id(r: aioredis.Redis, uid: str, next_uid: str) -> None:
+    """Back-fill next_episode_id on the predecessor episode to complete the doubly-linked chain."""
+    if not uid or not next_uid:
+        return
+    try:
+        raw = await r.execute_command("VGETATTR", EPISODE_KEY, uid)
+        if raw:
+            attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+            attrs["next_episode_id"] = next_uid
+            await r.execute_command("VSETATTR", EPISODE_KEY, uid, json.dumps(attrs))
+    except Exception:
+        pass  # VGETATTR not available or episode not found — chain stays partial
 
 
 async def save_fact(
