@@ -106,6 +106,19 @@ async def register_tool(
     if parameters:
         attr["parameters"] = parameters[:10]
 
+    # Preserve ToolMem feedback stats on re-register (don't overwrite with zeros)
+    try:
+        existing_raw = await r.execute_command("VGETATTR", TOOL_KEY, elem_key)
+        if existing_raw:
+            prev = json.loads(existing_raw.decode() if isinstance(existing_raw, bytes) else existing_raw)
+            attr["use_count"]          = prev.get("use_count", 0)
+            attr["success_count"]      = prev.get("success_count", 0)
+            attr["fail_count"]         = prev.get("fail_count", 0)
+            if prev.get("capability_summary"):
+                attr["capability_summary"] = prev["capability_summary"]
+    except Exception:
+        pass
+
     # VADD is upsert in Redis 8 vectorsets — overwrites existing element
     blob = embedding.astype(np.float32).tobytes()
     await r.execute_command("VADD", TOOL_KEY, "FP32", blob,
@@ -161,14 +174,17 @@ async def recall_tools(
             continue
 
         tools.append({
-            "name":        attrs.get("name", elem_str),
-            "description": attrs.get("description", ""),
-            "category":    attrs.get("category", "general"),
-            "source":      attrs.get("source", "builtin"),
-            "parameters":  attrs.get("parameters", []),
-            "use_count":   attrs.get("use_count", 0),
-            "score":       float(score) if score else 0.0,
-            "_element":    elem_str,
+            "name":               attrs.get("name", elem_str),
+            "description":        attrs.get("description", ""),
+            "category":           attrs.get("category", "general"),
+            "source":             attrs.get("source", "builtin"),
+            "parameters":         attrs.get("parameters", []),
+            "use_count":          attrs.get("use_count", 0),
+            "success_count":      attrs.get("success_count", 0),
+            "fail_count":         attrs.get("fail_count", 0),
+            "capability_summary": attrs.get("capability_summary", ""),
+            "score":              float(score) if score else 0.0,
+            "_element":           elem_str,
         })
 
         # Bump use_count (fire-and-forget)
@@ -365,8 +381,13 @@ async def get_capability_summary(r: aioredis.Redis) -> dict:
     }
 
 
-def format_tool_context(tools: list[dict], max_tools: int = 8) -> str:
-    """Format top-k tools as a context block for prepending to agent."""
+def format_tool_context(tools: list[dict], max_tools: int = 8,
+                        tig_hints: list[str] | None = None) -> str:
+    """Format top-k tools as a context block for prepending to agent.
+
+    Includes ToolMem capability_summary (success rate hint) when available.
+    Appends AutoTool TIG transition hints when tig_hints is provided.
+    """
     if not tools:
         return ""
     lines = ["## Available Tools (Relevant)"]
@@ -374,5 +395,11 @@ def format_tool_context(tools: list[dict], max_tools: int = 8) -> str:
         cat = t.get("category", "")
         src = t.get("source", "")
         tag = f"[{cat}/{src}]" if src and src != "builtin" else f"[{cat}]"
-        lines.append(f"- **{t['name']}** {tag}: {t['description'][:120]}")
+        line = f"- **{t['name']}** {tag}: {t['description'][:120]}"
+        cap = t.get("capability_summary", "")
+        if cap:
+            line += f" ⟨{cap}⟩"
+        lines.append(line)
+    if tig_hints:
+        lines.append(f"- *Frequent next tools*: {', '.join(tig_hints)}")
     return "\n".join(lines)

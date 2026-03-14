@@ -1,5 +1,5 @@
 /**
- * agentmem-openclaw-plugin  v0.4.0
+ * agentmem-openclaw-plugin  v0.5.0
  * AgentMem — local persistent memory via Redis HNSW + MiniLM FastAPI sidecar.
  * Drop-in replacement for memos-cloud-openclaw-plugin.
  *
@@ -173,7 +173,23 @@ export default {
       }
     });
 
-    // ── agent_end: compact + store + promote Tier 1 → Tier 2 ───────────────
+    // ── tool_end: ToolMem feedback — record success/fail per tool use ────────
+    api.on("tool_end", async (event, ctx) => {
+      const toolName = event?.toolName || event?.tool?.name || event?.name || "";
+      if (!toolName) return;
+      const sessionId = ctx?.sessionId ?? ctx?.sessionKey ?? "";
+
+      // Heuristic success: failure if error/exception in output
+      const output = String(event?.output || event?.result || event?.response || "");
+      const errorWords = ["error", "exception", "traceback", "failed", "not found",
+                          "permission denied", "timeout", "command not found"];
+      const success = !errorWords.some(w => output.toLowerCase().includes(w));
+
+      post("/tool-feedback", { tool_name: toolName, success, session_id: sessionId },
+           REG_TIMEOUT).catch(() => {});
+    });
+
+    // ── agent_end: compact + store + promote Tier 1 → Tier 2 + TIG ─────────
     api.on("agent_end", async (event, ctx) => {
       if (!event?.success) return;
       const messages  = event?.messages;
@@ -190,8 +206,6 @@ export default {
 
       if (sessionId) {
         // 2. Mid-session compact (v0.9.3): trim Tier 1 KV before promotion.
-        //    Inspired by claude-mem Endless Mode — keeps session context O(N).
-        //    Fire-and-forget: no blocking.
         fetch(`${base}/session/compact`, {
           method:  "POST",
           headers: { "Content-Type": "application/json" },
@@ -200,18 +214,36 @@ export default {
         }).catch(() => {});
 
         // 3. Promote Tier 1 session KV → Tier 2 long-term memory.
-        //    Crystallises the accumulated session summary into an episode
-        //    + extracts facts before the 4h TTL expires.
-        //    Fire-and-forget: don't block the agent_end response.
         fetch(`${base}/session/compress`, {
           method:  "POST",
           headers: { "Content-Type": "application/json" },
           body:    JSON.stringify({ session_id: sessionId, wait: false }),
           signal:  AbortSignal.timeout(STORE_TIMEOUT),
         }).catch(() => {});
+
+        // 4. AutoTool TIG (v0.9.5): extract tool call sequence from messages,
+        //    record transitions into mem:tool_graph for next-tool suggestions.
+        const toolSeq = [];
+        for (const msg of messages) {
+          const content = Array.isArray(msg?.content) ? msg.content
+                        : (typeof msg?.content === "string" ? [] : []);
+          for (const block of content) {
+            if (block?.type === "tool_use" && block?.name) {
+              toolSeq.push(block.name);
+            }
+          }
+        }
+        if (toolSeq.length >= 2) {
+          fetch(`${base}/record-tool-sequence`, {
+            method:  "POST",
+            headers: { "Content-Type": "application/json" },
+            body:    JSON.stringify({ sequence: toolSeq, session_id: sessionId }),
+            signal:  AbortSignal.timeout(STORE_TIMEOUT),
+          }).catch(() => {});
+        }
       }
     });
 
-    log.info?.(`${tag} v0.4.0 registered (base=${base}, limit=${limit}, compact+chain enabled)`);
+    log.info?.(`${tag} v0.5.0 registered (ToolMem+TIG+MACLA, base=${base}, limit=${limit})`);
   },
 };
