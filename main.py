@@ -1,5 +1,5 @@
 """
-AgentMem — Local Agent Memory Service  v0.9.3
+AgentMem — Local Agent Memory Service  v0.9.4
 ==============================================
 Replaces memos-cloud-openclaw-plugin with fully local, persistent memory.
 
@@ -165,12 +165,12 @@ async def lifespan(app: FastAPI):
     log.info("Ensuring vectorset indexes…")
     await mem_store.ensure_indexes(_redis)
     asyncio.create_task(_periodic_consolidate())
-    log.info("AgentMem v0.9.3 ready (A-MAC + wRRF + episode taxonomy + causal chains + compact)")
+    log.info("AgentMem v0.9.4 ready (A-MAC + wRRF + episode taxonomy + causal chains + compact + MetaClaw skills)")
     yield
     await _redis.aclose()
 
 
-app = FastAPI(title="AgentMem — Local Agent Memory Service", version="0.9.3", lifespan=lifespan)
+app = FastAPI(title="AgentMem — Local Agent Memory Service", version="0.9.4", lifespan=lifespan)
 
 # ── Static files + SSE log router ─────────────────────────────────────────────
 import os as _os
@@ -187,7 +187,7 @@ async def dashboard():
     idx = _os.path.join(_static_dir, "index.html")
     if _os.path.exists(idx):
         return FileResponse(idx)
-    return {"message": "AgentMem v0.9.3", "docs": "/docs"}
+    return {"message": "AgentMem v0.9.4", "docs": "/docs"}
 
 
 # ── Request / Response models ──────────────────────────────────────────────────
@@ -196,6 +196,7 @@ class RecallRequest(BaseModel):
     session_id: str = ""
     memory_limit_number: int = 6
     include_tools: bool = True          # Whether to append relevant tool context
+    include_procedures: bool = False    # Whether to append relevant skill/procedure context (v0.9.4)
     include_graph: bool = False         # Expand knowledge graph neighbours (v0.9.0)
     # SimpleMem Section 3.3: Intent-Aware Retrieval Planning (v0.9.1)
     enable_planning: bool = False       # LLM-based query planning (adds ~300-600ms)
@@ -281,13 +282,14 @@ def _format_prepend(
     persona_ctx: str,
     env_ctx: str = "",
     tool_ctx: str = "",
+    proc_ctx: list[dict] | None = None,
     token_budget: int = 1500,
 ) -> str:
     """
     Build the context string injected into the agent's system prompt.
 
     SimpleMem Section 3.3 token-budget packing:
-    Priority order: persona → env → tools → session_ctx → facts → episodes
+    Priority order: persona → env → tools → skills → session_ctx → facts → episodes
     Greedy packing: stop adding items when token_budget is exhausted.
     Output wrapped in <cross_session_memory> XML tags (SimpleMem convention).
     """
@@ -313,6 +315,20 @@ def _format_prepend(
 
     # Priority 3: tool context
     if tool_ctx and _add(tool_ctx):
+        _add("")
+
+    # Priority 3.5: procedural skills (MetaClaw-style behavioral guidelines)
+    if proc_ctx and _add("## Relevant Skills"):
+        for p in proc_ctx:
+            task      = p.get("task", "")
+            procedure = p.get("procedure", "")
+            # task may be "[skill:name] description" — strip the prefix tag for display
+            display = task.split("] ", 1)[-1] if task.startswith("[skill:") else task
+            # Include first 200 chars of procedure body as a hint
+            body_hint = procedure[:200].replace("\n", " ").strip()
+            line = f"- **{display}**" + (f": {body_hint}" if body_hint else "")
+            if not _add(line):
+                break
         _add("")
 
     # Priority 4: session context (Tier 1 rolling summary)
@@ -995,7 +1011,7 @@ async def answer(req: AnswerRequest):
 async def health():
     try:
         await _redis.ping()
-        return {"status": "ok", "redis": "ok", "version": "0.9.3"}
+        return {"status": "ok", "redis": "ok", "version": "0.9.4"}
     except Exception as e:
         return {"status": "degraded", "error": str(e)}
 
@@ -1074,6 +1090,37 @@ async def recall(req: RecallRequest):
         gather_tasks.append(cap_mod.recall_tools(_redis, emb, k=6))
     else:
         gather_tasks.append(asyncio.sleep(0))
+    # Procedure recall (index 7): fire in parallel if include_procedures=True
+    # Uses raw VSIM (not knn_search) because procedures store 'task' not 'content'.
+    async def _fetch_procs(embedding, k: int = 2) -> list[dict]:
+        blob = embedding.astype("float32").tobytes()
+        cmd  = ["VSIM", mem_store.PROC_KEY, "FP32", blob,
+                "COUNT", k + 1, "WITHSCORES", "WITHATTRIBS"]
+        try:
+            results = await _redis.execute_command(*cmd)
+        except Exception:
+            return []
+        procs = []
+        idx = 0
+        while idx + 2 < len(results):
+            elem = results[idx]; score = results[idx+1]; raw = results[idx+2]
+            idx += 3
+            elem_str = elem.decode() if isinstance(elem, bytes) else elem
+            if elem_str == "__seed__":
+                continue
+            try:
+                attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+            except Exception:
+                continue
+            if attrs.get("_seed") or not attrs.get("task"):
+                continue
+            procs.append({"task": attrs.get("task", ""), "procedure": attrs.get("procedure", "")})
+        return procs
+
+    if req.include_procedures:
+        gather_tasks.append(_fetch_procs(emb))
+    else:
+        gather_tasks.append(asyncio.sleep(0))
 
     results = await asyncio.gather(*gather_tasks)
     persona_ctx  = results[0]
@@ -1083,6 +1130,7 @@ async def recall(req: RecallRequest):
     eps_scene    = results[4]
     query_struct = results[5] if isinstance(results[5], dict) else {}
     tools_raw    = results[6] if isinstance(results[6], list) else []
+    procs_raw    = results[7] if isinstance(results[7], list) else []
 
     # Symbolic structured pass (AgentMem §3.3 extension):
     # If the query mentions specific persons or entities, do a targeted scan
@@ -1237,17 +1285,21 @@ async def recall(req: RecallRequest):
     tool_ctx = cap_mod.format_tool_context(tools_raw) if tools_raw else ""
     env_ctx_formatted = env_ctx if env_ctx and is_cap_query else ""
 
+    # proc_ctx: already decoded by _fetch_procs (list of {task, procedure} dicts)
+    proc_ctx: list[dict] = procs_raw if isinstance(procs_raw, list) else []
+
     # SimpleMem Section 3.3 token-budget injection with XML wrapper
     prepend = _format_prepend(
         facts, episodes, session_ctx, persona_ctx,
         env_ctx=env_ctx_formatted, tool_ctx=tool_ctx,
+        proc_ctx=proc_ctx or None,
         token_budget=req.token_budget,
     )
     ms = int((time.time() - t0) * 1000)
 
     planning_info = f" planning={req.enable_planning}" if req.enable_planning else ""
     log.info(f"[recall] session={req.session_id} lang={q_lang} domain={q_domain} "
-             f"facts={len(facts)} ep={len(episodes)} tools={len(tools_raw)}"
+             f"facts={len(facts)} ep={len(episodes)} tools={len(tools_raw)} procs={len(proc_ctx)}"
              f"{planning_info} {ms}ms")
 
     return {"prependContext": prepend if prepend else None, "latency_ms": ms}
