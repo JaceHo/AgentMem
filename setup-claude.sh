@@ -175,7 +175,30 @@ PYEOF
 exit 0
 HOOKEOF
 
-chmod +x "$HOOKS_DIR/recall.sh" "$HOOKS_DIR/store.sh" "$HOOKS_DIR/register-env.sh"
+# compact.sh (PostToolUse — mid-session compact, v0.9.3)
+cat > "$HOOKS_DIR/compact.sh" << 'HOOKEOF'
+#!/usr/bin/env bash
+# Hook: PostToolUse — mid-session compact (v0.9.3, claude-mem Endless Mode inspired).
+# Fires after every tool use; calls /session/compact only when session KV > 3000 chars.
+# Fire-and-forget: we do NOT wait for the response so tool latency is unaffected.
+unset PYTHONWARNINGS
+INPUT=$(cat)
+SESSION=$(python3 -c "
+import json, sys
+d = json.loads(sys.argv[1])
+print(d.get('session_id', ''))
+" "$INPUT" 2>/dev/null || echo "")
+if [ -z "$SESSION" ]; then exit 0; fi
+PAYLOAD=$(python3 -c "
+import json, sys
+print(json.dumps({'session_id': sys.argv[1], 'threshold_chars': 3000}))
+" "$SESSION" 2>/dev/null)
+curl -sf -m 3 -X POST http://localhost:18800/session/compact \
+  -H 'Content-Type: application/json' -d "$PAYLOAD" > /dev/null 2>&1 &
+exit 0
+HOOKEOF
+
+chmod +x "$HOOKS_DIR/recall.sh" "$HOOKS_DIR/store.sh" "$HOOKS_DIR/register-env.sh" "$HOOKS_DIR/compact.sh"
 echo "      Hook scripts written and made executable."
 
 # ── 6. Patch ~/.claude/settings.json ────────────────────────────────────────
@@ -196,6 +219,9 @@ settings["hooks"] = {
     }],
     "UserPromptSubmit": [{
         "hooks": [{"type": "command", "command": f"{hooks_dir}/recall.sh", "timeout": 10}]
+    }],
+    "PostToolUse": [{
+        "hooks": [{"type": "command", "command": f"{hooks_dir}/compact.sh", "timeout": 5}]
     }],
     "Stop": [{
         "hooks": [{"type": "command", "command": f"{hooks_dir}/store.sh", "timeout": 30}]
