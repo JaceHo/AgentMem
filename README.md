@@ -2,10 +2,10 @@
 
 **Local persistent memory for Claude Code, OpenClaw, and any AI agent framework.**
 
-[![Version](https://img.shields.io/badge/version-0.9.3-blue)](.) [![A-MAC](https://img.shields.io/badge/algorithm-A--MAC%20%2B%20wRRF-brightgreen)](https://arxiv.org/abs/2603.04549) [![Redis 8](https://img.shields.io/badge/backend-Redis%208%20HNSW-red)](https://redis.io) [![License](https://img.shields.io/badge/license-MIT-yellow)](.)
+[![Version](https://img.shields.io/badge/version-0.9.4-blue)](.) [![A-MAC](https://img.shields.io/badge/algorithm-A--MAC%20%2B%20wRRF-brightgreen)](https://arxiv.org/abs/2603.04549) [![Redis 8](https://img.shields.io/badge/backend-Redis%208%20HNSW-red)](https://redis.io) [![License](https://img.shields.io/badge/license-MIT-yellow)](.)
 
 ```
-LLM-F1: 64.70%†  │  Context-F1: 32.64%  │  AIC: 97.9%  │  Recall P50: 1.7ms  │  $0/month
+LLM-F1: 64.70%†  │  Context-F1: 32.64%  │  AIC: 97.9%  │  Recall P50: 1.7ms  │  $0/month  │  36 behavioral skills
 ```
 
 ---
@@ -32,7 +32,7 @@ Your AI framework (Claude Code / OpenClaw) manages the **LLM context window**. A
 │  lossless facts · pronoun-free · ISO-timestamped             │
 ├──────────────────────────────────────────────────────────────┤
 │  Tier 4 — Procedural  mem:procedures                         │
-│  how-to workflows · tool recipes                              │
+│  how-to workflows · tool recipes · MetaClaw behavioral skills │
 ├──────────────────────────────────────────────────────────────┤
 │  Tier 5 — Capability + Persona  mem:tools · mem:env          │
 │  tool index · environment state · evolving user profile       │
@@ -183,6 +183,10 @@ python3 digest-claudecode.py --reset  # re-ingest everything
 # Ingest all past OpenClaw sessions
 python3 digest-openclaw.py
 
+# Ingest MetaClaw behavioral skills (36 pre-built + any evolved skills)
+python3 digest-metaclaw.py --skills-dir /path/to/MetaClaw/memory_data/skills
+# Skills appear in prependContext as "## Relevant Skills" on every prompt
+
 # Merge semantic duplicates after bulk ingest
 curl -X POST http://localhost:18800/consolidate/sync
 ```
@@ -265,7 +269,7 @@ curl -X POST http://localhost:18800/consolidate/sync
 
 | Endpoint | Description |
 |----------|-------------|
-| `POST /recall` | Before-prompt hook — returns `prependContext` |
+| `POST /recall` | Before-prompt hook — returns `prependContext` (facts + episodes + skills) |
 | `POST /store` | After-session hook — async, returns `{"status":"queued"}` |
 | `POST /session/compress` | Promote Tier 1 → Tier 2 long-term |
 | `POST /session/compact` | Mid-session compress Tier 1 KV if >threshold chars |
@@ -273,7 +277,7 @@ curl -X POST http://localhost:18800/consolidate/sync
 | `POST /consolidate/sync` | Run 3-phase consolidation now |
 | `POST /register-tools` | Register agent tool index |
 | `POST /recall-tools` | Semantic search over tools |
-| `POST /store-procedure` | Save a how-to workflow |
+| `POST /store-procedure` | Save a how-to workflow / MetaClaw skill |
 | `POST /recall-procedures` | Search procedural memory |
 | `GET /graph/{entity}` | Knowledge graph neighbours |
 | `GET /stats` | `{"episodes":N,"facts":N,"procedures":N,"tools":N}` |
@@ -336,6 +340,7 @@ launchctl load ~/Library/LaunchAgents/ai.agent.memory.plist
 | [Anatomy of Agentic Memory arXiv:2602.19320](https://arxiv.org/abs/2602.19320) | 6-tier cognitive taxonomy |
 | [MemoryOS arXiv:2506.06326](https://arxiv.org/abs/2506.06326) | Heat-tiered reranking |
 | [claude-mem](https://github.com/thedotmack/claude-mem) | Episode taxonomy, causal chaining, Endless Mode compact (v0.9.3) |
+| [MetaClaw](https://github.com/aiming-lab/MetaClaw) | 36 behavioral SKILL.md library + SkillEvolver pattern — ingested via `digest-metaclaw.py` (v0.9.4) |
 | [Redis 8 Vectorset](https://redis.io/blog/searching-1-billion-vectors-with-redis-8/) | Native HNSW — no separate vector DB |
 
 ---
