@@ -149,6 +149,7 @@ export default {
             session_id:          ctx?.sessionId ?? ctx?.sessionKey ?? "",
             memory_limit_number: limit,
             include_tools:       true,
+            include_procedures:  true,
           }),
           signal: AbortSignal.timeout(RECALL_TIMEOUT),
         });
