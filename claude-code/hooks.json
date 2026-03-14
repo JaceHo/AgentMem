@@ -1,9 +1,12 @@
 {
-  "description": "AgentMem — Redis HNSW persistent memory for Claude Code (v0.9.3)",
+  "description": "AgentMem — Redis HNSW persistent memory for Claude Code (v0.9.7)",
   "hooks": {
     "SessionStart": [{
       "matcher": "startup|clear|compact",
-      "hooks": [{"type": "command", "command": "/Users/jace/code/agentmem/claude-code/hooks/register-env.sh", "timeout": 10}]
+      "hooks": [
+        {"type": "command", "command": "/Users/jace/code/agentmem/claude-code/hooks/register-env.sh",   "timeout": 10},
+        {"type": "command", "command": "/Users/jace/code/agentmem/claude-code/hooks/register-tools.sh", "timeout": 10}
+      ]
     }],
     "UserPromptSubmit": [{
       "hooks": [{"type": "command", "command": "/Users/jace/code/agentmem/claude-code/hooks/recall.sh", "timeout": 10}]
