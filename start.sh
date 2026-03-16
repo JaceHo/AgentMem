@@ -24,6 +24,23 @@ for i in $(seq 1 8); do
   sleep 1
 done
 
+# Register OpenClaw skills + Claude Code agents once the service is ready.
+# Runs in background so it doesn't block uvicorn startup.
+# Ownership: AgentMem owns the capability index, so registration lives here.
+_register_capabilities() {
+  for i in $(seq 1 40); do
+    if curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
+      python3 "$WORKDIR/register-skills.py" \
+        && echo "[agentmem] skills+agents registered to capability index" \
+        || echo "[agentmem] skills+agents registration failed"
+      return
+    fi
+    sleep 1
+  done
+  echo "[agentmem] skills+agents registration skipped (service did not become ready)"
+}
+_register_capabilities &
+
 exec venv/bin/python -m uvicorn main:app \
   --host 127.0.0.1 \
   --port $PORT \
