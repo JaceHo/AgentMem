@@ -55,7 +55,7 @@ echo ""
 
 # Re-register skills + agents now that service is ready
 echo "registering skills + agents..."
-python3 "$SCRIPT_DIR/register-skills.py"
+uv run python "$SCRIPT_DIR/register-skills.py"
 
 echo ""
 echo "--- stdout (last 20 lines) ---"

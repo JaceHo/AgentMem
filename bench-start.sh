@@ -57,16 +57,9 @@ export REDIS_URL="redis://localhost:6379/$BENCH_DB"
 # Production default is 0.30; bench uses 0.05 to admit all factual conversation turns.
 export AMAC_THRESHOLD="0.05"
 
-# Use the project venv python (has all deps: redis, fastapi, uvicorn, torch…)
-VENV_PYTHON="$(dirname "$0")/venv/bin/python3"
-if [ ! -f "$VENV_PYTHON" ]; then
-    echo "ERROR: venv not found at $VENV_PYTHON. Run: python3 -m venv venv && venv/bin/pip install -r requirements.txt"
-    exit 1
-fi
-
 # ── foreground mode ───────────────────────────────────────────────────────────
 if [ "$1" = "--fg" ]; then
-    "$VENV_PYTHON" -m uvicorn main:app \
+    uv run uvicorn main:app \
         --host 127.0.0.1 \
         --port $BENCH_PORT \
         --log-level info
@@ -74,7 +67,7 @@ if [ "$1" = "--fg" ]; then
 fi
 
 # ── background mode ───────────────────────────────────────────────────────────
-"$VENV_PYTHON" -m uvicorn main:app \
+uv run uvicorn main:app \
     --host 127.0.0.1 \
     --port $BENCH_PORT \
     --log-level warning \

@@ -30,7 +30,7 @@ done
 _register_capabilities() {
   for i in $(seq 1 40); do
     if curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
-      python3 "$WORKDIR/register-skills.py" \
+      uv run python "$WORKDIR/register-skills.py" \
         && echo "[agentmem] skills+agents registered to capability index" \
         || echo "[agentmem] skills+agents registration failed"
       return
@@ -41,7 +41,7 @@ _register_capabilities() {
 }
 _register_capabilities &
 
-exec venv/bin/python -m uvicorn main:app \
+exec uv run uvicorn main:app \
   --host 127.0.0.1 \
   --port $PORT \
   --log-level info \
