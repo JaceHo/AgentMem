@@ -111,6 +111,11 @@ _redis = None
 _stores_since_consolidation: int = 0
 _AUTO_CONSOLIDATE_EVERY: int = 50   # trigger after every N stored facts
 
+# ── Store observability counters (in-process, resets on restart) ───────────────
+_store_attempts: int = 0
+_store_successes: int = 0
+_store_latency_sum_ms: float = 0.0
+
 # ── System-injected content filter ────────────────────────────────────────────
 _SKIP_PREFIXES = (
     "## Long-Term Memory",
@@ -688,6 +693,8 @@ def _infer_ep_type(facts: list) -> str:
 
 # ── Background store ──────────────────────────────────────────────────────────
 async def _do_store(messages: list[Message], session_id: str) -> None:
+    global _store_attempts, _store_successes, _store_latency_sum_ms
+    _store_attempts += 1
     t0 = time.time()
     try:
         # 1. Filter system-injected and empty messages
@@ -821,10 +828,14 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
             log.info("[store] auto-consolidation triggered")
 
         ms = int((time.time() - t0) * 1000)
+        _store_successes += 1
+        _store_latency_sum_ms += ms
         log.info(f"[store] session={session_id} lang={lang} domain={domain} "
                  f"ep+{ep_saved} facts+{fact_saved} {ms}ms")
 
     except Exception as e:
+        ms = int((time.time() - t0) * 1000)
+        _store_latency_sum_ms += ms
         log.warning(f"[store] background error: {e}", exc_info=True)
 
 
@@ -981,10 +992,11 @@ async def answer(req: AnswerRequest):
 
     Returns {"answer": "<short span>"} or {"answer": ""} if LLM unavailable.
     """
-    from extractor import ZAI_URL, _load_key
+    _AISERV_OAI = "http://127.0.0.1:4000/v1/chat/completions"
+    _AISERV_KEY = "sk-aiserv-local-dev"
+    _FAST_MODEL = "ZhipuAI/GLM-4.7-Flash"
 
-    key = _load_key()
-    if not key or not req.context.strip():
+    if not req.context.strip():
         return {"answer": ""}
 
     prompt = (
@@ -997,9 +1009,9 @@ async def answer(req: AnswerRequest):
     try:
         async with httpx.AsyncClient(timeout=8.0) as client:
             resp = await client.post(
-                ZAI_URL,
+                _AISERV_OAI,
                 json={
-                    "model": "glm-4-flash",
+                    "model": _FAST_MODEL,
                     "messages": [
                         {"role": "system", "content": "You are a precise question-answering assistant. Extract the exact answer phrase from the provided context. Output valid JSON only."},
                         {"role": "user",   "content": prompt},
@@ -1007,7 +1019,7 @@ async def answer(req: AnswerRequest):
                     "temperature": 0.0,
                     "max_tokens": 80,
                 },
-                headers={"Authorization": f"Bearer {key}"},
+                headers={"Authorization": f"Bearer {_AISERV_KEY}"},
             )
         if resp.status_code == 200:
             raw = resp.json()["choices"][0]["message"]["content"].strip()
@@ -1058,6 +1070,17 @@ async def stats():
 
         env_raw = await _redis.hgetall(cap_mod.ENV_KEY)
         counts["env_fields"] = len(env_raw)
+
+        # v0.9.7: store observability counters (since last restart)
+        counts["store_attempts"] = _store_attempts
+        counts["store_successes"] = _store_successes
+        counts["store_failures"] = _store_attempts - _store_successes
+        if _store_attempts > 0:
+            counts["store_success_rate"] = round(_store_successes / _store_attempts, 3)
+            counts["store_avg_ms"] = round(_store_latency_sum_ms / _store_attempts)
+        else:
+            counts["store_success_rate"] = None
+            counts["store_avg_ms"] = None
 
         return counts
     except Exception as e:
@@ -2181,11 +2204,10 @@ async def _do_consolidate(
 
 
 async def _llm_merge_facts(contents: list[str]) -> str | None:
-    """Use GLM-4-flash to merge multiple similar facts into one consolidated fact."""
-    key = extractor._load_key()
-    if not key:
-        # Fallback: just pick the longest fact
-        return max(contents, key=len)
+    """Use GLM-4-Flash to merge multiple similar facts into one consolidated fact."""
+    _AISERV_OAI = "http://127.0.0.1:4000/v1/chat/completions"
+    _AISERV_KEY = "sk-aiserv-local-dev"
+    _FAST_MODEL = "ZhipuAI/GLM-4.7-Flash"
 
     facts_text = "\n".join(f"- {c}" for c in contents)
     prompt = (
@@ -2196,14 +2218,14 @@ async def _llm_merge_facts(contents: list[str]) -> str | None:
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.post(
-                extractor.ZAI_URL,
+                _AISERV_OAI,
                 json={
-                    "model": "glm-4-flash",
+                    "model": _FAST_MODEL,
                     "messages": [{"role": "user", "content": prompt}],
                     "max_tokens": 150,
                     "temperature": 0.1,
                 },
-                headers={"Authorization": f"Bearer {key}"},
+                headers={"Authorization": f"Bearer {_AISERV_KEY}"},
             )
             if resp.status_code == 200:
                 return resp.json()["choices"][0]["message"]["content"].strip()
