@@ -140,10 +140,15 @@ def _regex_extract(user_text: str) -> list[ExtractedFact]:
     return facts
 
 
-# ── Layer 2: SimpleMem LLM gate (GLM-4-flash, ~200-500ms) ────────────────────
+# ── Layer 2: SimpleMem LLM gate (ZhipuAI/GLM-4.7-Flash via aiserv 8-key pool) ─
+# OAI format (/v1/chat/completions) bypasses Anthropic↔OAI translation in gateway,
+# saving ~700ms vs /v1/messages. Uses Bearer auth (OAI convention).
+# Named route ZhipuAI/GLM-4.7-Flash → zai-gf-1..8 (8 keys, health-tracked).
 
-ZAI_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
-LLM_TIMEOUT_S = 10.0
+AISERV_URL   = "http://127.0.0.1:4000/v1/chat/completions"
+AISERV_KEY   = "sk-aiserv-local-dev"
+AISERV_MODEL = "ZhipuAI/GLM-4.7-Flash"
+LLM_TIMEOUT_S = 10.0  # 8-key pool health-skips bad keys → p99 ~400ms; 10s is safe ceiling
 LLM_MAX_INPUT = 3000   # chars of conversation to send to LLM
 
 # SimpleMem-aligned extraction prompt (bilingual):
@@ -257,49 +262,42 @@ def _parse_llm_json(raw: str) -> list:
 
 
 async def _llm_extract(conversation_text: str) -> list[ExtractedFact]:
-    """Layer 2: SimpleMem-style LLM extraction via GLM-4-flash.
+    """Layer 2: SimpleMem-style LLM extraction via ZAI GLM-4-flash (aiserv).
 
     Produces pronoun-free, absolute-timestamp lossless_restatement entries
     matching SimpleMem Section 3.1 multi-view indexing format.
-    """
-    key = _load_key()
-    if not key:
-        log.debug("[extractor] no ZAI key, skipping LLM extraction")
-        return []
 
+    v0.9.8: GLM-4-flash via aiserv zai-gf-1..5 pool (recovered 2026-03-17).
+    Uses anthropic-messages format; response in content[0]["text"].
+    """
     today = datetime.date.today().isoformat()
     prompt = _EXTRACT_PROMPT.format(
         today=today,
         conversation=conversation_text[:LLM_MAX_INPUT],
     )
 
-    proxy = _load_proxy()
     max_retries = 2
     for attempt in range(max_retries):
         try:
-            async with httpx.AsyncClient(timeout=LLM_TIMEOUT_S, proxy=proxy) as client:
+            async with httpx.AsyncClient(timeout=LLM_TIMEOUT_S) as client:
                 resp = await client.post(
-                    ZAI_URL,
+                    AISERV_URL,
                     json={
-                        "model": "glm-4-flash",
+                        "model":      AISERV_MODEL,
+                        "max_tokens": 1500,
                         "messages": [
-                            {
-                                "role": "system",
-                                "content": (
-                                    "You are a professional memory extraction assistant. "
-                                    "You extract structured, unambiguous information from conversations. "
-                                    "Output valid JSON only."
-                                ),
-                            },
+                            {"role": "system", "content": (
+                                "You are a professional memory extraction assistant. "
+                                "You extract structured, unambiguous information from conversations. "
+                                "Output valid JSON only."
+                            )},
                             {"role": "user", "content": prompt},
                         ],
-                        "max_tokens": 1500,
-                        "temperature": 0.1,
                     },
-                    headers={"Authorization": f"Bearer {key}"},
+                    headers={"Authorization": f"Bearer {AISERV_KEY}"},
                 )
                 if resp.status_code != 200:
-                    log.warning(f"[extractor] LLM returned {resp.status_code}")
+                    log.warning(f"[extractor] LLM returned {resp.status_code}: {resp.text[:200]}")
                     return []
 
                 raw = resp.json()["choices"][0]["message"]["content"].strip()
