@@ -17,7 +17,7 @@ print(json.dumps({'query': sys.argv[1], 'session_id': sys.argv[2],
                   'memory_limit_number': 6, 'include_tools': True,
                   'include_procedures': True}))
 " "$PROMPT" "$SESSION" 2>/dev/null)
-RESULT=$(curl -sf -m 5 -X POST http://localhost:18800/recall \
+RESULT=$(curl -sf -m 7 -X POST http://localhost:18800/recall \
   -H 'Content-Type: application/json' -d "$PAYLOAD" 2>/dev/null)
 python3 -c "
 import json, sys

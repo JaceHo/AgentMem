@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 unset PYTHONWARNINGS  # prevent invalid startup-time warning filter from spamming stderr
+# Skip storing if disabled (prevents Claude Code debugging sessions from polluting Feishu AgentMem)
+if [ "${AGENTMEM_DISABLE_STORE:-0}" = "1" ]; then exit 0; fi
 INPUT=$(cat)
 SESSION=$(python3 -c "
 import json, sys
@@ -45,20 +47,27 @@ req = urllib.request.Request("http://localhost:18800/store",
     data=payload, headers={"Content-Type": "application/json"}, method="POST")
 try: urllib.request.urlopen(req, timeout=3)
 except: pass
-# 2. Promote session Tier 1 → Tier 2
+# 2. Compact Tier 1 KV before promotion (parity with OpenClaw plugin agent_end)
+if session_id:
+    req_compact = urllib.request.Request("http://localhost:18800/session/compact",
+        data=json.dumps({"session_id": session_id, "threshold_chars": 3000}).encode(),
+        headers={"Content-Type": "application/json"}, method="POST")
+    try: urllib.request.urlopen(req_compact, timeout=2)
+    except: pass
+# 3. Promote session Tier 1 → Tier 2
 req2 = urllib.request.Request("http://localhost:18800/session/compress",
     data=json.dumps({"session_id": session_id, "wait": False}).encode(),
     headers={"Content-Type": "application/json"}, method="POST")
 try: urllib.request.urlopen(req2, timeout=2)
 except: pass
-# 3. Record tool sequence into TIG (AutoTool, v0.9.5)
+# 4. Record tool sequence into TIG (AutoTool, v0.9.5)
 if len(tool_sequence) >= 2:
     req3 = urllib.request.Request("http://localhost:18800/record-tool-sequence",
         data=json.dumps({"sequence": tool_sequence, "session_id": session_id}).encode(),
         headers={"Content-Type": "application/json"}, method="POST")
     try: urllib.request.urlopen(req3, timeout=2)
     except: pass
-    # 4. AWO meta-tool detection (v0.9.6): synthesize composite procedures from TIG chains.
+    # 5. AWO meta-tool detection (v0.9.6): synthesize composite procedures from TIG chains.
     #    Idempotent — knn_search dedup prevents re-adding existing meta-tool entries.
     req4 = urllib.request.Request("http://localhost:18800/tool-graph/detect-meta-tools?threshold=5",
         data=b"{}", headers={"Content-Type": "application/json"}, method="POST")
