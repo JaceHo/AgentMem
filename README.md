@@ -134,7 +134,7 @@ Open a new Claude Code session. Done — every prompt now gets cross-session mem
 | `register-tools.sh` | Session start | Registers 18 built-in tools + MCP tools from settings (v0.9.7) |
 | `recall.sh` | Every prompt | Injects memory via `additionalContext` (~330ms) |
 | `compact.sh` | After every tool use | Session compact + ToolMem feedback per tool (v0.9.5) |
-| `store.sh` | Session end | Store + compress + TIG recording + AWO meta-tool synthesis (v0.9.6) |
+| `store.sh` | Session end | Store + compact + compress + TIG recording + AWO meta-tool synthesis (v0.9.6/v0.9.7) |
 
 ---
 
@@ -155,7 +155,9 @@ Open a new Claude Code session. Done — every prompt now gets cross-session mem
 }
 ```
 
-Plugin v0.5.1: recalls + registers tools/env on `before_agent_start` · ToolMem feedback + compact on `tool_end` · stores + TIG + AWO on `agent_end`.
+Plugin v0.5.2: recalls + registers tools/env on `before_agent_start` · ToolMem feedback + compact on `tool_end` · stores + TIG + AWO on `agent_end`.
+
+**v0.5.2 fixes:** `STORE_TIMEOUT` raised 500ms → 10000ms (pipeline takes 500-2000ms); store now fires even on failed/timeout sessions; failures logged instead of silently swallowed. Set `AGENTMEM_DISABLE_STORE=1` env var to skip storing (useful when debugging AgentMem itself).
 
 **Full parity — Claude Code hooks ↔ OpenClaw plugin:**
 
@@ -166,7 +168,7 @@ Plugin v0.5.1: recalls + registers tools/env on `before_agent_start` · ToolMem 
 | Recall memory | ✅ `recall.sh` | ✅ `before_agent_start` |
 | Tool feedback per tool | ✅ `compact.sh` | ✅ `tool_end` |
 | Session compact per tool | ✅ `compact.sh` | ✅ `tool_end` |
-| Store + compress + TIG | ✅ `store.sh` | ✅ `agent_end` |
+| Store + compact + compress + TIG | ✅ `store.sh` | ✅ `agent_end` |
 | AWO detect-meta-tools | ✅ `store.sh` | ✅ `agent_end` |
 
 ---
