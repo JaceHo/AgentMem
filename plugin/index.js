@@ -1,7 +1,14 @@
 /**
- * agentmem-openclaw-plugin  v0.5.1
+ * agentmem-openclaw-plugin  v0.5.2
  * AgentMem — local persistent memory via Redis HNSW + MiniLM FastAPI sidecar.
  * Drop-in replacement for memos-cloud-openclaw-plugin.
+ *
+ * v0.5.2 fixes (2026-03-17):
+ *   - STORE_TIMEOUT raised 500ms → 10000ms: pipeline (summarize+embed+extract)
+ *     routinely takes 500-2000ms; 500ms killed ~95% of real stores silently.
+ *   - Removed `if (!event?.success) return` guard: failed/timeout sessions
+ *     (the majority when LLM times out) now get their memory stored too.
+ *   - Added warn logging on store failure instead of silent .catch(() => {}).
  *
  * v0.3.0 additions (2026 layered controlled architecture):
  *   - Session Tier 1→2 promotion: calls /session/compress on agent_end
@@ -18,7 +25,7 @@
 const DEFAULT_BASE_URL = "http://127.0.0.1:18800";
 const DEFAULT_LIMIT    = 6;
 const RECALL_TIMEOUT   = 7000;   // ms — block agent start if exceeded (raised from 3000: avg recall is 4-6s)
-const STORE_TIMEOUT    = 500;    // ms — fire-and-forget, don't block
+const STORE_TIMEOUT    = 10000;  // ms — raised from 500: pipeline (summarize+embed+LLM) takes 500-2000ms
 const REG_TIMEOUT      = 2000;   // ms — tool/env registration (non-blocking)
 
 export default {
@@ -202,18 +209,21 @@ export default {
 
     // ── agent_end: compact + store + promote Tier 1 → Tier 2 + TIG ─────────
     api.on("agent_end", async (event, ctx) => {
-      if (!event?.success) return;
+      // v0.5.2: Store even on failure — partial/timeout sessions contain valuable
+      // context. Only skip if there are genuinely no messages to store.
       const messages  = event?.messages;
       const sessionId = ctx?.sessionId ?? ctx?.sessionKey ?? "";
       if (!messages?.length) return;
 
       // 1. Queue turn storage (async background, non-blocking)
+      // v0.5.2: Log failures instead of silently swallowing them.
       fetch(`${base}/store`, {
         method:  "POST",
         headers: { "Content-Type": "application/json" },
         body:    JSON.stringify({ messages, session_id: sessionId }),
         signal:  AbortSignal.timeout(STORE_TIMEOUT),
-      }).catch(() => {});
+      }).then(r => { if (!r?.ok) log.warn?.(`${tag} store HTTP ${r?.status}`); })
+        .catch(e => log.warn?.(`${tag} store failed: ${e?.message}`));
 
       if (sessionId) {
         // 2. Mid-session compact (v0.9.3): trim Tier 1 KV before promotion.
@@ -265,6 +275,6 @@ export default {
       }
     });
 
-    log.info?.(`${tag} v0.5.1 registered (ToolMem+TIG+MACLA+AWO, base=${base}, limit=${limit})`);
+    log.info?.(`${tag} v0.5.2 registered (ToolMem+TIG+MACLA+AWO, store_timeout=${STORE_TIMEOUT}ms, base=${base}, limit=${limit})`);
   },
 };
