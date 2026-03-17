@@ -29,6 +29,7 @@ DEFAULT_API           = "http://localhost:18800"
 STATE_FILE            = Path(__file__).parent / ".digest-state.json"
 MIN_TURNS_DEFAULT     = 2      # skip sessions shorter than this many turns
 RATE_LIMIT_MS         = 200    # ms between /store calls (be polite to Redis)
+WINDOW_SIZE           = 4      # messages per /store call — matches _do_store clean[-4:]
 
 # Strip injected memory context before storing — avoids circular echoes
 MEMORY_BLOCK_RE = re.compile(
@@ -135,6 +136,29 @@ def store(api_base: str, session_id: str, messages: list[dict]) -> bool:
         return False
 
 
+def store_windowed(api_base: str, session_id: str, messages: list[dict],
+                   window: int = WINDOW_SIZE) -> int:
+    """Chunk messages into windows of `window` and POST each chunk.
+
+    Returns the number of successful /store calls.  Each chunk is sent as
+    "openclaw:{session_id}:wN" so AgentMem can deduplicate across re-runs.
+
+    Why: _do_store in main.py takes clean[-4:] (last 4 messages).  Sending a
+    full session in one call discards everything except the final 4 messages.
+    Chunking ensures every window is fully processed.
+    """
+    ok_count = 0
+    for chunk_idx, start in enumerate(range(0, len(messages), window)):
+        chunk = messages[start: start + window]
+        if len(chunk) < 2:   # need at least 1 user+assistant pair
+            continue
+        chunk_id = f"openclaw:{session_id}:w{chunk_idx}"
+        if store(api_base, chunk_id, chunk):
+            ok_count += 1
+        time.sleep(RATE_LIMIT_MS / 1000)
+    return ok_count
+
+
 def check_health(api_base: str) -> bool:
     try:
         with urllib.request.urlopen(f"{api_base}/health", timeout=5) as resp:
@@ -203,13 +227,15 @@ def main() -> None:
 
     # ── ingest ────────────────────────────────────────────────────────────────
     ingested = skipped_short = skipped_empty = errors = 0
-    total_turns = 0
+    total_turns = total_windows = 0
 
     for i, path in enumerate(pending, 1):
         session_id, messages = extract_messages(path)
 
         turns = len(messages)
-        label = f"[{i:>4}/{len(pending)}] {path.name[:40]:<40} {turns:>4} turns"
+        windows = max(0, (turns + WINDOW_SIZE - 1) // WINDOW_SIZE)
+        label = (f"[{i:>4}/{len(pending)}] {path.name[:36]:<36} "
+                 f"{turns:>4} turns  {windows:>3}w")
 
         if turns < args.min_turns:
             print(f"  skip  {label}  (< {args.min_turns} turns)")
@@ -232,15 +258,17 @@ def main() -> None:
             print(f"  dry   {label}")
             ingested += 1
             total_turns += turns
+            total_windows += windows
             continue
 
-        ok = store(args.api, session_id, messages)
-        if ok:
-            print(f"  ok    {label}")
+        ok_wins = store_windowed(args.api, session_id, messages)
+        if ok_wins > 0:
+            print(f"  ok    {label}  ({ok_wins}/{windows} windows stored)")
             ingested += 1
             total_turns += turns
+            total_windows += ok_wins
             state["processed"][path.stem] = {
-                "ok": True, "turns": turns,
+                "ok": True, "turns": turns, "windows": ok_wins,
                 "at": datetime.now(timezone.utc).isoformat()
             }
         else:
@@ -251,13 +279,11 @@ def main() -> None:
         if i % 10 == 0:
             save_state(state)
 
-        time.sleep(RATE_LIMIT_MS / 1000)
-
     # ── summary ───────────────────────────────────────────────────────────────
     save_state(state)
     verb = "Would ingest" if args.dry_run else "Ingested"
     print(f"\n{'─'*60}")
-    print(f"{verb}:      {ingested} sessions / {total_turns} turns")
+    print(f"{verb}:      {ingested} sessions / {total_turns} turns / {total_windows} windows")
     print(f"Skipped (short): {skipped_short}")
     print(f"Skipped (empty): {skipped_empty}")
     print(f"Errors:          {errors}")
