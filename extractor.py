@@ -140,16 +140,37 @@ def _regex_extract(user_text: str) -> list[ExtractedFact]:
     return facts
 
 
-# ── Layer 2: SimpleMem LLM gate (ZhipuAI/GLM-4.7-Flash via aiserv 8-key pool) ─
-# OAI format (/v1/chat/completions) bypasses Anthropic↔OAI translation in gateway,
-# saving ~700ms vs /v1/messages. Uses Bearer auth (OAI convention).
-# Named route ZhipuAI/GLM-4.7-Flash → zai-gf-1..8 (8 keys, health-tracked).
+# ── Layer 2: SimpleMem LLM gate via aiserv role-based routing ───────────────
+# Uses GET /v1/role/nlp to dynamically pick the best model based on live
+# provider health, latency, and availability — no hardcoded model cascade.
+# aiserv rotates across Cerebras, Groq, ZAI, Google, etc. and auto-heals
+# when provider keys are restored. Fallback: hardcoded "fast" tier.
 
-AISERV_URL   = "http://127.0.0.1:4000/v1/chat/completions"
-AISERV_KEY   = "sk-aiserv-local-dev"
-AISERV_MODEL = "ZhipuAI/GLM-4.7-Flash"
-LLM_TIMEOUT_S = 10.0  # 8-key pool health-skips bad keys → p99 ~400ms; 10s is safe ceiling
+AISERV_BASE  = "http://127.0.0.1:4000"
+AISERV_URL   = f"{AISERV_BASE}/v1/chat/completions"
+AISERV_KEY   = "sk-aiserv-local"
+AISERV_ROLE  = "nlp"                    # maps to /v1/role/nlp
+AISERV_FALLBACK_MODEL = "fast"          # cerebras/llama3.1-8b: sub-1s, always first
+AISERV_MODEL_CASCADE = []               # populated dynamically; kept for import compat
+LLM_TIMEOUT_S = 8.0    # per-attempt timeout; fast=2s, role models up to 8s
+LLM_MAX_RETRIES = 3    # attempt 0: fast, attempt 1-2: role-based with exclude
 LLM_MAX_INPUT = 3000   # chars of conversation to send to LLM
+
+
+async def _resolve_nlp_model(exclude: Optional[str] = None) -> tuple[str, str]:
+    """Ask aiserv for the best NLP model right now. Returns (model_id, tier)."""
+    try:
+        url = f"{AISERV_BASE}/v1/role/{AISERV_ROLE}"
+        if exclude:
+            url += f"?exclude={exclude}"
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            resp = await client.get(url, headers={"Authorization": f"Bearer {AISERV_KEY}"})
+            if resp.status_code == 200:
+                d = resp.json()
+                return d.get("model", AISERV_FALLBACK_MODEL), d.get("tier", "fast")
+    except Exception as e:
+        log.debug("[extractor] role API failed: %s", e)
+    return AISERV_FALLBACK_MODEL, "fast"
 
 # SimpleMem-aligned extraction prompt (bilingual):
 # - Φ_coref: forbids all pronouns (he/she/it/they/this/that/我/他/她)
@@ -262,13 +283,14 @@ def _parse_llm_json(raw: str) -> list:
 
 
 async def _llm_extract(conversation_text: str) -> list[ExtractedFact]:
-    """Layer 2: SimpleMem-style LLM extraction via ZAI GLM-4-flash (aiserv).
+    """Layer 2: SimpleMem-style LLM extraction via aiserv role-based routing.
 
     Produces pronoun-free, absolute-timestamp lossless_restatement entries
     matching SimpleMem Section 3.1 multi-view indexing format.
 
-    v0.9.8: GLM-4-flash via aiserv zai-gf-1..5 pool (recovered 2026-03-17).
-    Uses anthropic-messages format; response in content[0]["text"].
+    v0.9.9: Role-based routing via /v1/role/nlp. aiserv dynamically selects
+    the best model based on live provider health. On failure, excludes the
+    failed model and retries with the next best.
     """
     today = datetime.date.today().isoformat()
     prompt = _EXTRACT_PROMPT.format(
@@ -276,15 +298,23 @@ async def _llm_extract(conversation_text: str) -> list[ExtractedFact]:
         conversation=conversation_text[:LLM_MAX_INPUT],
     )
 
-    max_retries = 2
-    for attempt in range(max_retries):
+    exclude = None
+    tried_models = []
+    for attempt in range(LLM_MAX_RETRIES):
+        if attempt == 0:
+            model = AISERV_FALLBACK_MODEL  # "fast" — cerebras sub-1s, always first
+        else:
+            model, _ = await _resolve_nlp_model(exclude=exclude)
+            if model in tried_models:
+                model = AISERV_FALLBACK_MODEL
+        tried_models.append(model)
         try:
             async with httpx.AsyncClient(timeout=LLM_TIMEOUT_S) as client:
                 resp = await client.post(
                     AISERV_URL,
                     json={
-                        "model":      AISERV_MODEL,
-                        "max_tokens": 1500,
+                        "model":      model,
+                        "max_tokens": 800,
                         "messages": [
                             {"role": "system", "content": (
                                 "You are a professional memory extraction assistant. "
@@ -297,16 +327,20 @@ async def _llm_extract(conversation_text: str) -> list[ExtractedFact]:
                     headers={"Authorization": f"Bearer {AISERV_KEY}"},
                 )
                 if resp.status_code != 200:
-                    log.warning(f"[extractor] LLM returned {resp.status_code}: {resp.text[:200]}")
-                    return []
+                    log.warning(
+                        "[extractor] %s returned %d: %s",
+                        model, resp.status_code, resp.text[:200],
+                    )
+                    exclude = model
+                    continue
 
                 raw = resp.json()["choices"][0]["message"]["content"].strip()
                 items = _parse_llm_json(raw)
 
                 if not isinstance(items, list):
-                    if attempt < max_retries - 1:
-                        continue
-                    return []
+                    log.warning("[extractor] %s returned non-list, trying next", model)
+                    exclude = model
+                    continue
 
                 facts: list[ExtractedFact] = []
                 for item in items:
@@ -373,17 +407,19 @@ async def _llm_extract(conversation_text: str) -> list[ExtractedFact]:
                 return facts
 
         except json.JSONDecodeError as e:
-            log.warning(f"[extractor] LLM returned non-JSON (attempt {attempt+1}): {e}")
-            if attempt >= max_retries - 1:
-                return []
+            log.warning("[extractor] %s returned non-JSON: %s", model, e)
+            exclude = model
+        except httpx.TimeoutException:
+            log.warning("[extractor] %s timed out (%.0fs)", model, LLM_TIMEOUT_S)
+            exclude = model
         except Exception as e:
             log.warning(
-                f"[extractor] LLM extraction failed (attempt {attempt+1}): "
-                f"{type(e).__name__}: {e}"
+                "[extractor] %s failed: %s: %s", model, type(e).__name__, e
             )
-            if attempt >= max_retries - 1:
-                return []
+            exclude = model
 
+    log.error("[extractor] All models exhausted after %d attempts (%s)",
+              LLM_MAX_RETRIES, ", ".join(tried_models))
     return []
 
 

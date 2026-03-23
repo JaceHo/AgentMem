@@ -27,38 +27,56 @@ import logging
 
 import httpx
 
-from extractor import AISERV_URL, AISERV_KEY, AISERV_MODEL, LLM_TIMEOUT_S, _parse_llm_json
+from extractor import (
+    AISERV_URL, AISERV_KEY, LLM_TIMEOUT_S, LLM_MAX_RETRIES,
+    _resolve_nlp_model, AISERV_FALLBACK_MODEL, _parse_llm_json,
+)
 
 log = logging.getLogger("mem")
 
-# Keep planning fast — shorter timeout than extraction
-_PLAN_TIMEOUT_S = 12.0  # GLM-4-flash ~1-3s; 12s covers cold start
+_PLAN_TIMEOUT_S = 6.0  # planning generates fewer tokens; 6s is generous
 
 
 async def _llm_call(prompt: str, system: str, max_tokens: int = 300) -> str | None:
-    """Call DeepSeek-V3.2 via aiserv. Returns raw text or None on failure.
+    """Call LLM via aiserv role-based routing. Returns raw text or None on failure.
 
-    v0.9.8: GLM-4-flash via aiserv (ZAI recovered 2026-03-17). Anthropic-messages format:
-    system is top-level, response in content[0]["text"].
+    Uses /v1/role/nlp for dynamic model selection with exclude-rotation on failure.
     """
-    try:
-        async with httpx.AsyncClient(timeout=_PLAN_TIMEOUT_S) as client:
-            resp = await client.post(
-                AISERV_URL,
-                json={
-                    "model":      AISERV_MODEL,
-                    "max_tokens": max_tokens,
-                    "system":     system,
-                    "messages":   [{"role": "user", "content": prompt}],
-                },
-                headers={"x-api-key": AISERV_KEY},
-            )
-            if resp.status_code == 200:
-                blocks = resp.json().get("content", [])
-                if blocks and blocks[0].get("type") == "text":
-                    return blocks[0]["text"].strip()
-    except Exception as e:
-        log.debug(f"[planner] LLM call failed: {type(e).__name__}: {e}")
+    exclude = None
+    tried = []
+    for _ in range(LLM_MAX_RETRIES):
+        model, _ = await _resolve_nlp_model(exclude=exclude)
+        if model in tried:
+            model = AISERV_FALLBACK_MODEL
+        tried.append(model)
+        try:
+            async with httpx.AsyncClient(timeout=_PLAN_TIMEOUT_S) as client:
+                resp = await client.post(
+                    AISERV_URL,
+                    json={
+                        "model":      model,
+                        "max_tokens": max_tokens,
+                        "messages": [
+                            {"role": "system", "content": system},
+                            {"role": "user", "content": prompt},
+                        ],
+                    },
+                    headers={"Authorization": f"Bearer {AISERV_KEY}"},
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    choices = data.get("choices", [])
+                    if choices:
+                        return choices[0]["message"]["content"].strip()
+                log.warning("[planner] %s returned %d", model, resp.status_code)
+                exclude = model
+        except httpx.TimeoutException:
+            log.warning("[planner] %s timed out (%.0fs)", model, _PLAN_TIMEOUT_S)
+            exclude = model
+        except Exception as e:
+            log.debug("[planner] %s failed: %s: %s", model, type(e).__name__, e)
+            exclude = model
+    log.warning("[planner] All models exhausted (%s)", ", ".join(tried))
     return None
 
 

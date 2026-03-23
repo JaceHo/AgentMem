@@ -5,19 +5,35 @@ MiniLM-L6 silently truncates at 256 word-pieces (~200 chars of dense text).
 Long conversations lose their tail. Summarizing first ensures the full
 turn is captured in the 384-dim embedding.
 
-v0.9.8: Switched back to ZAI GLM-4-flash via aiserv (ZAI recovered 2026-03-17).
-aiserv routes to zai-gf-1..5 pool (5 keys × 300 RPM). ~1-3s domestic.
-Degrades gracefully: returns truncated original if aiserv unavailable or timeout.
+v0.9.9: Role-based routing via /v1/role/nlp. Same model selection as
+extractor and retrieval_planner. Falls back to truncation if unavailable.
 """
 
 import httpx
+import logging
+
+log = logging.getLogger("mem")
 
 MIN_TO_SUMMARIZE = 280   # chars — below this, embed directly
 MAX_SUMMARY_CHARS = 180  # target summary length
-AISERV_URL   = "http://127.0.0.1:4000/v1/messages"
-AISERV_KEY   = "sk-aiserv-local-dev"
-AISERV_MODEL = "glm-4-flash"
-TIMEOUT_S    = 12.0  # GLM-4-flash ~1-3s; 12s covers cold start
+AISERV_URL   = "http://127.0.0.1:4000/v1/chat/completions"
+AISERV_KEY   = "sk-aiserv-local"
+TIMEOUT_S    = 6.0       # summarization generates ~40 tokens; 6s is generous
+
+
+async def _get_model() -> str:
+    """Ask aiserv for the best NLP model."""
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            resp = await client.get(
+                "http://127.0.0.1:4000/v1/role/nlp",
+                headers={"Authorization": f"Bearer {AISERV_KEY}"},
+            )
+            if resp.status_code == 200:
+                return resp.json().get("model", "fast")
+    except Exception:
+        pass
+    return "fast"
 
 
 async def summarize(text: str) -> str:
@@ -30,22 +46,24 @@ async def summarize(text: str) -> str:
         f"Preserve names, entities, and key facts:\n\n{text[:1200]}"
     )
 
+    model = await _get_model()
     try:
         async with httpx.AsyncClient(timeout=TIMEOUT_S) as client:
             resp = await client.post(
                 AISERV_URL,
                 json={
-                    "model":      AISERV_MODEL,
+                    "model":      model,
                     "max_tokens": 80,
                     "messages":   [{"role": "user", "content": prompt}],
                 },
-                headers={"x-api-key": AISERV_KEY},
+                headers={"Authorization": f"Bearer {AISERV_KEY}"},
             )
             if resp.status_code == 200:
-                blocks = resp.json().get("content", [])
-                if blocks and blocks[0].get("type") == "text":
-                    return blocks[0]["text"].strip()
-    except Exception:
-        pass
+                data = resp.json()
+                choices = data.get("choices", [])
+                if choices:
+                    return choices[0]["message"]["content"].strip()
+    except Exception as e:
+        log.debug("[summarizer] %s failed: %s", model, e)
 
     return text[:MAX_SUMMARY_CHARS]
