@@ -18,6 +18,7 @@ that are self-contained and independently interpretable — exactly as
 specified in SimpleMem Section 3.1.
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -171,6 +172,26 @@ async def _resolve_nlp_model(exclude: Optional[str] = None) -> tuple[str, str]:
     except Exception as e:
         log.debug("[extractor] role API failed: %s", e)
     return AISERV_FALLBACK_MODEL, "fast"
+
+
+async def _report_quality(model: str, score: int) -> None:
+    """Fire-and-forget: push quality signal to aiserv health matrix.
+
+    score=+1 (success) or -1 (timeout/failure). aiserv accumulates these in
+    feedback_scores which shifts _score() output — after enough -1s a slow
+    model scores ≤ 0 and is automatically excluded from role routing.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            await client.post(
+                f"{AISERV_BASE}/v1/quality-feedback",
+                json={"model": model, "score": score, "task_type": "language"},
+                headers={"Authorization": f"Bearer {AISERV_KEY}"},
+            )
+            log.debug("[extractor] quality-feedback: %s score=%+d", model, score)
+    except Exception:
+        pass  # best-effort; never block the caller
+
 
 # SimpleMem-aligned extraction prompt (bilingual):
 # - Φ_coref: forbids all pronouns (he/she/it/they/this/that/我/他/她)
@@ -404,19 +425,26 @@ async def _llm_extract(conversation_text: str) -> list[ExtractedFact]:
                     f"[extractor] LLM produced {len(facts)} lossless entries "
                     f"(SimpleMem Φ_gate)"
                 )
+                # Report success to aiserv so health matrix tracks working models.
+                asyncio.create_task(_report_quality(model, +1))
                 return facts
 
         except json.JSONDecodeError as e:
             log.warning("[extractor] %s returned non-JSON: %s", model, e)
             exclude = model
+            asyncio.create_task(_report_quality(model, -1))
         except httpx.TimeoutException:
             log.warning("[extractor] %s timed out (%.0fs)", model, LLM_TIMEOUT_S)
             exclude = model
+            # Self-healing: push -1 back to aiserv health matrix so slow models
+            # are automatically downranked/excluded from future role routing.
+            asyncio.create_task(_report_quality(model, -1))
         except Exception as e:
             log.warning(
                 "[extractor] %s failed: %s: %s", model, type(e).__name__, e
             )
             exclude = model
+            asyncio.create_task(_report_quality(model, -1))
 
     log.error("[extractor] All models exhausted after %d attempts (%s)",
               LLM_MAX_RETRIES, ", ".join(tried_models))

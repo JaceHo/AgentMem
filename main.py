@@ -1030,10 +1030,12 @@ async def answer(req: AnswerRequest):
     """
     _AISERV_OAI = "http://127.0.0.1:4000/v1/chat/completions"
     _AISERV_KEY = "sk-aiserv-local-dev"
-    _FAST_MODEL = "ZhipuAI/GLM-4.7-Flash"
 
     if not req.context.strip():
         return {"answer": ""}
+
+    # Use live role-based routing so the health matrix picks the best model.
+    model, _ = await extractor._resolve_nlp_model()
 
     prompt = (
         f"Based only on the following memory context, answer the question concisely "
@@ -1047,7 +1049,7 @@ async def answer(req: AnswerRequest):
             resp = await client.post(
                 _AISERV_OAI,
                 json={
-                    "model": _FAST_MODEL,
+                    "model": model,
                     "messages": [
                         {"role": "system", "content": "You are a precise question-answering assistant. Extract the exact answer phrase from the provided context. Output valid JSON only."},
                         {"role": "user",   "content": prompt},
@@ -1076,8 +1078,12 @@ async def answer(req: AnswerRequest):
                         return {"answer": str(parsed.get("answer", ""))}
                     elif isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
                         return {"answer": str(parsed[0].get("answer", ""))}
+    except httpx.TimeoutException:
+        log.warning("[answer] %s timed out", model)
+        asyncio.create_task(extractor._report_quality(model, -1))
     except Exception as e:
         log.debug(f"[answer] LLM extraction failed: {e}")
+        asyncio.create_task(extractor._report_quality(model, -1))
     return {"answer": ""}
 
 
@@ -2331,10 +2337,12 @@ async def _do_hard_prune() -> dict:
 
 
 async def _llm_merge_facts(contents: list[str]) -> str | None:
-    """Use GLM-4-Flash to merge multiple similar facts into one consolidated fact."""
+    """Use role-based routing to merge multiple similar facts into one consolidated fact."""
     _AISERV_OAI = "http://127.0.0.1:4000/v1/chat/completions"
     _AISERV_KEY = "sk-aiserv-local-dev"
-    _FAST_MODEL = "ZhipuAI/GLM-4.7-Flash"
+
+    # Use live health matrix — no hardcoded dead models.
+    model, _ = await extractor._resolve_nlp_model()
 
     facts_text = "\n".join(f"- {c}" for c in contents)
     prompt = (
@@ -2347,7 +2355,7 @@ async def _llm_merge_facts(contents: list[str]) -> str | None:
             resp = await client.post(
                 _AISERV_OAI,
                 json={
-                    "model": _FAST_MODEL,
+                    "model": model,
                     "messages": [{"role": "user", "content": prompt}],
                     "max_tokens": 150,
                     "temperature": 0.1,
@@ -2355,9 +2363,14 @@ async def _llm_merge_facts(contents: list[str]) -> str | None:
                 headers={"Authorization": f"Bearer {_AISERV_KEY}"},
             )
             if resp.status_code == 200:
+                asyncio.create_task(extractor._report_quality(model, +1))
                 return resp.json()["choices"][0]["message"]["content"].strip()
+    except httpx.TimeoutException:
+        log.warning("[consolidate] %s timed out", model)
+        asyncio.create_task(extractor._report_quality(model, -1))
     except Exception as e:
         log.warning(f"[consolidate] LLM merge failed: {e}")
+        asyncio.create_task(extractor._report_quality(model, -1))
 
     return max(contents, key=len)
 
