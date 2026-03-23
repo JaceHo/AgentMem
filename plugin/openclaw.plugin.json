@@ -1,8 +1,8 @@
 {
   "id": "memos-local-openclaw-plugin",
   "name": "AgentMem — Local Agent Memory",
-  "description": "AgentMem v0.9.6: A-MAC + SimpleMem + ToolMem + TIG + AWO + 6-tier persistent memory via Redis HNSW.",
-  "version": "0.5.1",
+  "description": "AgentMem v1.0.0: A-MAC + SimpleMem + ToolMem + TIG + AWO + 6-tier persistent memory via Redis HNSW.",
+  "version": "0.5.2",
   "kind": "lifecycle",
   "main": "./index.js",
   "configSchema": {

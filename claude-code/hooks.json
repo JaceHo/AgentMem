@@ -1,5 +1,5 @@
 {
-  "description": "AgentMem — Redis HNSW persistent memory for Claude Code (v0.9.7)",
+  "description": "AgentMem — Redis HNSW persistent memory for Claude Code (v1.0.0)",
   "hooks": {
     "SessionStart": [{
       "matcher": "startup|clear|compact",
