@@ -1,5 +1,5 @@
 """
-AgentMem — Local Agent Memory Service  v0.9.6
+AgentMem — Local Agent Memory Service  v1.0.0
 ==============================================
 Replaces memos-cloud-openclaw-plugin with fully local, persistent memory.
 
@@ -40,6 +40,12 @@ Features (v0.9.2 — A-MAC + wRRF + importance floors):
                                  tracks temporal narrative flow across sessions (v0.9.3)
  22. Mid-session compact      — /session/compact: LLM-compress Tier 1 KV when >3000
                                  chars, PostToolUse hook keeps context O(N) (v0.9.3)
+ 23. Session handoff bridge  — /session/compress pins last summary; always injected
+                                 at next session start for cross-session continuity (v1.0)
+ 24. Hard-delete pruning     — daily VREM of superseded facts (>7d) and stale
+                                 episodes (>180d, unaccessed); keeps HNSW fresh (v1.0)
+ 25. Auto graph expansion    — graph neighbourhood auto-triggers on entity queries
+                                 without explicit include_graph=True flag (v1.0)
 
 Endpoints:
   POST /recall              — before_agent_start hook (includes tool context + graph)
@@ -64,6 +70,7 @@ Endpoints:
   POST /procedure-feedback  — MACLA Beta: record procedure success/fail (v0.9.5)
   GET  /tool-procedures/{name} — reverse index: procedures that use a given tool (v0.9.6)
   POST /proc-backfill-index — backfill proc_by_tool reverse index for existing procedures (v0.9.6)
+  POST /consolidate/hard-prune — manual trigger: VREM soft-deleted + stale entries (v1.0)
   GET  /health
   GET  /stats
 """
@@ -111,6 +118,9 @@ _redis = None
 _stores_since_consolidation: int = 0
 _AUTO_CONSOLIDATE_EVERY: int = 50   # trigger after every N stored facts
 
+# ── Hard-prune (physical VREM of superseded entries) runs every 24 hours ───────
+_periodic_prune_counter: int = 0    # incremented each hourly _periodic_consolidate call
+
 # ── Store observability counters (in-process, resets on restart) ───────────────
 _store_attempts: int = 0
 _store_successes: int = 0
@@ -153,10 +163,16 @@ def _cached_encode(text: str) -> bytes:
 def _encode(text: str) -> np.ndarray:
     return np.frombuffer(_cached_encode(text), dtype=np.float32).copy()
 
+# ── Session handoff: pinned last-session summary ───────────────────────────────
+# Key stores the most recent session summary so the NEXT session can always
+# retrieve it regardless of query similarity (cross-session continuity bridge).
+_PINNED_SESSION_KEY = "mem:pinned:session_summary"
+
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
 async def _periodic_consolidate() -> None:
-    """Background task: consolidate memory every hour if there are facts to merge."""
+    """Background task: consolidate memory every hour; hard-prune every 24 hours."""
+    global _periodic_prune_counter
     while True:
         await asyncio.sleep(3600)
         try:
@@ -165,6 +181,13 @@ async def _periodic_consolidate() -> None:
                 await _do_consolidate()
         except Exception as e:
             log.warning(f"[periodic_consolidate] error: {e}")
+        _periodic_prune_counter += 1
+        if _periodic_prune_counter >= 24:
+            _periodic_prune_counter = 0
+            try:
+                await _do_hard_prune()
+            except Exception as e:
+                log.warning(f"[periodic_consolidate] hard-prune error: {e}")
 
 
 @asynccontextmanager
@@ -177,12 +200,12 @@ async def lifespan(app: FastAPI):
     log.info("Ensuring vectorset indexes…")
     await mem_store.ensure_indexes(_redis)
     asyncio.create_task(_periodic_consolidate())
-    log.info("AgentMem v0.9.6 ready (ToolMem+TIG+MACLA+proc_by_tool reverse index+AWO meta-tools)")
+    log.info("AgentMem v1.0.0 ready (session-handoff+hard-prune+auto-graph+batch-MCP)")
     yield
     await _redis.aclose()
 
 
-app = FastAPI(title="AgentMem — Local Agent Memory Service", version="0.9.5", lifespan=lifespan)
+app = FastAPI(title="AgentMem — Local Agent Memory Service", version="1.0.0", lifespan=lifespan)
 
 # ── Static files + SSE log router ─────────────────────────────────────────────
 import os as _os
@@ -209,7 +232,8 @@ class RecallRequest(BaseModel):
     memory_limit_number: int = 6
     include_tools: bool = True          # Whether to append relevant tool context
     include_procedures: bool = False    # Whether to append relevant skill/procedure context (v0.9.4)
-    include_graph: bool = False         # Expand knowledge graph neighbours (v0.9.0)
+    include_graph: bool = False         # Explicitly expand knowledge graph neighbours (v0.9.0)
+    auto_graph: bool = True             # Auto-trigger graph expansion when query has named entities (v1.0)
     # SimpleMem Section 3.3: Intent-Aware Retrieval Planning (v0.9.1)
     enable_planning: bool = False       # LLM-based query planning (adds ~300-600ms)
     enable_reflection: bool = False     # LLM sufficiency check + second-pass retrieval
@@ -311,12 +335,13 @@ def _format_prepend(
     tool_ctx: str = "",
     proc_ctx: list[dict] | None = None,
     token_budget: int = 1500,
+    last_session_summary: str | None = None,
 ) -> str:
     """
     Build the context string injected into the agent's system prompt.
 
     SimpleMem Section 3.3 token-budget packing:
-    Priority order: persona → env → tools → skills → session_ctx → facts → episodes
+    Priority order: persona → last_session_summary → env → tools → skills → session_ctx → facts → episodes
     Greedy packing: stop adding items when token_budget is exhausted.
     Output wrapped in <cross_session_memory> XML tags (SimpleMem convention).
     """
@@ -334,6 +359,13 @@ def _format_prepend(
 
     # Priority 1: persona (user profile — most stable context)
     if persona_ctx and _add(persona_ctx):
+        _add("")
+
+    # Priority 1.5: last session summary (cross-session continuity bridge)
+    # Always injected when present so the agent knows what was accomplished
+    # in the previous session, regardless of current query similarity.
+    if last_session_summary and _add("## Last Session Summary"):
+        _add(last_session_summary[:600])
         _add("")
 
     # Priority 2: environment context
@@ -916,6 +948,10 @@ async def _do_compress_session(session_id: str) -> dict:
     # Delete Tier 1 KV — session has been crystallised into long-term memory
     await _redis.delete(f"{mem_store.SESSION_PRE}{session_id}:ctx")
 
+    # Pin the session summary for the NEXT session's recall (cross-session handoff).
+    # Stored without TTL so it persists until the next compress overwrites it.
+    await _redis.set(_PINNED_SESSION_KEY, session_summary[:600].encode())
+
     log.info(f"[compress] session={session_id} promoted → ep+{ep_saved} facts+{fact_saved}")
     return {
         "status":     "ok",
@@ -1049,7 +1085,7 @@ async def answer(req: AnswerRequest):
 async def health():
     try:
         await _redis.ping()
-        return {"status": "ok", "redis": "ok", "version": "0.9.6"}
+        return {"status": "ok", "redis": "ok", "version": "1.0.0"}
     except Exception as e:
         return {"status": "degraded", "error": str(e)}
 
@@ -1127,6 +1163,7 @@ async def recall(req: RecallRequest):
     # Parallel: persona + env + session ctx + scene-filtered facts + episodes
     # + tool recall if capability query or include_tools=True
     # + symbolic structured pass (async, no extra latency via gather)
+    # + pinned last-session summary (cross-session handoff bridge, index 6)
     gather_tasks = [
         persona_mod.get_context(_redis),
         cap_mod.get_env_context(_redis),
@@ -1134,6 +1171,7 @@ async def recall(req: RecallRequest):
         _fetch(mem_store.FACT_KEY,    n_facts,    lang_filter_sym or None),
         _fetch(mem_store.EPISODE_KEY, n_episodes, lang_filter_sym or None),
         retrieval_planner.analyze_query_structure(req.query),  # symbolic layer (index 5)
+        _redis.get(_PINNED_SESSION_KEY),                       # handoff bridge (index 6)
     ]
     if req.include_tools and is_cap_query:
         gather_tasks.append(cap_mod.recall_tools(_redis, emb, k=6))
@@ -1197,8 +1235,12 @@ async def recall(req: RecallRequest):
     facts_scene  = results[3]
     eps_scene    = results[4]
     query_struct = results[5] if isinstance(results[5], dict) else {}
-    tools_raw    = results[6] if isinstance(results[6], list) else []
-    procs_raw    = results[7] if isinstance(results[7], list) else []
+    _pinned_raw  = results[6]
+    last_session_summary = (
+        _pinned_raw.decode() if isinstance(_pinned_raw, bytes) else _pinned_raw
+    ) if _pinned_raw else None
+    tools_raw    = results[7] if isinstance(results[7], list) else []
+    procs_raw    = results[8] if isinstance(results[8], list) else []
 
     # Symbolic structured pass (AgentMem §3.3 extension):
     # If the query mentions specific persons or entities, do a targeted scan
@@ -1327,8 +1369,11 @@ async def recall(req: RecallRequest):
                 facts = facts[:n_facts + 3]
                 log.info(f"[recall] reflection pass: added {len(reflection_facts)} candidates")
 
-    # Knowledge graph expansion (v0.9.0): pull facts from graph neighbourhood
-    if req.include_graph and facts:
+    # Knowledge graph expansion (v0.9.0 + auto-trigger v1.0):
+    # Fire when explicitly requested OR when query has named entities (auto_graph=True).
+    # Auto-trigger catches "what did Bob tell me about Redis?" without needing include_graph.
+    _auto_graph_trigger = req.auto_graph and bool(sym_entities)
+    if (req.include_graph or _auto_graph_trigger) and facts:
         graph_ents: list[str] = []
         for f in facts[:3]:
             attrs = f.get("attrs", {})
@@ -1382,11 +1427,15 @@ async def recall(req: RecallRequest):
     proc_ctx: list[dict] = procs_raw if isinstance(procs_raw, list) else []
 
     # SimpleMem Section 3.3 token-budget injection with XML wrapper
+    # Skip pinned session summary if this session has already accumulated context
+    # (session_ctx means we're mid-session, not starting fresh).
+    _handoff = last_session_summary if not session_ctx else None
     prepend = _format_prepend(
         facts, episodes, session_ctx, persona_ctx,
         env_ctx=env_ctx_formatted, tool_ctx=tool_ctx,
         proc_ctx=proc_ctx or None,
         token_budget=req.token_budget,
+        last_session_summary=_handoff,
     )
     ms = int((time.time() - t0) * 1000)
 
@@ -1399,8 +1448,8 @@ async def recall(req: RecallRequest):
 
 
 @app.post("/store")
-async def store_memory(req: StoreRequest, background_tasks: BackgroundTasks):
-    background_tasks.add_task(_do_store, req.messages, req.session_id)
+async def store_memory(req: StoreRequest):
+    asyncio.create_task(_do_store(req.messages, req.session_id))
     return {"status": "queued"}
 
 
@@ -2203,6 +2252,84 @@ async def _do_consolidate(
     }
 
 
+async def _do_hard_prune() -> dict:
+    """
+    Physically VREM entries that have been soft-deleted for > 7 days,
+    and stale episodes (>180 days old, never accessed).
+
+    Soft-delete (superseded_by != "") is the SimpleMem audit trail.
+    Hard-delete (VREM) is the capacity management pass that actually
+    reduces vectorset size and keeps HNSW index fresh.
+
+    Returns counts of entries removed from each vectorset.
+    """
+    t0 = time.time()
+    now_ms = int(time.time() * 1000)
+    SEVEN_DAYS_MS   = 7  * 86_400_000
+    SIX_MONTHS_MS   = 180 * 86_400_000
+
+    removed_facts = 0
+    removed_eps   = 0
+
+    async def _hard_prune_vset(vset_key: str, max_scan: int = 2000) -> int:
+        card = await _redis.execute_command("VCARD", vset_key)
+        if not card or int(card) <= 1:
+            return 0
+        seed = np.zeros(mem_store.DIMS, dtype=np.float32)
+        try:
+            results = await _redis.execute_command(
+                "VSIM", vset_key, "FP32", seed.tobytes(),
+                "COUNT", min(int(card), max_scan), "WITHSCORES", "WITHATTRIBS"
+            )
+        except Exception as e:
+            log.warning(f"[hard_prune] scan failed for {vset_key}: {e}")
+            return 0
+
+        to_remove: list[str] = []
+        i = 0
+        while i + 2 < len(results):
+            elem = results[i]; raw = results[i + 2]; i += 3
+            elem_str = elem.decode() if isinstance(elem, bytes) else elem
+            if elem_str == "__seed__":
+                continue
+            try:
+                attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+            except Exception:
+                continue
+            if attrs.get("_seed"):
+                continue
+
+            ts = attrs.get("ts", now_ms)
+            age_ms = now_ms - ts
+
+            # Hard-delete soft-deleted entries older than 7 days
+            superseded = attrs.get("superseded_by", "")
+            if superseded and age_ms > SEVEN_DAYS_MS:
+                to_remove.append(elem_str)
+                continue
+
+            # Hard-delete stale episodes: 180+ days old, never recalled
+            if vset_key == mem_store.EPISODE_KEY:
+                if age_ms > SIX_MONTHS_MS and attrs.get("access_count", 0) == 0:
+                    to_remove.append(elem_str)
+
+        removed = 0
+        for elem_str in to_remove:
+            try:
+                await _redis.execute_command("VREM", vset_key, elem_str)
+                removed += 1
+            except Exception:
+                pass
+        return removed
+
+    removed_facts = await _hard_prune_vset(mem_store.FACT_KEY)
+    removed_eps   = await _hard_prune_vset(mem_store.EPISODE_KEY)
+
+    ms = int((time.time() - t0) * 1000)
+    log.info(f"[hard_prune] removed facts={removed_facts} episodes={removed_eps} {ms}ms")
+    return {"removed_facts": removed_facts, "removed_episodes": removed_eps, "ms": ms}
+
+
 async def _llm_merge_facts(contents: list[str]) -> str | None:
     """Use GLM-4-Flash to merge multiple similar facts into one consolidated fact."""
     _AISERV_OAI = "http://127.0.0.1:4000/v1/chat/completions"
@@ -2247,6 +2374,16 @@ async def consolidate_sync():
     """Synchronous consolidation — returns results immediately."""
     result = await _do_consolidate()
     return result
+
+
+@app.post("/consolidate/hard-prune")
+async def hard_prune(background_tasks: BackgroundTasks):
+    """
+    Physical VREM of soft-deleted entries (>7 days) and stale episodes (>180 days).
+    Runs automatically every 24h; use this to trigger on demand.
+    """
+    background_tasks.add_task(_do_hard_prune)
+    return {"status": "hard_prune_queued"}
 
 
 @app.post("/admin/delete-facts-by-content")

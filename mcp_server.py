@@ -36,6 +36,7 @@ Tools exposed
 
 from __future__ import annotations
 
+import asyncio
 import httpx
 
 try:
@@ -191,6 +192,62 @@ async def list_tools() -> list[types.Tool]:
                 "required": ["session_id"],
             },
         ),
+        types.Tool(
+            name="batch_recall_memory",
+            description=(
+                "Retrieve relevant memories for multiple queries in parallel. "
+                "More efficient than calling recall_memory N times. "
+                "Returns combined context from all queries."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "queries":             {
+                        "type": "array", "items": {"type": "string"},
+                        "description": "List of queries to search for in memory (max 5)",
+                    },
+                    "session_id":          {"type": "string",  "description": "Session identifier (optional)", "default": ""},
+                    "memory_limit_number": {"type": "integer", "description": "Max memories per query",        "default": 4},
+                },
+                "required": ["queries"],
+            },
+        ),
+        types.Tool(
+            name="batch_store_memory",
+            description=(
+                "Save multiple conversation turns to long-term memory in parallel. "
+                "More efficient than calling store_memory N times when you have "
+                "several exchanges to persist at once."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "batches": {
+                        "type": "array",
+                        "description": "List of message batches, each with role and content",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "messages": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "role":    {"type": "string"},
+                                            "content": {"type": "string"},
+                                        },
+                                        "required": ["role", "content"],
+                                    },
+                                },
+                                "session_id": {"type": "string", "default": ""},
+                            },
+                            "required": ["messages"],
+                        },
+                    },
+                },
+                "required": ["batches"],
+            },
+        ),
     ]
 
 
@@ -246,6 +303,38 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
                 f"facts_saved={result.get('facts_saved', 0)}, "
                 f"status={result.get('status', '?')}"
             )
+
+        elif name == "batch_recall_memory":
+            queries = arguments.get("queries", [])[:5]  # cap at 5
+            session_id = arguments.get("session_id", "")
+            limit = arguments.get("memory_limit_number", 4)
+            tasks = [
+                _post("/recall", {"query": q, "session_id": session_id,
+                                  "memory_limit_number": limit})
+                for q in queries
+            ]
+            results_list = await asyncio.gather(*tasks, return_exceptions=True)
+            contexts: list[str] = []
+            for q, res in zip(queries, results_list):
+                if isinstance(res, Exception):
+                    continue
+                ctx = res.get("prependContext")
+                if ctx:
+                    contexts.append(f"[Query: {q}]\n{ctx}")
+            if contexts:
+                text = "Batch memory context:\n\n" + "\n\n---\n\n".join(contexts)
+            else:
+                text = "(no relevant memories found for any query)"
+
+        elif name == "batch_store_memory":
+            batches = arguments.get("batches", [])
+            tasks = [
+                _post("/store", {"messages": b.get("messages", []),
+                                  "session_id": b.get("session_id", "")})
+                for b in batches
+            ]
+            await asyncio.gather(*tasks, return_exceptions=True)
+            text = f"Batch stored: {len(batches)} conversation turn(s) queued"
 
         else:
             text = f"Unknown tool: {name}"
