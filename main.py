@@ -1170,7 +1170,7 @@ async def recall(req: RecallRequest):
         mem_store.get_session_context(_redis, req.session_id),
         _fetch(mem_store.FACT_KEY,    n_facts,    lang_filter_sym or None),
         _fetch(mem_store.EPISODE_KEY, n_episodes, lang_filter_sym or None),
-        retrieval_planner.analyze_query_structure(req.query),  # symbolic layer (index 5)
+        retrieval_planner.analyze_query_structure(req.query) if (req.query.strip() and req.enable_planning) else asyncio.sleep(0),  # symbolic layer (index 5) — LLM call only when enable_planning=True
         _redis.get(_PINNED_SESSION_KEY),                       # handoff bridge (index 6)
     ]
     if req.include_tools and is_cap_query:

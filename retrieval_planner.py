@@ -34,7 +34,8 @@ from extractor import (
 
 log = logging.getLogger("mem")
 
-_PLAN_TIMEOUT_S = 6.0  # planning generates fewer tokens; 6s is generous
+_PLAN_TIMEOUT_S = 3.0   # planning generates fewer tokens; 3s hard cap keeps recall fast
+_PLAN_MAX_RETRIES = 1   # single attempt — fail fast; retrying multiplies latency
 
 
 async def _llm_call(prompt: str, system: str, max_tokens: int = 300) -> str | None:
@@ -44,7 +45,7 @@ async def _llm_call(prompt: str, system: str, max_tokens: int = 300) -> str | No
     """
     exclude = None
     tried = []
-    for _ in range(LLM_MAX_RETRIES):
+    for _ in range(_PLAN_MAX_RETRIES):
         model, _ = await _resolve_nlp_model(exclude=exclude)
         if model in tried:
             model = AISERV_FALLBACK_MODEL
