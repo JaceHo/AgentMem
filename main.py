@@ -135,9 +135,50 @@ _SKIP_PREFIXES = (
     "[cron:",
 )
 
+# Platform tags that must never be stored as content
+_PLATFORM_TAG_RE = re.compile(
+    r"\[\[reply_to_current\]\]|\[\[reply_to:[^\]]*\]\]",
+    re.IGNORECASE,
+)
+
+# Matches a message that is ONLY a <cross_session_memory> block (possibly followed
+# by whitespace or a HEARTBEAT keyword — nothing real).
+_ONLY_CROSS_SESSION_RE = re.compile(
+    r"^\s*<cross_session_memory>.*?</cross_session_memory>\s*(HEARTBEAT[^\n]*)?\s*$",
+    re.DOTALL | re.IGNORECASE,
+)
+
+# Matches the leading <cross_session_memory>…</cross_session_memory> block so we
+# can strip it and keep whatever real message follows.
+_CROSS_SESSION_PREFIX_RE = re.compile(
+    r"^\s*<cross_session_memory>.*?</cross_session_memory>\s*",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
 def _is_injected(text: str) -> bool:
     t = text.strip()
     return any(t.startswith(p) for p in _SKIP_PREFIXES)
+
+
+def _strip_platform_noise(text: str) -> str:
+    """Remove platform tags and cross_session_memory prefixes from content.
+
+    1. Strip leading <cross_session_memory>…</cross_session_memory> block.
+    2. Remove any remaining [[reply_to_current]] / [[reply_to:<id>]] tags.
+    """
+    # Strip cross_session_memory prefix block (keep real content after it)
+    text = _CROSS_SESSION_PREFIX_RE.sub("", text)
+    # Strip platform reply tags anywhere in the text
+    text = _PLATFORM_TAG_RE.sub("", text)
+    return text.strip()
+
+
+def _is_only_platform_noise(text: str) -> bool:
+    """Return True when the entire message is a cross_session_memory wrapper
+    with no meaningful user content after it (or just a HEARTBEAT line).
+    """
+    return bool(_ONLY_CROSS_SESSION_RE.match(text))
 
 
 # ── Trivial message filter ─────────────────────────────────────────────────────
@@ -311,10 +352,13 @@ class ProcedureFeedbackRequest(BaseModel):
 # ── Helpers ────────────────────────────────────────────────────────────────────
 def _msg_text(m: Message) -> str:
     if isinstance(m.content, str):
-        return m.content.strip()
-    if isinstance(m.content, list):
-        return " ".join(b.get("text","") for b in m.content if isinstance(b, dict)).strip()
-    return ""
+        raw = m.content.strip()
+    elif isinstance(m.content, list):
+        raw = " ".join(b.get("text","") for b in m.content if isinstance(b, dict)).strip()
+    else:
+        return ""
+    # Strip cross_session_memory prefixes and platform tags before returning
+    return _strip_platform_noise(raw)
 
 def _messages_to_text(messages: list[Message]) -> str:
     return "\n".join(
@@ -729,11 +773,28 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
     _store_attempts += 1
     t0 = time.time()
     try:
-        # 1. Filter system-injected and empty messages
+        # 1. Filter system-injected and empty messages.
+        #    _msg_text() strips <cross_session_memory> prefixes and [[platform_tags]]
+        #    before returning text, so purely-noise messages collapse to "" here.
         clean = [m for m in messages if _msg_text(m) and not _is_injected(_msg_text(m))]
         if not clean:
             return
         clean = clean[-4:]   # last 4 messages = last 2 turns (user+assistant pairs)
+
+        # 1b. Check if the raw (pre-strip) user messages were ONLY cross_session_memory
+        #     wrappers — e.g. heartbeat sessions that contain nothing real.
+        raw_user_msgs = [
+            m for m in messages
+            if m.role == "user" and (
+                isinstance(m.content, str) and m.content.strip()
+            )
+        ]
+        if raw_user_msgs and all(
+            _is_only_platform_noise(m.content if isinstance(m.content, str) else "")
+            for m in raw_user_msgs
+        ):
+            log.info("[store] skipped: all user messages are cross_session_memory wrappers")
+            return
 
         # 2. Detect scene from user messages
         user_text_raw = " ".join(_msg_text(m) for m in clean if m.role == "user")
@@ -908,6 +969,12 @@ async def _do_compress_session(session_id: str) -> dict:
     if not ctx or len(ctx) < 80:
         return {"status": "skipped", "reason": "session too short to promote"}
 
+    # Strip platform tags and cross_session_memory wrapping from the accumulated
+    # session context before it is summarised and stored as a long-term episode.
+    ctx = _strip_platform_noise(ctx)
+    if not ctx or len(ctx) < 80:
+        return {"status": "skipped", "reason": "session context empty after noise strip"}
+
     sc = scene_mod.detect(ctx[:500])
     lang, domain = sc["language"], sc["domain"]
 
@@ -949,8 +1016,11 @@ async def _do_compress_session(session_id: str) -> dict:
     await _redis.delete(f"{mem_store.SESSION_PRE}{session_id}:ctx")
 
     # Pin the session summary for the NEXT session's recall (cross-session handoff).
+    # Strip platform tags before persisting — summaries must contain real content only.
     # Stored without TTL so it persists until the next compress overwrites it.
-    await _redis.set(_PINNED_SESSION_KEY, session_summary[:600].encode())
+    clean_summary = _strip_platform_noise(session_summary)
+    if clean_summary:
+        await _redis.set(_PINNED_SESSION_KEY, clean_summary[:600].encode())
 
     log.info(f"[compress] session={session_id} promoted → ep+{ep_saved} facts+{fact_saved}")
     return {

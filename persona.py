@@ -32,6 +32,18 @@ _MAX_FIELD_LEN = 500
 
 # ── Reject patterns — things that must never enter the persona ─────────────────
 
+# Known real user name — any identity claim using a different name is rejected.
+# Update this constant if the user's name changes.
+_KNOWN_USER_NAME = "jace"
+
+# Garbage "name" patterns: the literal phrase "my name is" used as a value,
+# placeholder names from test sessions, or clearly fake/template identity strings.
+_GARBAGE_NAME_PATTERNS = re.compile(
+    r"(^我的名字是\s*$|^my name is\s*$|^name\s*$|^unnamed\s*$|^unknown\s*$|"
+    r"^user\s*$|^test\s*$|^example\s*$|^placeholder\s*$)",
+    re.I | re.UNICODE,
+)
+
 # AI self-reference: sentences about Claude/assistant, not the user
 _AI_PATTERNS = re.compile(
     r"(the assistant|claude|i'?m (the|a|an|running|using|ready|sorry|not able|claude)|"
@@ -70,6 +82,42 @@ def _should_reject(content: str) -> bool:
         return True
     if _STATUS_PATTERNS.search(c):
         return True
+    return False
+
+
+def _should_reject_name(content: str) -> bool:
+    """Return True if this identity/name fact should NOT update the name field.
+
+    Rejects:
+    - The literal phrase "我的名字是" / "my name is" used as the name value itself
+      (regex captured the wrong group from a Chinese identity pattern).
+    - Names that do not match the known real user (_KNOWN_USER_NAME).
+      Any name that is clearly not "Jace" (case-insensitive) and is not a
+      meaningful description of Jace is blocked.
+
+    We check conservatively: if the content contains the known name we allow it;
+    if it contains a GARBAGE_NAME pattern we always reject it.
+    """
+    c = content.strip()
+    # Always reject obvious garbage captures
+    if _GARBAGE_NAME_PATTERNS.search(c):
+        return True
+    # Reject if "我的名字是" appears as content (the regex matched the phrase itself,
+    # not an actual name — e.g. "我的名字是" with nothing after it).
+    if "我的名字是" in c and _KNOWN_USER_NAME.lower() not in c.lower():
+        return True
+    # Reject if this looks like an identity statement for someone other than the
+    # known user. We look for explicit name introductions with a name that is not
+    # the known user. This catches "my name is <foreign-name>" patterns.
+    _name_intro = re.compile(
+        r"(?:my name is|i(?:'m| am)|我叫|我的名字是)\s+([^\s，。！\n]{1,30})",
+        re.I | re.UNICODE,
+    )
+    for m in _name_intro.finditer(c):
+        extracted_name = m.group(1).strip().lower()
+        # If the extracted name doesn't contain the known user name, reject
+        if extracted_name and _KNOWN_USER_NAME.lower() not in extracted_name:
+            return True
     return False
 
 
@@ -122,6 +170,16 @@ async def update(r: aioredis.Redis, category: str, content: str) -> None:
     content = content.replace("\n", " ").replace("\r", " ").strip()
 
     if _should_reject(content):
+        return
+
+    # Extra guard for the name/identity field: reject fake or garbage user names.
+    # This prevents test-session data (e.g. "我的名字是", Firebase test users) from
+    # overwriting the real user's identity.
+    if field == "name" and _should_reject_name(content):
+        import logging as _logging
+        _logging.getLogger("mem").warning(
+            "[persona] rejected bad name fact: %r", content[:80]
+        )
         return
 
     existing_raw = await r.hget(PERSONA_KEY, field)
