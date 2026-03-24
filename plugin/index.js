@@ -207,6 +207,31 @@ export default {
       }
     });
 
+    // ── Helpers: platform-noise detection ───────────────────────────────────
+    /**
+     * Returns true when a string is ONLY a <cross_session_memory>…</cross_session_memory>
+     * block, optionally followed by a HEARTBEAT line — i.e. no real user content.
+     */
+    const isOnlyCrossSessionMemory = (text) => {
+      if (typeof text !== "string") return false;
+      return /^\s*<cross_session_memory>[\s\S]*?<\/cross_session_memory>\s*(HEARTBEAT[^\n]*)?\s*$/i.test(text);
+    };
+
+    /**
+     * Returns true if ALL user messages in the session are cross_session_memory-only
+     * wrappers with no meaningful content after them.
+     */
+    const isSessionAllNoise = (msgs) => {
+      const userMsgs = msgs.filter(m => m?.role === "user");
+      if (!userMsgs.length) return false;
+      const contentOf = (m) => typeof m.content === "string"
+        ? m.content
+        : (Array.isArray(m.content)
+            ? m.content.map(b => b?.text ?? "").join(" ")
+            : "");
+      return userMsgs.every(m => isOnlyCrossSessionMemory(contentOf(m)));
+    };
+
     // ── agent_end: compact + store + promote Tier 1 → Tier 2 + TIG ─────────
     api.on("agent_end", async (event, ctx) => {
       // v0.5.2: Store even on failure — partial/timeout sessions contain valuable
@@ -214,6 +239,13 @@ export default {
       const messages  = event?.messages;
       const sessionId = ctx?.sessionId ?? ctx?.sessionKey ?? "";
       if (!messages?.length) return;
+
+      // Skip sessions that are purely cross_session_memory wrappers — these are
+      // recursive injections with no real user content and would create feedback loops.
+      if (isSessionAllNoise(messages)) {
+        log.info?.(`${tag} skipped store: session is all cross_session_memory wrappers`);
+        return;
+      }
 
       // 1. Queue turn storage (async background, non-blocking)
       // v0.5.2: Log failures instead of silently swallowing them.
