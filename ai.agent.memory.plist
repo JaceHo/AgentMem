@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.agent.memory</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/jace/code/agentmem/agentmem.sh</string>
+    <string>start-fg</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/jace/code/agentmem</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <!-- 5s throttle: enough time for port release after crash/kill -->
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/jace/.openclaw/logs/memory-stdout.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/jace/.openclaw/logs/memory-stderr.log</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- Prevent tokenizer parallelism → eliminates semaphore leak on shutdown -->
+    <key>TOKENIZERS_PARALLELISM</key>
+    <string>false</string>
+    <!-- Single-threaded OMP → no multiprocessing semaphores to leak -->
+    <key>OMP_NUM_THREADS</key>
+    <string>1</string>
+    <key>MKL_NUM_THREADS</key>
+    <string>1</string>
+    <!-- Offline model loading (no HuggingFace network calls) -->
+    <key>HF_HUB_OFFLINE</key>
+    <string>1</string>
+    <key>TRANSFORMERS_OFFLINE</key>
+    <string>1</string>
+    <!-- PATH: launchd does not inherit user PATH; include homebrew so uv is found -->
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <!-- uv: reuse existing venv/ instead of creating .venv — avoids re-install on kickstart -->
+    <key>UV_PROJECT_ENVIRONMENT</key>
+    <string>/Users/jace/code/agentmem/venv</string>
+    <!-- NOTE: ZAI_API_KEY and ZAI_PROXY are intentionally NOT set here.
+         They are read fresh from .env on every extraction call,
+         enabling zero-downtime key rotation without launchctl reload. -->
+    <!-- A-MAC admission threshold: 0.15 for normal operation.
+         Dev conversations score 0.10-0.20 (typ=0.00, HIGH_VALUE_RE rarely fires).
+         0.05 was used for initial bulk re-digest; 0.15 filters pure noise. -->
+    <key>AMAC_THRESHOLD</key>
+    <string>0.15</string>
+  </dict>
+</dict>
+</plist>
