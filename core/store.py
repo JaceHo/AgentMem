@@ -65,7 +65,7 @@ async def ensure_indexes(r: aioredis.Redis) -> None:
             await r.execute_command("VADD", key, "FP32", _blob(seed), "__seed__",
                                     "SETATTR", attr)
     # Tool capability vectorset
-    from capability import ensure_tool_index
+    from .capability import ensure_tool_index
     await ensure_tool_index(r, DIMS)
     # Procedural memory vectorset
     card = await r.execute_command("VCARD", PROC_KEY)
@@ -141,7 +141,7 @@ async def knn_search(
 
         if bump_heat:
             import asyncio
-            from heat import bump_heat as _bump
+            from .heat import bump_heat as _bump
             asyncio.create_task(_bump(r, vset_key, elem_str, attrs))
 
     return items

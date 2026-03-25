@@ -122,7 +122,7 @@ async def entity_recall(
 
     Returns up to *k* fact dicts with {content, category, score, attrs}.
     """
-    import store as mem_store
+    from . import store as mem_store
 
     related = await get_related(r, entity, depth=1)
     if not related:
@@ -196,7 +196,7 @@ async def find_bridge_nodes(
     Returns bridge fact dicts (same shape as knn_search results) annotated
     with {"_bridge": True}.
     """
-    import store as mem_store
+    from . import store as mem_store
 
     if len(terminal_facts) < 2:
         return []
@@ -284,7 +284,7 @@ async def get_entity_neighbors_with_counts(
     Each result: {"entity": slug, "fact_count": N}
     Fact count is estimated by SMEMBERS of that entity's graph key.
     """
-    import store as mem_store
+    from . import store as mem_store
 
     related_slugs_raw = await r.smembers(_key(entity))
     related_slugs = [

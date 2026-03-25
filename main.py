@@ -92,17 +92,17 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-import capability as cap_mod
-import embedder
-import extractor
-import graph as graph_mod
-import heat as heat_mod
-import log_sse
-import persona as persona_mod
-import retrieval_planner
-import scene as scene_mod
-import store as mem_store
-import summarizer
+from core import capability as cap_mod
+from core import embedder
+from core import extractor
+from core import graph as graph_mod
+from core import heat as heat_mod
+from core import log_sse
+from core import persona as persona_mod
+from core import retrieval_planner
+from core import scene as scene_mod
+from core import store as mem_store
+from core import summarizer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [mem] %(message)s")
 log = logging.getLogger("mem")

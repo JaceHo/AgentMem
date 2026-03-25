@@ -27,7 +27,7 @@ import logging
 
 import httpx
 
-from extractor import (
+from .extractor import (
     AISERV_URL, AISERV_KEY, LLM_TIMEOUT_S, LLM_MAX_RETRIES,
     _resolve_nlp_model, AISERV_FALLBACK_MODEL, _parse_llm_json,
 )

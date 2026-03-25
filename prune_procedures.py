@@ -22,7 +22,7 @@ import redis.asyncio as aioredis
 
 # Use local MiniLM embedder (same model as agentmem service)
 sys.path.insert(0, "/Users/jace/code/agentmem")
-import embedder as _embedder
+from core import embedder as _embedder
 
 REDIS_URL = "redis://localhost:6379"
 PROC_KEY  = "mem:procedures"
