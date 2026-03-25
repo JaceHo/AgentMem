@@ -6,7 +6,7 @@ Works with Claude Code, OpenClaw, LangChain, LangGraph, CrewAI, AutoGen — or a
 [![Version](https://img.shields.io/badge/version-1.0.0-blue)](.) [![A-MAC](https://img.shields.io/badge/algorithm-A--MAC%20%2B%20wRRF-brightgreen)](https://arxiv.org/abs/2603.04549) [![Redis 8](https://img.shields.io/badge/backend-Redis%208%20HNSW-red)](https://redis.io) [![License](https://img.shields.io/badge/license-MIT-yellow)](.)
 
 ```
-LLM-F1: 76.34%  │  P50 recall latency: 1.7ms  │  AIC: 97.9%  │  Cost: $0/month
+LLM-F1: 76.34%†  │  P50 recall latency: 1.7ms  │  AIC: 97.9%  │  Cost: $0/month
 Episodes: 341  │  Facts: 141  │  Procedures: 281  │  Tools: 32
 ```
 
@@ -35,7 +35,7 @@ Episodes: 341  │  Facts: 141  │  Procedures: 281  │  Tools: 32
 | **CJK / Chinese support** | ❌ | ❌ | ✅ |
 | **MCP server** | ✅ | ❌ | ✅ |
 | **LangChain / LangGraph / CrewAI / AutoGen** | ❌ | Partial | ✅ |
-| **Benchmark F1** | — | 34.20% | **76.34%** |
+| **Benchmark F1** | — | 34.20% | **76.34%†** |
 
 **The short version:** SuperMemory is a great bookmark/knowledge-search tool for humans. AgentMem is built from scratch for AI agents that need to remember — architecture, costs, and privacy included.
 
@@ -68,21 +68,31 @@ Episodes: 341  │  Facts: 141  │  Procedures: 281  │  Tools: 32
 | **CJK / Chinese** | ❌ | ❌ | ❌ | ❌ | ✅ |
 | **MCP server** | ❌ | ✅ | ✅ | ❌ | ✅ |
 | **LangChain / LangGraph / CrewAI / AutoGen** | Partial | ❌ | ❌ | ❌ | ✅ |
-| **Benchmark F1** | 34.20% | 43.24% | ❌ | ❌ | **76.34%** |
+| **Benchmark F1** | 34.20% | 43.24% | ❌ | ❌ | **76.34%†** |
 
 ---
 
 ## Benchmark
 
-> ⚠️ AgentMem's 76.34% is on an **internal bench** (8 convs, 47 Q/A, flush-between-sessions). SimpleMem/AriadneMem scores are on the harder published LoCoMo dataset (500 convs). Not directly comparable. Run `bench-f1.py --flush-between-sessions` to reproduce.
+**Published baselines — real LoCoMo dataset (500 convs, GPT-4 answer extractor):**
 
-| System | LLM-F1 | Dataset |
-|--------|:------:|---------|
-| Full Context | 18.70% | real LoCoMo |
-| Mem0 | 34.20% | real LoCoMo |
-| SimpleMem | 43.24% | real LoCoMo |
-| AriadneMem | 46.30% | real LoCoMo (published SOTA) |
-| **AgentMem** | **76.34%** | internal (8 convs) |
+| System | LLM-F1 | Source |
+|--------|:------:|--------|
+| Full Context | 18.70% | [SimpleMem paper](https://arxiv.org/abs/2601.02553) |
+| A-Mem | 32.58% | [SimpleMem paper](https://arxiv.org/abs/2601.02553) |
+| Mem0 | 34.20% | [SimpleMem paper](https://arxiv.org/abs/2601.02553) |
+| SimpleMem | 43.24% | [SimpleMem paper](https://arxiv.org/abs/2601.02553) |
+| AriadneMem | **46.30%** | [AriadneMem paper](https://arxiv.org/abs/2603.03290) — SOTA |
+
+**AgentMem — internal bench† (8 convs, 47 Q/A, flush-between-sessions):**
+
+| System | LLM-F1 | Context-F1 | AIC | Recall@1 |
+|--------|:------:|:----------:|:---:|:--------:|
+| No Memory | 0% | 0% | 0% | 0% |
+| Full Context oracle | — | 36.96% | 100% | 100% |
+| **AgentMem** | **76.34%†** | **34.59%** | **97.9%** | **100%** |
+
+> **†** Not directly comparable to published numbers. Different dataset (8 vs 500 convs), different answer extractor (Kimi-K2.5 vs GPT-4), and no official LoCoMo test split. Context-F1 and AIC are dataset-agnostic retrieval quality metrics. Run `bench-f1.py --flush-between-sessions` to reproduce.
 
 ---
 
