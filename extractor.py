@@ -174,6 +174,26 @@ async def _resolve_nlp_model(exclude: Optional[str] = None) -> tuple[str, str]:
     return AISERV_FALLBACK_MODEL, "fast"
 
 
+async def _resolve_qa_model(exclude: Optional[str] = None) -> tuple[str, str]:
+    """Ask aiserv for the best QA model right now. Returns (model_id, tier).
+
+    Uses /v1/role/qa which routes to stronger reasoning models (Kimi-K2.5,
+    DeepSeek-V3.2, sn) compared to nlp role. Better for answer extraction.
+    """
+    try:
+        url = f"{AISERV_BASE}/v1/role/qa"
+        if exclude:
+            url += f"?exclude={exclude}"
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            resp = await client.get(url, headers={"Authorization": f"Bearer {AISERV_KEY}"})
+            if resp.status_code == 200:
+                d = resp.json()
+                return d.get("model", AISERV_FALLBACK_MODEL), d.get("tier", "fast")
+    except Exception as e:
+        log.debug("[extractor] qa role API failed: %s", e)
+    return AISERV_FALLBACK_MODEL, "fast"
+
+
 async def _report_quality(model: str, score: int) -> None:
     """Fire-and-forget: push quality signal to aiserv health matrix.
 
@@ -335,7 +355,7 @@ async def _llm_extract(conversation_text: str) -> list[ExtractedFact]:
                     AISERV_URL,
                     json={
                         "model":      model,
-                        "max_tokens": 800,
+                        "max_tokens": 1500,
                         "messages": [
                             {"role": "system", "content": (
                                 "You are a professional memory extraction assistant. "

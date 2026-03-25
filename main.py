@@ -1104,8 +1104,26 @@ async def answer(req: AnswerRequest):
     if not req.context.strip():
         return {"answer": ""}
 
-    # Use live role-based routing so the health matrix picks the best model.
-    model, _ = await extractor._resolve_nlp_model()
+    def _parse_answer_raw(raw: str) -> str:
+        """Parse JSON answer from LLM response, handling fences and both shapes."""
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+        obj_start = raw.find("{")
+        arr_start = raw.find("[")
+        starts = [x for x in [obj_start, arr_start] if x != -1]
+        if not starts:
+            return ""
+        start = min(starts)
+        end_ch = "}" if raw[start] == "{" else "]"
+        end = raw.rfind(end_ch)
+        if end == -1:
+            return ""
+        parsed = json.loads(raw[start:end + 1])
+        if isinstance(parsed, dict):
+            return str(parsed.get("answer", ""))
+        if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
+            return str(parsed[0].get("answer", ""))
+        return ""
 
     prompt = (
         f"Based only on the following memory context, answer the question concisely "
@@ -1114,46 +1132,49 @@ async def answer(req: AnswerRequest):
         f"Question: {req.query}\n\n"
         f'Return JSON: {{"answer": "<exact phrase from context>"}}'
     )
-    try:
-        async with httpx.AsyncClient(timeout=8.0) as client:
-            resp = await client.post(
-                _AISERV_OAI,
-                json={
-                    "model": model,
-                    "messages": [
-                        {"role": "system", "content": "You are a precise question-answering assistant. Extract the exact answer phrase from the provided context. Output valid JSON only."},
-                        {"role": "user",   "content": prompt},
-                    ],
-                    "temperature": 0.0,
-                    "max_tokens": 80,
-                },
-                headers={"Authorization": f"Bearer {_AISERV_KEY}"},
-            )
-        if resp.status_code == 200:
-            raw = resp.json()["choices"][0]["message"]["content"].strip()
-            # Strip markdown code fences (glm-4-plus wraps JSON in ```json...```)
-            if raw.startswith("```"):
-                raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-            # Parse JSON object or array — _parse_llm_json only handles arrays,
-            # so we parse directly here to support both response shapes.
-            obj_start = raw.find("{")
-            arr_start = raw.find("[")
-            start = min(x for x in [obj_start, arr_start] if x != -1) if any(x != -1 for x in [obj_start, arr_start]) else -1
-            if start != -1:
-                end_ch = "}" if raw[start] == "{" else "]"
-                end = raw.rfind(end_ch)
-                if end != -1:
-                    parsed = json.loads(raw[start:end + 1])
-                    if isinstance(parsed, dict):
-                        return {"answer": str(parsed.get("answer", ""))}
-                    elif isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
-                        return {"answer": str(parsed[0].get("answer", ""))}
-    except httpx.TimeoutException:
-        log.warning("[answer] %s timed out", model)
-        asyncio.create_task(extractor._report_quality(model, -1))
-    except Exception as e:
-        log.debug(f"[answer] LLM extraction failed: {e}")
-        asyncio.create_task(extractor._report_quality(model, -1))
+    system_msg = ("You are a precise question-answering assistant. "
+                  "Extract the exact answer phrase from the provided context. "
+                  "Output valid JSON only.")
+
+    # Two attempts: first with best QA model (qa role = stronger reasoning),
+    # retry with fallback on timeout/failure.
+    tried: list[str] = []
+    exclude: str | None = None
+    for attempt in range(2):
+        model, _ = await extractor._resolve_qa_model(exclude=exclude)
+        if model in tried:
+            break
+        tried.append(model)
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                resp = await client.post(
+                    _AISERV_OAI,
+                    json={
+                        "model": model,
+                        "messages": [
+                            {"role": "system", "content": system_msg},
+                            {"role": "user",   "content": prompt},
+                        ],
+                        "temperature": 0.0,
+                        "max_tokens": 80,
+                    },
+                    headers={"Authorization": f"Bearer {_AISERV_KEY}"},
+                )
+            if resp.status_code == 200:
+                raw = resp.json()["choices"][0]["message"]["content"].strip()
+                answer = _parse_answer_raw(raw)
+                if answer:
+                    asyncio.create_task(extractor._report_quality(model, +1))
+                    return {"answer": answer}
+            exclude = model
+        except httpx.TimeoutException:
+            log.warning("[answer] %s timed out (attempt %d)", model, attempt + 1)
+            asyncio.create_task(extractor._report_quality(model, -1))
+            exclude = model
+        except Exception as e:
+            log.debug("[answer] %s failed: %s", model, e)
+            asyncio.create_task(extractor._report_quality(model, -1))
+            exclude = model
     return {"answer": ""}
 
 
@@ -1469,6 +1490,24 @@ async def recall(req: RecallRequest):
                         facts.append(gf)
                         seen_contents.add(gf["content"])
             facts = facts[:n_facts + 3]
+
+    # AriadneMem Steiner tree bridge discovery (arXiv:2603.03290 §3.3):
+    # Find facts that structurally bridge pairs of retrieved terminal facts.
+    # Fires when include_graph=True and we have ≥2 retrieved facts.
+    # Deterministic — no extra LLM call, single graph+vector pass.
+    if (req.include_graph or _auto_graph_trigger) and len(facts) >= 2:
+        try:
+            bridge_facts = await graph_mod.find_bridge_nodes(_redis, facts, emb, k=3)
+            if bridge_facts:
+                seen_bridge = {f["content"] for f in facts}
+                for bf in bridge_facts:
+                    if bf["content"] not in seen_bridge:
+                        facts.append(bf)
+                        seen_bridge.add(bf["content"])
+                facts = facts[:n_facts + 5]
+                log.debug(f"[recall] bridge discovery: +{len(bridge_facts)} bridge nodes")
+        except Exception as _be:
+            log.debug(f"[recall] bridge discovery skipped: {_be}")
 
     # AutoTool TIG: get transition hints from most-used recalled tool (v0.9.5)
     tig_hints: list[str] = []

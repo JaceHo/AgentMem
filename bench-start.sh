@@ -59,7 +59,7 @@ export AMAC_THRESHOLD="0.05"
 
 # ── foreground mode ───────────────────────────────────────────────────────────
 if [ "$1" = "--fg" ]; then
-    uv run uvicorn main:app \
+    venv/bin/uvicorn main:app \
         --host 127.0.0.1 \
         --port $BENCH_PORT \
         --log-level info
@@ -67,7 +67,7 @@ if [ "$1" = "--fg" ]; then
 fi
 
 # ── background mode ───────────────────────────────────────────────────────────
-uv run uvicorn main:app \
+venv/bin/uvicorn main:app \
     --host 127.0.0.1 \
     --port $BENCH_PORT \
     --log-level warning \

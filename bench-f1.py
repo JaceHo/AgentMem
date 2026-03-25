@@ -28,7 +28,7 @@ Usage:
   # Run full evaluation
   python3 bench-f1.py
 
-  # Quick smoke test (first 10 questions only)
+  # Quick smoke test (first 3 conversations only)
   python3 bench-f1.py --quick
 
   # Verbose: show per-question results
@@ -36,6 +36,9 @@ Usage:
 
   # Skip store phase (re-use previously stored data)
   python3 bench-f1.py --no-store
+
+  # Isolated mode: flush persona+facts between sessions (correct for multi-persona datasets)
+  python3 bench-f1.py --flush-between-sessions
 """
 
 import argparse
@@ -352,7 +355,7 @@ def context_f1(context: str, ground_truth: str) -> float:
     Tokens are language-aware: CJK chars are individual tokens, English words
     are space-separated. Window of 10 tokens works for both languages.
     """
-    context = _strip_memory_wrapper(context)
+    context = _strip_memory_wrapper(context or "")
     if not context.strip():
         return 0.0
     # Use normalized (language-aware) token list
@@ -465,31 +468,65 @@ def flush_bench_db(api: str) -> bool:
         return False
 
 
-def wait_for_processing(api: str, seconds: int = 30) -> None:
-    """Wait for AgentMem async store queue to drain."""
-    print(f"  Waiting {seconds}s for async store + LLM extraction…", end=" ", flush=True)
+def wait_for_processing(api: str, seconds: int = 50, consolidate: bool = False) -> None:
+    """Wait for AgentMem async store queue to drain, then optionally consolidate.
+
+    Stops early once both episodes AND facts have been stable for 2 consecutive
+    polls (3s each), ensuring extraction is complete without over-waiting.
+    After stabilisation, calls /consolidate/sync if consolidate=True to run
+    SimpleMem Stage 2 online synthesis (merge related fragments immediately).
+    """
+    print(f"  Waiting up to {seconds}s for async store + LLM extraction…", end=" ", flush=True)
     deadline = time.time() + seconds
-    prev_ep = -1
+    prev_ep, prev_fa = -1, -1
+    stable_count = 0
+
     while time.time() < deadline:
         time.sleep(3)
         try:
             with urllib.request.urlopen(f"{api}/stats", timeout=3) as r:
                 s = json.loads(r.read())
             ep, fa = s.get("episodes", 0), s.get("facts", 0)
-            if ep != prev_ep:
+            if ep != prev_ep or fa != prev_fa:
                 print(f"\n    episodes={ep}, facts={fa}", end=" ", flush=True)
-                prev_ep = ep
+                prev_ep, prev_fa = ep, fa
+                stable_count = 0
+            else:
+                stable_count += 1
+                # Both counters stable for 2 polls (6s) — extraction complete
+                if stable_count >= 2 and ep > 0:
+                    break
         except Exception:
             pass
+
     try:
         with urllib.request.urlopen(f"{api}/stats", timeout=3) as r:
             s = json.loads(r.read())
         ep, fa = s.get("episodes", 0), s.get("facts", 0)
         print(f"\n  done. Final: episodes={ep}, facts={fa}")
-        if ep < 3:
-            print("  ⚠️  Very few episodes stored — check service log or lower AMAC_THRESHOLD.")
+        if ep == 0:
+            print("  ⚠️  No episodes stored — check service log or AMAC_THRESHOLD.")
+        elif fa == 0:
+            print("  ⚠️  No facts extracted — LLM extractor may have timed out.")
     except Exception:
         print("\n  done.")
+
+    # SimpleMem Stage 2: trigger consolidation to merge related fragments
+    if consolidate:
+        try:
+            req = urllib.request.Request(
+                f"{api}/consolidate/sync",
+                data=b"{}",
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=30) as r:
+                result = json.loads(r.read())
+            merged = result.get("merged", 0)
+            if merged:
+                print(f"  Consolidation: merged {merged} fact cluster(s).")
+        except Exception as e:
+            print(f"  Consolidation skipped: {e}")
 
 
 # ── benchmark runner ─────────────────────────────────────────────────────────
@@ -541,7 +578,69 @@ class SystemResult:
         return sum(self.token_counts) / len(self.token_counts) if self.token_counts else 0.0
 
 
-def run_benchmark(quick: bool, verbose: bool, no_store: bool) -> None:
+def _eval_question(
+    systems: dict,
+    session_id: str,
+    turns: list,
+    question: str,
+    ground_truth: str,
+    idx: int,
+    verbose: bool,
+) -> None:
+    """Evaluate one question across all systems and append results in-place."""
+    # No-memory baseline
+    t0 = time.perf_counter()
+    nm_ctx = ""
+    nm_f1  = context_f1(nm_ctx, ground_truth)
+    nm_aic = answer_in_context(nm_ctx, ground_truth)
+    nm_ms  = (time.perf_counter() - t0) * 1000
+    systems["no_memory"].f1_scores.append(nm_f1)
+    systems["no_memory"].aic_scores.append(nm_aic)
+    systems["no_memory"].latencies_ms.append(nm_ms)
+    systems["no_memory"].token_counts.append(0)
+
+    # Full-context oracle
+    t0 = time.perf_counter()
+    fc_ctx = full_context(turns)
+    fc_f1  = context_f1(fc_ctx, ground_truth)
+    fc_aic = answer_in_context(fc_ctx, ground_truth)
+    fc_ms  = (time.perf_counter() - t0) * 1000
+    systems["full_context"].f1_scores.append(fc_f1)
+    systems["full_context"].aic_scores.append(fc_aic)
+    systems["full_context"].latencies_ms.append(fc_ms)
+    systems["full_context"].token_counts.append(len(_normalize(fc_ctx).split()))
+
+    # AgentMem recall
+    t0 = time.perf_counter()
+    am_ctx    = recall_context(BENCH_API, question, session_id) or ""
+    am_f1     = context_f1(am_ctx, ground_truth)
+    am_aic    = answer_in_context(am_ctx, ground_truth)
+    am_ms     = (time.perf_counter() - t0) * 1000
+    # LLM-extracted F1: mirrors SimpleMem's AnswerGenerator (comparable to published)
+    # Brief pause: let aiserv settle after the recall LLM calls (planning+reflection)
+    # before submitting the /answer LLM call, avoiding parallel-queue timeouts.
+    time.sleep(1.5)
+    am_answer = extract_answer_llm(BENCH_API, question, am_ctx)
+    am_llm_f1 = token_f1(am_answer, ground_truth) if am_answer else 0.0
+    systems["agentmem"].f1_scores.append(am_f1)
+    systems["agentmem"].llm_f1_scores.append(am_llm_f1)
+    systems["agentmem"].aic_scores.append(am_aic)
+    systems["agentmem"].latencies_ms.append(am_ms)
+    systems["agentmem"].token_counts.append(len(_normalize(am_ctx).split()))
+
+    q_short  = (question[:36] + "…") if len(question) > 36 else question
+    gt_short = (ground_truth[:14] + "…") if len(ground_truth) > 14 else ground_truth
+    aic_mark = "✓" if am_aic else "✗"
+    llm_mark = f"{am_llm_f1:.2f}" if am_answer else "—"
+    print(f"{idx:>3}  {q_short:<38}  {gt_short:<16}  "
+          f"{fc_aic!s:<5}  {am_f1:>6.3f}  {aic_mark}  LLM-F1:{llm_mark}")
+
+    if verbose:
+        print(f"      [recalled]: {am_ctx[:150].strip()!r}")
+
+
+def run_benchmark(quick: bool, verbose: bool, no_store: bool,
+                  flush_between_sessions: bool = False) -> None:
     print("\n" + "═" * 65)
     print("  AgentMem LoCoMo-style F1 Benchmark")
     print("═" * 65)
@@ -565,97 +664,85 @@ def run_benchmark(quick: bool, verbose: bool, no_store: bool) -> None:
         for q, gt in conv["qa"]:
             all_qa.append((conv["session_id"], conv["turns"], q, gt))
 
-    print(f"\nDataset : {len(conversations)} conversations, {len(all_qa)} Q/A pairs")
-    print(f"Mode    : {'quick (first 3 convs)' if quick else 'full'}")
+    total_q = len(all_qa)
+    print(f"\nDataset : {len(conversations)} conversations, {total_q} Q/A pairs")
+    if flush_between_sessions:
+        print(f"Mode    : flush-between-sessions (isolated persona per conversation)")
+    elif quick:
+        print(f"Mode    : quick (first 3 convs)")
+    else:
+        print(f"Mode    : full")
     print()
 
-    # ── store phase ───────────────────────────────────────────────────
-    if not no_store:
-        print("Phase 1 — Flushing benchmark db…", end=" ", flush=True)
-        flush_bench_db(BENCH_API)
-        print("done.")
-
-        total_pairs = sum(len(c["turns"]) // 2 for c in conversations)
-        print(f"Phase 2 — Storing {len(conversations)} conversations ({total_pairs} turn pairs)…")
-        for conv in conversations:
-            n_pairs = len(conv["turns"]) // 2
-            ok = store_session(BENCH_API, conv["session_id"], conv["turns"])
-            status = "ok" if ok else "FAIL"
-            print(f"  {conv['session_id']}  {n_pairs} pairs  [{status}]")
-
-        wait_for_processing(BENCH_API, seconds=75)
-    else:
-        print("Skipping store phase (--no-store).")
-
-    # ── evaluation ────────────────────────────────────────────────────
+    # ── shared systems accumulator ────────────────────────────────────
     systems: dict[str, SystemResult] = {
         "no_memory":    SystemResult("no_memory"),
         "full_context": SystemResult("full_context"),
         "agentmem":     SystemResult("agentmem"),
     }
 
-    # Pre-eval: check what's stored
-    try:
-        with urllib.request.urlopen(f"{BENCH_API}/stats", timeout=3) as r:
-            st = json.loads(r.read())
-        print(f"\nPre-eval memory state: episodes={st.get('episodes',0)}, "
-              f"facts={st.get('facts',0)}, persona={st.get('persona_fields',0)}")
-    except Exception:
-        pass
-
-    print(f"\nPhase 3 — Evaluating {len(all_qa)} questions…\n")
     header = f"{'#':>3}  {'Question':<40}  {'GT':<16}  {'FC?':<5}  {'F1':>6}  {'AIC'}"
     print(header)
     print("-" * len(header))
     print("  (FC?=answer in full-context oracle, F1=context-F1, AIC=Answer In Context ✓/✗)")
 
-    for idx, (session_id, turns, question, ground_truth) in enumerate(all_qa, 1):
-        # No-memory baseline
-        t0 = time.perf_counter()
-        nm_ctx = ""
-        nm_f1  = context_f1(nm_ctx, ground_truth)
-        nm_aic = answer_in_context(nm_ctx, ground_truth)
-        nm_ms  = (time.perf_counter() - t0) * 1000
-        systems["no_memory"].f1_scores.append(nm_f1)
-        systems["no_memory"].aic_scores.append(nm_aic)
-        systems["no_memory"].latencies_ms.append(nm_ms)
-        systems["no_memory"].token_counts.append(0)
+    # ── flush-between-sessions mode ───────────────────────────────────
+    if flush_between_sessions:
+        idx = 1
+        for conv in conversations:
+            sid = conv["session_id"]
+            n_pairs = len(conv["turns"]) // 2
 
-        # Full-context oracle
-        t0 = time.perf_counter()
-        fc_ctx = full_context(turns)
-        fc_f1  = context_f1(fc_ctx, ground_truth)
-        fc_aic = answer_in_context(fc_ctx, ground_truth)
-        fc_ms  = (time.perf_counter() - t0) * 1000
-        systems["full_context"].f1_scores.append(fc_f1)
-        systems["full_context"].aic_scores.append(fc_aic)
-        systems["full_context"].latencies_ms.append(fc_ms)
-        systems["full_context"].token_counts.append(len(_normalize(fc_ctx).split()))
+            print(f"\n  ── {sid} ({'quick' if quick else 'full'}) ──")
+            if not no_store:
+                print(f"  Flushing db…", end=" ", flush=True)
+                flush_bench_db(BENCH_API)
+                print("done.")
+                ok = store_session(BENCH_API, sid, conv["turns"])
+                print(f"  Stored {n_pairs} pairs  [{'ok' if ok else 'FAIL'}]")
+                wait_for_processing(BENCH_API, seconds=50, consolidate=True)
+            else:
+                print("  (--no-store: skipping flush+store)")
 
-        # AgentMem recall
-        t0 = time.perf_counter()
-        am_ctx    = recall_context(BENCH_API, question, session_id)
-        am_f1     = context_f1(am_ctx, ground_truth)
-        am_aic    = answer_in_context(am_ctx, ground_truth)
-        am_ms     = (time.perf_counter() - t0) * 1000
-        # LLM-extracted F1: mirrors SimpleMem's AnswerGenerator (comparable to published)
-        am_answer = extract_answer_llm(BENCH_API, question, am_ctx)
-        am_llm_f1 = token_f1(am_answer, ground_truth) if am_answer else 0.0
-        systems["agentmem"].f1_scores.append(am_f1)
-        systems["agentmem"].llm_f1_scores.append(am_llm_f1)
-        systems["agentmem"].aic_scores.append(am_aic)
-        systems["agentmem"].latencies_ms.append(am_ms)
-        systems["agentmem"].token_counts.append(len(_normalize(am_ctx).split()))
+            for question, ground_truth in conv["qa"]:
+                _eval_question(systems, sid, conv["turns"], question, ground_truth, idx, verbose)
+                idx += 1
 
-        q_short  = (question[:36] + "…") if len(question) > 36 else question
-        gt_short = (ground_truth[:14] + "…") if len(ground_truth) > 14 else ground_truth
-        aic_mark = "✓" if am_aic else "✗"
-        llm_mark = f"{am_llm_f1:.2f}" if am_answer else "—"
-        print(f"{idx:>3}  {q_short:<38}  {gt_short:<16}  "
-              f"{fc_aic!s:<5}  {am_f1:>6.3f}  {aic_mark}  LLM-F1:{llm_mark}")
+        # Final flush so bench db is clean after run
+        flush_bench_db(BENCH_API)
 
-        if verbose:
-            print(f"      [recalled]: {am_ctx[:150].strip()!r}")
+    # ── bulk mode (original) ──────────────────────────────────────────
+    else:
+        if not no_store:
+            print("Phase 1 — Flushing benchmark db…", end=" ", flush=True)
+            flush_bench_db(BENCH_API)
+            print("done.")
+
+            total_pairs = sum(len(c["turns"]) // 2 for c in conversations)
+            print(f"Phase 2 — Storing {len(conversations)} conversations ({total_pairs} turn pairs)…")
+            for conv in conversations:
+                n_pairs = len(conv["turns"]) // 2
+                ok = store_session(BENCH_API, conv["session_id"], conv["turns"])
+                status = "ok" if ok else "FAIL"
+                print(f"  {conv['session_id']}  {n_pairs} pairs  [{status}]")
+
+            wait_for_processing(BENCH_API, seconds=90, consolidate=True)
+        else:
+            print("Skipping store phase (--no-store).")
+
+        # Pre-eval: check what's stored
+        try:
+            with urllib.request.urlopen(f"{BENCH_API}/stats", timeout=3) as r:
+                st = json.loads(r.read())
+            print(f"\nPre-eval memory state: episodes={st.get('episodes',0)}, "
+                  f"facts={st.get('facts',0)}, persona={st.get('persona_fields',0)}")
+        except Exception:
+            pass
+
+        print(f"\nPhase 3 — Evaluating {total_q} questions…\n")
+
+        for idx, (session_id, turns, question, ground_truth) in enumerate(all_qa, 1):
+            _eval_question(systems, session_id, turns, question, ground_truth, idx, verbose)
 
     # ── results table ─────────────────────────────────────────────────
     am = systems["agentmem"]
@@ -762,9 +849,16 @@ def run_benchmark(quick: bool, verbose: bool, no_store: bool) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--quick",    action="store_true", help="Only first 3 conversations")
-    parser.add_argument("--verbose",  action="store_true", help="Show recalled context excerpts")
-    parser.add_argument("--no-store", action="store_true", help="Skip store phase (re-use existing data)")
+    parser.add_argument("--quick",                  action="store_true", help="Only first 3 conversations")
+    parser.add_argument("--verbose",                action="store_true", help="Show recalled context excerpts")
+    parser.add_argument("--no-store",               action="store_true", help="Skip store phase (re-use existing data)")
+    parser.add_argument("--flush-between-sessions", action="store_true",
+                        help="Flush persona+facts between each conversation (isolates multi-persona contamination)")
     args = parser.parse_args()
 
-    run_benchmark(quick=args.quick, verbose=args.verbose, no_store=args.no_store)
+    run_benchmark(
+        quick=args.quick,
+        verbose=args.verbose,
+        no_store=args.no_store,
+        flush_between_sessions=args.flush_between_sessions,
+    )

@@ -173,6 +173,107 @@ async def graph_stats(r: aioredis.Redis) -> dict:
     }
 
 
+async def find_bridge_nodes(
+    r: aioredis.Redis,
+    terminal_facts: list[dict],
+    query_emb,
+    k: int = 3,
+) -> list[dict]:
+    """
+    AriadneMem Steiner tree approximation: find bridge nodes that connect
+    pairs of disconnected terminal facts for multi-hop retrieval.
+
+    Algorithm (arXiv:2603.03290 Phase II §3.3):
+      1. Collect entity+person sets from each terminal fact.
+      2. For each terminal entity, fetch its graph neighbours.
+      3. Find candidate facts whose content/attrs overlap with ≥2 different
+         terminal entity sets — these are structural bridge nodes.
+      4. Return up to k bridge facts, deduplicated against terminal_facts.
+
+    This is deterministic (no LLM call) — replaces iterative LLM planning
+    for multi-hop questions with one structural graph pass.
+
+    Returns bridge fact dicts (same shape as knn_search results) annotated
+    with {"_bridge": True}.
+    """
+    import store as mem_store
+
+    if len(terminal_facts) < 2:
+        return []
+
+    # Build entity sets per terminal fact (up to 5 facts, cap entities per fact)
+    terminal_entity_sets: list[set[str]] = []
+    all_terminal_entities: set[str] = set()
+    for f in terminal_facts[:5]:
+        attrs = f.get("attrs", {})
+        ents = set(e.lower() for e in (attrs.get("entities") or []))
+        pers = set(p.lower() for p in (attrs.get("persons") or []))
+        # Also pull significant words from content (4+ char tokens, not stopwords)
+        _STOP = {"the", "and", "for", "with", "from", "that", "this", "have",
+                 "they", "were", "been", "their", "what", "when", "where"}
+        content_tokens = {
+            w for w in f.get("content", "").lower().split()
+            if len(w) >= 4 and w not in _STOP
+        }
+        combined = ents | pers | content_tokens
+        terminal_entity_sets.append(combined)
+        all_terminal_entities |= ents | pers
+
+    if not all_terminal_entities:
+        return []
+
+    # Expand via graph neighbourhood: collect neighbour slugs for all entities
+    neighbour_tasks = [get_related(r, ent, depth=1) for ent in list(all_terminal_entities)[:6]]
+    try:
+        neighbour_batches = await asyncio.gather(*neighbour_tasks, return_exceptions=True)
+    except Exception:
+        return []
+
+    graph_neighbours: set[str] = set()
+    for batch in neighbour_batches:
+        if isinstance(batch, list):
+            graph_neighbours.update(batch)
+
+    # Broad semantic search for bridge candidates
+    try:
+        candidates = await mem_store.knn_search(r, mem_store.FACT_KEY, query_emb, k=k * 8)
+    except Exception:
+        return []
+
+    terminal_contents = {f.get("content", "") for f in terminal_facts}
+    bridges: list[dict] = []
+
+    for cand in candidates:
+        if cand.get("content", "") in terminal_contents:
+            continue  # already a terminal — not a bridge
+
+        attrs = cand.get("attrs", {})
+        cand_ents  = set(e.lower() for e in (attrs.get("entities") or []))
+        cand_pers  = set(p.lower() for p in (attrs.get("persons") or []))
+        cand_words = set(cand.get("content", "").lower().split())
+        cand_all   = cand_ents | cand_pers | cand_words
+
+        # Graph neighbour boost: entity appeared in neighbourhood expansion
+        graph_match = bool(cand_ents & graph_neighbours or cand_pers & graph_neighbours)
+
+        # Count how many distinct terminal entity sets this candidate bridges
+        terminal_sets_covered = sum(
+            1 for ts in terminal_entity_sets
+            if ts & cand_all  # non-empty intersection with this terminal's entities
+        )
+
+        # Bridge criterion: connects ≥2 terminal entity sets OR is in graph neighbourhood
+        if terminal_sets_covered >= 2 or (graph_match and terminal_sets_covered >= 1):
+            bridged = dict(cand)
+            bridged["_bridge"] = True
+            bridged["_bridge_coverage"] = terminal_sets_covered
+            bridges.append(bridged)
+            if len(bridges) >= k:
+                break
+
+    return bridges
+
+
 async def get_entity_neighbors_with_counts(
     r: aioredis.Redis,
     entity: str,
