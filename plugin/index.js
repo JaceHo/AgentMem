@@ -147,6 +147,15 @@ export default {
       // 3. Recall memories (blocking — result goes into prependContext)
       if (!query) return;
 
+      // Skip recall for cron sessions: injecting cross-session memory bloats
+      // input from ~6K to ~18K tokens, causing DeepSeek 120s timeout on every run.
+      // Cron jobs read state from files; they don't benefit from memory recall.
+      const sessionKey = ctx?.sessionId ?? ctx?.sessionKey ?? "";
+      if (sessionKey.startsWith("agent:cron:cron:")) {
+        log.info?.(`${tag} recall skipped: cron session`);
+        return;
+      }
+
       try {
         const res = await fetch(`${base}/recall`, {
           method:  "POST",
