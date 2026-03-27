@@ -128,7 +128,7 @@ case "${1:-help}" in
         echo "  Starting in foreground on :$PORT"
         echo ""
         _kill_stale
-        _register_capabilities &
+        ( _register_capabilities & )  # double-fork: orphan to launchd, not zombie of uv run
         exec uv run uvicorn main:app \
             --host 127.0.0.1 \
             --port "$PORT" \
