@@ -114,7 +114,7 @@ case "${1:-help}" in
             _kill_stale
             _register_capabilities &
             uv run uvicorn main:app \
-                --host 127.0.0.1 \
+                --host 0.0.0.0 \
                 --port "$PORT" \
                 --log-level info \
                 --timeout-graceful-shutdown 0 &
@@ -130,7 +130,7 @@ case "${1:-help}" in
         _kill_stale
         ( _register_capabilities & )  # double-fork: orphan to launchd, not zombie of uv run
         exec uv run uvicorn main:app \
-            --host 127.0.0.1 \
+            --host 0.0.0.0 \
             --port "$PORT" \
             --log-level info \
             --timeout-graceful-shutdown 0
