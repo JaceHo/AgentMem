@@ -156,6 +156,23 @@ _CROSS_SESSION_PREFIX_RE = re.compile(
 )
 
 
+_OPTION_REPLY_RE = re.compile(
+    r"^\s*(?:option|choice|select|pick)?\s*[#(]?\s*(\d{1,2})\s*[)\].:,-]?\s*$",
+    re.IGNORECASE,
+)
+
+_SECRET_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{12,}\b"), "[REDACTED_GITHUB_TOKEN]"),
+    (re.compile(r"\bsk-[A-Za-z0-9_-]{10,}\b"), "[REDACTED_API_KEY]"),
+    (re.compile(r"\btoken-active-\d+\b", re.IGNORECASE), "[REDACTED_TOKEN]"),
+]
+
+_SECRET_KEYWORD_VALUE_RE = re.compile(
+    r"(?i)\b(password|token|api[_ -]?key|secret)\b"
+    r"(\s*(?:is|=|:|for\s+[^:\n]{1,80}?\s+is)\s*)"
+    r"([\'\"]?)([^\'\"\s;,\n]+)\3"
+)
+
 def _is_injected(text: str) -> bool:
     t = text.strip()
     return any(t.startswith(p) for p in _SKIP_PREFIXES)
@@ -179,6 +196,30 @@ def _is_only_platform_noise(text: str) -> bool:
     with no meaningful user content after it (or just a HEARTBEAT line).
     """
     return bool(_ONLY_CROSS_SESSION_RE.match(text))
+
+
+def _is_brief_option_reply(text: str) -> bool:
+    return bool(_OPTION_REPLY_RE.match(text or ""))
+
+
+def _contains_secret(text: str) -> bool:
+    if not text:
+        return False
+    if any(pattern.search(text) for pattern, _ in _SECRET_PATTERNS):
+        return True
+    return bool(_SECRET_KEYWORD_VALUE_RE.search(text))
+
+
+def _redact_secrets(text: str) -> str:
+    if not text:
+        return ""
+    redacted = text
+    for pattern, replacement in _SECRET_PATTERNS:
+        redacted = pattern.sub(replacement, redacted)
+    return _SECRET_KEYWORD_VALUE_RE.sub(
+        lambda m: f"{m.group(1)}{m.group(2)}[REDACTED]",
+        redacted,
+    )
 
 
 # ── Trivial message filter ─────────────────────────────────────────────────────
@@ -394,6 +435,7 @@ def _format_prepend(
 
     def _add(text: str) -> bool:
         nonlocal tokens_used
+        text = _redact_secrets(text)
         cost = _estimate_tokens(text)
         if tokens_used + cost > token_budget:
             return False
@@ -842,6 +884,8 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
         facts = await extractor.extract_hybrid(raw_msgs, turn_text)
         fact_saved = 0
         for fact in facts:
+            if _contains_secret(fact.content):
+                continue
             f_emb = _encode(fact.content)
             existing = await mem_store.knn_search(_redis, mem_store.FACT_KEY, f_emb, k=1)
             if existing and existing[0].get("score", 0.0) > 0.95:
@@ -999,6 +1043,8 @@ async def _do_compress_session(session_id: str) -> dict:
     )
     fact_saved = 0
     for fact in facts:
+        if _contains_secret(fact.content):
+            continue
         f_emb    = _encode(fact.content)
         existing = await mem_store.knn_search(_redis, mem_store.FACT_KEY, f_emb, k=1)
         if existing and existing[0].get("score", 0.0) > 0.95:
@@ -1228,6 +1274,18 @@ async def recall(req: RecallRequest):
     query_scene = scene_mod.detect(req.query)
     q_lang, q_domain = query_scene["language"], query_scene["domain"]
     emb = _encode(req.query)
+
+    if _is_brief_option_reply(req.query):
+        hint = (
+            "<cross_session_memory>\n"
+            "The user's latest message is a brief numeric option selection.\n"
+            "Resolve it against the numbered options in the immediately preceding assistant message in this same conversation.\n"
+            "Only ask for clarification if no numbered options were offered.\n"
+            "</cross_session_memory>"
+        )
+        ms = int((time.time() - t0) * 1000)
+        log.info(f"[recall] session={req.session_id} option-reply shortcut {ms}ms")
+        return {"prependContext": hint, "latency_ms": ms}
 
     # Adaptive retrieval depth (SimpleMem-inspired C_q estimator)
     n_facts, n_episodes = _estimate_depth(req.query, req.memory_limit_number)

@@ -67,8 +67,23 @@ _STATUS_PATTERNS = re.compile(
     re.I,
 )
 
+_SECRET_PATTERNS = [
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{12,}\b"),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{10,}\b"),
+    re.compile(r"\btoken-active-\d+\b", re.I),
+    re.compile(
+        r"(?i)\b(password|token|api[_ -]?key|secret)\b"
+        r"\s*(?:is|=|:|for\s+[^:\n]{1,80}?\s+is)\s*['\"]?[^'\"\s;,\n]+"
+    ),
+]
+
 # Too short to be meaningful (after stripping punctuation)
 _MIN_CONTENT_LEN = 12
+
+
+def _contains_secret(content: str) -> bool:
+    c = content.strip()
+    return any(p.search(c) for p in _SECRET_PATTERNS)
 
 
 def _should_reject(content: str) -> bool:
@@ -81,6 +96,8 @@ def _should_reject(content: str) -> bool:
     if _NOISE_PATTERNS.search(c):
         return True
     if _STATUS_PATTERNS.search(c):
+        return True
+    if _contains_secret(c):
         return True
     return False
 
