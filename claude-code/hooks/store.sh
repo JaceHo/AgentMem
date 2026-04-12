@@ -29,7 +29,7 @@ with open(transcript_path) as f:
             role = entry.get("role") or entry.get("type", "")
             content = entry.get("content") or entry.get("message", "")
             if role and content:
-                messages.append({"role": role, "content": str(content)})
+                messages.append({"role": role, "content": content})
             # Extract tool_use blocks from assistant messages for TIG
             raw_content = content if isinstance(content, list) else \
                           (entry.get("message", {}) or {}).get("content", [])

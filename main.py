@@ -83,6 +83,7 @@ Endpoints:
   GET  /stats
 """
 
+import ast
 import asyncio
 import json
 import logging
@@ -138,6 +139,8 @@ _periodic_prune_counter: int = 0    # incremented each hourly _periodic_consolid
 # ── Store observability counters (in-process, resets on restart) ───────────────
 _store_attempts: int = 0
 _store_successes: int = 0
+_store_skips: int = 0
+_store_errors: int = 0
 _store_latency_sum_ms: float = 0.0
 
 # ── System-injected content filter ────────────────────────────────────────────
@@ -536,14 +539,40 @@ class ProcedureFeedbackRequest(BaseModel):
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
-def _msg_text(m: Message) -> str:
-    if isinstance(m.content, str):
-        raw = m.content.strip()
-    elif isinstance(m.content, list):
-        raw = " ".join(b.get("text","") for b in m.content if isinstance(b, dict)).strip()
-    else:
+def _flatten_message_content(content: Any) -> str:
+    if isinstance(content, str):
+        raw = content.strip()
+        if not raw:
+            return ""
+        if raw[:1] in "[{":
+            parsed = None
+            try:
+                parsed = json.loads(raw)
+            except Exception:
+                try:
+                    parsed = ast.literal_eval(raw)
+                except Exception:
+                    parsed = None
+            if parsed is not None and parsed is not content:
+                return _flatten_message_content(parsed)
+        return raw
+    if isinstance(content, dict):
+        block_type = str(content.get("type", "")).lower()
+        if block_type in {"tool_use", "tool_result", "thinking"}:
+            return ""
+        if "text" in content:
+            return _flatten_message_content(content.get("text"))
+        if "content" in content:
+            return _flatten_message_content(content.get("content"))
         return ""
-    # Strip cross_session_memory prefixes and platform tags before returning
+    if isinstance(content, list):
+        parts = [_flatten_message_content(item) for item in content]
+        return " ".join(part for part in parts if part).strip()
+    return ""
+
+
+def _msg_text(m: Message) -> str:
+    raw = _flatten_message_content(m.content)
     return _strip_platform_noise(raw)
 
 def _messages_to_text(messages: list[Message]) -> str:
@@ -739,13 +768,17 @@ _DATE_RE  = re.compile(
     r'|(?:昨天|今天|明天|上周|下周|上个月|下个月)', re.I
 )
 _FACT_RE  = re.compile(                # declarative fact patterns (EN + ZH)
-    r'\b(?:is|are|was|were|has|have|had|will|prefer|use|like|work|live|need'
-    r'|always|never|must|should|remember|note|my|our)\b'
+    r'\b(?:is|are|was|were|has|have|had|will|prefer|prefers|preferred|use|uses'
+    r'|used|using|like|likes|liked|work|works|worked|working|live|lives|lived'
+    r'|need|needs|needed|always|never|must|should|remember|remembers|note|notes'
+    r'|default|workspace|directory|repo|repository|branch|shell|tool|stack|my|our)\b'
     r'|(?:是|有|在|住|工作|喜欢|需要|记住|总是|从不|必须|应该|我的)', re.I
 )
 _HIGH_VALUE_RE = re.compile(           # content type prior: high-value (EN + ZH)
-    r'\b(?:my name|i am|i\'m|i work|i live|i prefer|i like|always use|never use'
-    r'|deadline|remember|important|rule:|note:|prefer|password|token|key|api)\b'
+    r'\b(?:my name|i am|i\'m|i work|i live|i prefer|i like|i use|i always|i never'
+    r'|always use|never use|uses|prefers|default shell|package manager|workspace'
+    r'|directory|repo|repository|branch|project|tool|stack|deadline|remember'
+    r'|important|rule:|note:|prefer|password|token|key|api|model)\b'
     r'|(?:我叫|我是|我在|我住|我喜欢|总是用|截止|记住|重要|密码|令牌)', re.I
 )
 
@@ -993,15 +1026,17 @@ async def _evolve_similar_fact(element_id: str, new_keywords: list[str], new_top
 
 # ── Background store ──────────────────────────────────────────────────────────
 async def _do_store(messages: list[Message], session_id: str) -> None:
-    global _store_attempts, _store_successes, _store_latency_sum_ms
+    global _store_attempts, _store_successes, _store_skips, _store_errors, _store_latency_sum_ms
     _store_attempts += 1
     t0 = time.time()
+    outcome = "error"
     try:
         # 1. Filter system-injected and empty messages.
         #    _msg_text() strips <cross_session_memory> prefixes and [[platform_tags]]
         #    before returning text, so purely-noise messages collapse to "" here.
         clean = [m for m in messages if _msg_text(m) and not _is_injected(_msg_text(m))]
         if not clean:
+            outcome = "skip"
             return
         clean = clean[-4:]   # last 4 messages = last 2 turns (user+assistant pairs)
 
@@ -1018,22 +1053,26 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
             for m in raw_user_msgs
         ):
             log.info("[store] skipped: all user messages are cross_session_memory wrappers")
+            outcome = "skip"
             return
 
         # 2. Detect scene from user messages
         user_text_raw = " ".join(_msg_text(m) for m in clean if m.role == "user")
         if not user_text_raw:
+            outcome = "skip"
             return
 
         # 2b. Skip trivial exchanges (greetings, single words) — prevents feedback loops
         if _is_trivial(user_text_raw):
             log.info(f"[store] skipped trivial exchange: {user_text_raw[:40]!r}")
+            outcome = "skip"
             return
 
         # 2c. A-MAC 5-factor admission gate (arXiv:2603.04549).
         #     Discards low-value inputs before heavy processing (summarize/embed/LLM).
         #     type_prior is dominant (w=0.30); threshold 0.40.
         if not await _admission_gate(user_text_raw):
+            outcome = "skip"
             return  # low-entropy input, skip (not worth storing)
 
         sc = scene_mod.detect(user_text_raw)
@@ -1062,7 +1101,7 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
         # 5. Hybrid fact extraction (regex + LLM) → dedup → save → update persona
         # Extract from all roles: assistant messages contain rich facts too
         # (e.g. "I work at NovaPay", "I live in Oakland" are in assistant turns)
-        raw_msgs = [m.model_dump() for m in clean]
+        raw_msgs = [{"role": m.role, "content": _msg_text(m)} for m in clean if _msg_text(m)]
         facts = await extractor.extract_hybrid(raw_msgs, turn_text)
         fact_saved = 0
         for fact in facts:
@@ -1167,14 +1206,19 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
 
         ms = int((time.time() - t0) * 1000)
         _store_successes += 1
-        _store_latency_sum_ms += ms
+        outcome = "success"
         log.info(f"[store] session={session_id} lang={lang} domain={domain} "
                  f"ep+{ep_saved} facts+{fact_saved} {ms}ms")
 
     except Exception as e:
+        log.warning(f"[store] background error: {e}", exc_info=True)
+    finally:
         ms = int((time.time() - t0) * 1000)
         _store_latency_sum_ms += ms
-        log.warning(f"[store] background error: {e}", exc_info=True)
+        if outcome == "skip":
+            _store_skips += 1
+        elif outcome == "error":
+            _store_errors += 1
 
 
 # ── Session helpers (Tier 1 — rolling accumulation + promote) ─────────────────
@@ -1497,12 +1541,17 @@ async def stats():
         # v0.9.7: store observability counters (since last restart)
         counts["store_attempts"] = _store_attempts
         counts["store_successes"] = _store_successes
-        counts["store_failures"] = _store_attempts - _store_successes
-        if _store_attempts > 0:
-            counts["store_success_rate"] = round(_store_successes / _store_attempts, 3)
-            counts["store_avg_ms"] = round(_store_latency_sum_ms / _store_attempts)
+        counts["store_skips"] = _store_skips
+        counts["store_errors"] = _store_errors
+        counts["store_failures"] = _store_errors
+        completed = _store_successes + _store_errors
+        if completed > 0:
+            counts["store_success_rate"] = round(_store_successes / completed, 3)
         else:
             counts["store_success_rate"] = None
+        if _store_attempts > 0:
+            counts["store_avg_ms"] = round(_store_latency_sum_ms / _store_attempts)
+        else:
             counts["store_avg_ms"] = None
 
         return counts

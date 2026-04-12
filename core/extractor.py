@@ -157,7 +157,9 @@ AISERV_KEY   = "sk-aiserv-local"
 AISERV_ROLE  = "nlp"                    # maps to /v1/role/nlp
 AISERV_FALLBACK_MODEL = "fast"          # cerebras/llama3.1-8b: sub-1s, always first
 AISERV_MODEL_CASCADE = []               # populated dynamically; kept for import compat
-LLM_TIMEOUT_S = 8.0    # per-attempt timeout; fast=2s, role models up to 8s
+FAST_LLM_TIMEOUT_S = 2.5
+ROLE_LLM_TIMEOUT_S = 8.0
+LLM_TIMEOUT_S = ROLE_LLM_TIMEOUT_S
 LLM_MAX_RETRIES = 3    # attempt 0: fast, attempt 1-2: role-based with exclude
 LLM_MAX_INPUT = 3000   # chars of conversation to send to LLM
 
@@ -215,6 +217,10 @@ async def _report_quality(model: str, score: int) -> None:
             log.debug("[extractor] quality-feedback: %s score=%+d", model, score)
     except Exception:
         pass  # best-effort; never block the caller
+
+
+def _timeout_for(model: str, tier: str) -> float:
+    return FAST_LLM_TIMEOUT_S if model == AISERV_FALLBACK_MODEL or tier == "fast" else ROLE_LLM_TIMEOUT_S
 
 
 # SimpleMem + Memori aligned extraction prompt (bilingual):
@@ -354,14 +360,16 @@ async def _llm_extract(conversation_text: str) -> list[ExtractedFact]:
     tried_models = []
     for attempt in range(LLM_MAX_RETRIES):
         if attempt == 0:
-            model = AISERV_FALLBACK_MODEL  # "fast" — cerebras sub-1s, always first
+            model, tier = AISERV_FALLBACK_MODEL, "fast"
         else:
-            model, _ = await _resolve_nlp_model(exclude=exclude)
+            model, tier = await _resolve_nlp_model(exclude=exclude)
             if model in tried_models:
-                model = AISERV_FALLBACK_MODEL
+                log.warning("[extractor] duplicate route from role API: %s", model)
+                break
         tried_models.append(model)
+        timeout_s = _timeout_for(model, tier)
         try:
-            async with httpx.AsyncClient(timeout=LLM_TIMEOUT_S) as client:
+            async with httpx.AsyncClient(timeout=timeout_s) as client:
                 resp = await client.post(
                     AISERV_URL,
                     json={
@@ -481,7 +489,7 @@ async def _llm_extract(conversation_text: str) -> list[ExtractedFact]:
             exclude = model
             asyncio.create_task(_report_quality(model, -1))
         except httpx.TimeoutException:
-            log.warning("[extractor] %s timed out (%.0fs)", model, LLM_TIMEOUT_S)
+            log.warning("[extractor] %s timed out (%.1fs)", model, timeout_s)
             exclude = model
             # Self-healing: push -1 back to aiserv health matrix so slow models
             # are automatically downranked/excluded from future role routing.
