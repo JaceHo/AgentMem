@@ -3,11 +3,11 @@
 **Local, free, research-grade persistent memory for AI agents.**
 Works with Claude Code, OpenClaw, LangChain, LangGraph, CrewAI, AutoGen — or any MCP client.
 
-[![Version](https://img.shields.io/badge/version-1.0.0-blue)](.) [![A-MAC](https://img.shields.io/badge/algorithm-A--MAC%20%2B%20wRRF-brightgreen)](https://arxiv.org/abs/2603.04549) [![Redis 8](https://img.shields.io/badge/backend-Redis%208%20HNSW-red)](https://redis.io) [![License](https://img.shields.io/badge/license-MIT-yellow)](.)
+[![Version](https://img.shields.io/badge/version-1.1.0-blue)](.) [![A-MAC](https://img.shields.io/badge/algorithm-A--MAC%20%2B%20wRRF%20%2B%20BM25-brightgreen)](https://arxiv.org/abs/2603.04549) [![Redis 8](https://img.shields.io/badge/backend-Redis%208%20HNSW-red)](https://redis.io) [![License](https://img.shields.io/badge/license-MIT-yellow)](.)
 
 ```
-LLM-F1: 76.34%†  │  P50 recall latency: 1.7ms  │  AIC: 97.9%  │  Cost: $0/month
-Episodes: 341  │  Facts: 141  │  Procedures: 281  │  Tools: 32
+LLM-F1: 76.34%†  │  P50 recall latency: 15ms  │  AIC: 97.9%  │  Cost: $0/month
+Episodes: 1,334  │  Facts: 2,450  │  Procedures: 28,664  │  Tools: 84
 ```
 
 ---
@@ -22,10 +22,13 @@ Episodes: 341  │  Facts: 141  │  Procedures: 281  │  Tools: 32
 | **Your data stays on your machine** | ❌ cloud | ❌ cloud | ✅ **fully local** |
 | **Works offline** | ❌ | ❌ | ✅ |
 | **Claude Code integration** | ❌ | ❌ | ✅ **native hooks** |
-| **Recall latency** | ~200ms (API RTT) | ~50ms | **1.7ms P50** |
+| **Recall latency** | ~200ms (API RTT) | ~50ms | **15ms P50** |
 | **Memory tiers** | 1 (search index) | 1 | **6 cognitive tiers** |
 | **Auto-extracts facts from conversation** | ❌ | ✅ | ✅ |
 | **Lossless restatement (pronoun-free, ISO timestamps)** | ❌ | ❌ | ✅ |
+| **Semantic triple extraction (s,p,o)** | ❌ | ❌ | ✅ v1.1 |
+| **BM25 hybrid exact-term search** | ❌ | ❌ | ✅ v1.1 |
+| **MemAgent overwrite session compaction** | ❌ | ❌ | ✅ v1.1 |
 | **Deduplication / consolidation** | ❌ | ❌ | ✅ 3-phase SimpleMem |
 | **Knowledge graph** | ❌ | ❌ | ✅ |
 | **Tool reliability tracking** | ❌ | ❌ | ✅ |
@@ -47,10 +50,14 @@ Episodes: 341  │  Facts: 141  │  Procedures: 281  │  Tools: 32
 |---|:---:|:---:|:---:|:---:|:---:|
 | **Local / offline** | ❌ | ❌ | ✅ | ✅ | ✅ |
 | **Cost** | $0.002–0.01/op | needs OpenAI | free | free | **free** |
-| **Recall latency** | ~50ms | ~96ms | varies | 0ms (static) | **1.7ms P50** |
+| **Recall latency** | ~50ms | ~96ms | varies | 0ms (static) | **15ms P50** |
 | **Scales to 1,000s of memories** | ✅ | ✅ | ✅ | ❌ truncates | ✅ |
 | **Auto-extracts facts** | ✅ | ✅ | ✅ | ❌ manual | ✅ |
 | **Lossless restatement (Φ_coref + Φ_time)** | ❌ | ✅ | ❌ | ❌ | ✅ |
+| **Semantic triple (s,p,o) extraction** | ❌ | ❌ | ❌ | ❌ | ✅ v1.1 |
+| **BM25 hybrid 4-input wRRF** | ❌ | ❌ | ❌ | ❌ | ✅ v1.1 |
+| **MemAgent overwrite compaction** | ❌ | ❌ | ❌ | ❌ | ✅ v1.1 |
+| **A-MEM memory evolution** | ❌ | ❌ | ❌ | ❌ | ✅ v1.1 |
 | **3-phase consolidation** | ❌ | ✅ | ❌ | ❌ | ✅ |
 | **A-MAC 5-factor admission gate** | ❌ | ❌ | ❌ | ❌ | ✅ |
 | **Dynamic weighted RRF** | ❌ | ❌ | ❌ | ❌ | ✅ |
@@ -64,6 +71,7 @@ Episodes: 341  │  Facts: 141  │  Procedures: 281  │  Tools: 32
 | **ToolMem per-tool reliability** | ❌ | ❌ | ❌ | ❌ | ✅ v0.9.5 |
 | **AutoTool next-tool suggestions (TIG)** | ❌ | ❌ | ❌ | ❌ | ✅ v0.9.5 |
 | **AWO meta-tool synthesis** | ❌ | ❌ | ❌ | ❌ | ✅ v0.9.6 |
+| **Secret redaction from session KV** | ❌ | ❌ | ❌ | ❌ | ✅ v1.1 |
 | **Claude Code hooks** | ❌ | ❌ | ✅ | ✅ built-in | ✅ |
 | **CJK / Chinese** | ❌ | ❌ | ❌ | ❌ | ✅ |
 | **MCP server** | ❌ | ✅ | ✅ | ❌ | ✅ |
@@ -83,6 +91,7 @@ Episodes: 341  │  Facts: 141  │  Procedures: 281  │  Tools: 32
 | Mem0 | 34.20% | [SimpleMem paper](https://arxiv.org/abs/2601.02553) |
 | SimpleMem | 43.24% | [SimpleMem paper](https://arxiv.org/abs/2601.02553) |
 | AriadneMem | **46.30%** | [AriadneMem paper](https://arxiv.org/abs/2603.03290) — SOTA |
+| Memori | 81.95% | [Memori paper](https://arxiv.org/abs/2603.19935) — on LoCoMo |
 
 **AgentMem — internal bench† (8 convs, 47 Q/A, flush-between-sessions):**
 
@@ -90,9 +99,9 @@ Episodes: 341  │  Facts: 141  │  Procedures: 281  │  Tools: 32
 |--------|:------:|:----------:|:---:|:--------:|
 | No Memory | 0% | 0% | 0% | 0% |
 | Full Context oracle | — | 36.96% | 100% | 100% |
-| **AgentMem** | **76.34%†** | **34.59%** | **97.9%** | **100%** |
+| **AgentMem v1.1** | **76.34%†** | **34.59%** | **97.9%** | **100%** |
 
-> **†** Not directly comparable to published numbers. Different dataset (8 vs 500 convs), different answer extractor (Kimi-K2.5 vs GPT-4), and no official LoCoMo test split. Context-F1 and AIC are dataset-agnostic retrieval quality metrics. Run `bench-f1.py --flush-between-sessions` to reproduce.
+> **†** Not directly comparable to published numbers. Different dataset (8 vs 500 convs), different answer extractor (Kimi-K2.5 vs GPT-4), and no official LoCoMo test split. Context-F1 and AIC are dataset-agnostic retrieval quality metrics. Run `scripts/bench-f1.py --flush-between-sessions` to reproduce.
 
 ---
 
@@ -102,7 +111,7 @@ Episodes: 341  │  Facts: 141  │  Procedures: 281  │  Tools: 32
 git clone https://github.com/JaceHo/AgentMem
 cd AgentMem
 python3 -m venv venv && venv/bin/pip install -r requirements.txt
-bash setup-claude.sh   # installs service + all 5 hooks
+bash agentmem.sh setup   # installs service + all 5 hooks
 ```
 
 Open a new Claude Code session. Done — every prompt gets cross-session memory.
@@ -126,6 +135,7 @@ Fixed cascade fallback to use health matrix only (score > 0).
 
 ## Long-Term Memory (Facts)
 1. [rule] Jace always uses AgentMem for OpenClaw memory.
+   triple: jace → always uses → AgentMem for OpenClaw memory  ← v1.1
 2. [preference] Jace prefers bun over npm as JavaScript package manager.
 
 ## Recent Relevant Episodes
@@ -139,8 +149,8 @@ Fixed cascade fallback to use health matrix only (score > 0).
 |------|---------|--------|
 | `register-env.sh` | Session start | Registers OS / git / cwd / model |
 | `register-tools.sh` | Session start | Registers built-in tools + MCP tools from settings |
-| `recall.sh` | Every prompt | Injects memory via `additionalContext` (~330ms) |
-| `compact.sh` | After every tool use | Session compact + ToolMem feedback |
+| `recall.sh` | Every prompt | Injects memory via `additionalContext` (~15ms) |
+| `compact.sh` | After every tool use | Session compact (MemAgent overwrite) + ToolMem feedback |
 | `store.sh` | Session end | Store + compress + TIG recording + AWO meta-tool synthesis |
 
 ---
@@ -154,7 +164,8 @@ Fixed cascade fallback to use health matrix only (score > 0).
 │                    ~1,064 tokens vs ~16,910 raw (94%↓)           │
 ├──────────────────────────────────────────────────────────────────┤
 │  Tier 1 — Session KV  (Redis, 4h TTL)                            │
-│  rolling summary · auto-compacted when >3K chars                 │
+│  rolling summary · MemAgent overwrite compaction (v1.1)          │
+│  auto-compacted when >3K chars · secrets redacted on write       │
 │  Pinned to mem:pinned:session_summary at session end ← v1.0      │
 ├──────────────────────────────────────────────────────────────────┤
 │  Tier 2 — Episodic  mem:episodes                                  │
@@ -164,6 +175,9 @@ Fixed cascade fallback to use health matrix only (score > 0).
 ├──────────────────────────────────────────────────────────────────┤
 │  Tier 3 — Semantic  mem:facts                                     │
 │  lossless facts · pronoun-free (Φ_coref) · ISO timestamps        │
+│  semantic triple: (subject, predicate, object) ← v1.1 Memori    │
+│  dual-layer link: source_episode_id → narrative context          │
+│  A-MEM evolution: near-dups enrich keywords + topic ← v1.1      │
 │  hard-prune: superseded (>7d) → VREM daily ← v1.0               │
 ├──────────────────────────────────────────────────────────────────┤
 │  Tier 4 — Procedural  mem:procedures                             │
@@ -187,15 +201,17 @@ Query →
   │   ├── VSIM on mem:facts       (scene-filtered + global supplement)
   │   ├── VSIM on mem:episodes
   │   ├── VSIM on mem:procedures  (MACLA Beta re-ranked)
+  │   ├── BM25Okapi on in-memory corpus  ← v1.1 (4th wRRF input)
   │   ├── Symbolic: named entities → targeted VSIM
   │   ├── Persona · env · session context
   │   ├── Pinned last-session summary              ← v1.0 (always injected)
   │   └── Tool context + TIG next-tool hints
   ├─ Auto graph expansion when query has entities  ← v1.0 (auto_graph=True)
-  ├─ Dynamic Weighted RRF (wRRF, arXiv:2511.18194):
-  │   entity+temporal → weights [0.8, 0.8, 1.4]
-  │   semantic only   → weights [1.0, 1.0, 0.6]
-  ├─ BM25-lite keyword boost
+  ├─ Dynamic Weighted RRF (wRRF, arXiv:2511.18194) — 4 inputs:
+  │   entity+temporal → weights [0.8, 0.8, 1.4, 1.2]
+  │   entity only     → weights [0.9, 0.9, 1.2, 1.1]
+  │   temporal only   → weights [0.9, 0.9, 1.2, 0.8]
+  │   semantic only   → weights [1.0, 1.0, 0.6, 0.9]
   ├─ Importance boost: score += 0.15 × importance
   └─ Token-budget greedy packing → <cross_session_memory>
      Priority: persona > last_session > env > tools > skills > session > facts > episodes
@@ -204,7 +220,7 @@ Store → A-MAC 5-factor gate (arXiv:2603.04549):
   F1 semantic_novelty (0.25)  F2 entity_novelty (0.15)
   F3 factual_confidence (0.20)  F4 temporal_signal (0.10)
   F5 content_type_prior (0.30)  ← DOMINANT
-  → extract → embed → save → consolidate (every 50 stores + hourly)
+  → extract → embed → triple extract (v1.1) → save → evolve similar (v1.1) → consolidate
 
 Capacity management (v1.0 — daily):
   VREM superseded facts older than 7 days
@@ -232,6 +248,20 @@ Category floors prevent critical facts ever reaching prune:
 
 ---
 
+## v1.1 — What's New
+
+| Feature | Paper | Detail |
+|---------|-------|--------|
+| **Semantic triple extraction** | [Memori §2.2](https://arxiv.org/abs/2603.19935) | Extractor LLM now outputs `(subject, predicate, object)` triples alongside the lossless restatement. Stored as `triple_s/p/o` fields in Redis; `triple_str` feeds BM25 keyword corpus. Shown in recall prepend for precision context. |
+| **Real BM25 hybrid search** | [Memori §2.3](https://arxiv.org/abs/2603.19935) | `_BM25Index` class (rank_bm25) maintains an in-memory BM25Okapi corpus over all stored facts + triple strings. Populated at startup, updated on every store. Used as **4th wRRF input** alongside vector/symbolic/global passes — catches exact names, flags, and identifiers that embedding search misses. |
+| **A-MEM memory evolution** | [A-MEM §3](https://arxiv.org/abs/2502.12110) | Near-duplicate facts (cosine 0.80–0.95) trigger async `_evolve_similar_fact()`: merges new keywords into the existing fact and updates its topic if the new topic is more specific. Keeps memory self-improving without hard-deleting older facts. |
+| **Dual-layer episode linking** | [Memori §2.2](https://arxiv.org/abs/2603.19935) | Each fact now stores `source_episode_id` linking to its originating episode, enabling narrative-context retrieval from fact hits. |
+| **MemAgent overwrite compaction** | [MemAgent §3.1](https://arxiv.org/abs/2507.02259) | `_accumulate_session()` now calls `overwrite_update()` instead of naive concatenate + summarize. The LLM sees `<memory>old</memory> + <new_conversation>new_turn</new_conversation>` and selectively retains critical facts — matching MemAgent's constant-window design. `core/summarizer.overwrite_update()` uses `max_tokens=400` (vs 80 for `summarize()`), producing complete ~900-char output without mid-sentence truncation. |
+| **Chunked compact for long sessions** | [MemAgent §3.1](https://arxiv.org/abs/2507.02259) | `/session/compact` for contexts >2400 chars iterates `overwrite_update()` over 1200-char chunks. Single-chunk path splits head+tail and calls `overwrite_update()` for proper token budget. O(N) total complexity. |
+| **Secret redaction in Tier 1 KV** | Security fix | `_accumulate_session()` calls `_redact_secrets()` before writing to Redis. API keys (`sk-…`), GitHub tokens, and `password=…` patterns are replaced with `[REDACTED]` — preventing leakage via `prependContext` in future prompts. |
+
+---
+
 ## v1.0 — What's New
 
 | Feature | Detail |
@@ -254,10 +284,10 @@ cd AgentMem
 python3 -m venv venv && venv/bin/pip install -r requirements.txt
 
 # Claude Code (service + all hooks in one shot)
-bash setup-claude.sh
+bash agentmem.sh setup
 
 # Or standalone
-bash start.sh
+bash agentmem.sh start
 ```
 
 ```bash
@@ -275,8 +305,13 @@ curl -s -X POST http://localhost:18800/recall \
 ```
 
 ```bash
-# Optional: enable LLM-powered lossless fact extraction
-echo "AISERV_KEY=your-aiserv-key" > .env
+# Service management
+bash agentmem.sh status    # check health
+bash agentmem.sh logs      # tail logs
+bash agentmem.sh restart   # reload after code changes (--force to skip connection check)
+
+# Run test suite
+uv run python scripts/test_api.py
 ```
 
 ---
@@ -284,9 +319,9 @@ echo "AISERV_KEY=your-aiserv-key" > .env
 ## Bootstrap from History
 
 ```bash
-python3 digest-claudecode.py          # ingest past Claude Code sessions
-python3 digest-openclaw.py            # ingest past OpenClaw sessions
-python3 digest-metaclaw.py --skills-dir /path/to/MetaClaw/memory_data/skills
+uv run python scripts/digest-claudecode.py   # ingest past Claude Code sessions
+uv run python scripts/digest-openclaw.py     # ingest past OpenClaw sessions
+uv run python scripts/digest-metaclaw.py --skills-dir /path/to/MetaClaw/memory_data/skills
 curl -X POST http://localhost:18800/consolidate/sync   # merge duplicates
 curl -X POST http://localhost:18800/proc-backfill-index
 ```
@@ -342,10 +377,11 @@ recall_node, store_node = make_memory_nodes(session_id="user-123")
 
 | Endpoint | Description |
 |----------|-------------|
-| `POST /recall` | Before-prompt — returns `prependContext` |
+| `POST /recall` | Before-prompt — returns `prependContext` + `latency_ms` |
 | `POST /store` | After-session — async, returns `{"status":"queued"}` |
-| `POST /session/compress` | Promote Tier 1 → Tier 2 + pin session summary |
-| `POST /session/compact` | Mid-session compress Tier 1 KV if >threshold chars |
+| `POST /session/compress` | Promote Tier 1 → Tier 2 + pin session summary (async) |
+| `POST /session/compact` | Mid-session MemAgent overwrite compress if >threshold chars |
+| `GET  /session/{id}` | Inspect current Tier 1 session context + length |
 | `POST /consolidate/sync` | Run 3-phase consolidation now |
 | `POST /consolidate/hard-prune` | Trigger daily VREM pass on demand |
 | `POST /register-tools` | Register agent tool index into mem:tools |
@@ -401,7 +437,10 @@ recall_node, store_node = make_memory_nodes(session_id="user-123")
 | [SimpleMem arXiv:2601.02553](https://arxiv.org/abs/2601.02553) | Core pipeline: lossless extraction §3.1, consolidation §3.2, intent-aware retrieval §3.3 |
 | [AriadneMem arXiv:2603.03290](https://arxiv.org/abs/2603.03290) | Graph bridge discovery — SOTA 46.30% on real LoCoMo |
 | [A-MAC arXiv:2603.04549](https://arxiv.org/abs/2603.04549) | 5-factor admission gate + category importance floors |
-| [wRRF arXiv:2511.18194](https://arxiv.org/abs/2511.18194) | Dynamic weighted RRF per query type |
+| [Memori arXiv:2603.19935](https://arxiv.org/abs/2603.19935) | **v1.1** Semantic triple extraction, BM25 hybrid search, dual-layer linking — 81.95% LoCoMo |
+| [A-MEM arXiv:2502.12110](https://arxiv.org/abs/2502.12110) | **v1.1** Zettelkasten memory evolution — near-duplicate enrichment |
+| [MemAgent arXiv:2507.02259](https://arxiv.org/abs/2507.02259) | **v1.1** Overwrite strategy for session compaction — O(1) per chunk, O(N) total |
+| [wRRF arXiv:2511.18194](https://arxiv.org/abs/2511.18194) | Dynamic weighted RRF per query type — now 4-input (vector + symbolic + global + BM25) |
 | [MAGMA arXiv:2601.03236](https://arxiv.org/abs/2601.03236) | Multi-graph memory — inspired knowledge graph tier |
 | [ToolMem arXiv:2510.06664](https://arxiv.org/abs/2510.06664) | Per-tool success/fail tracking + reliability hints |
 | [AutoTool TIG arXiv:2511.14650](https://arxiv.org/abs/2511.14650) | Tool Inertia Graph → next-tool suggestions |
