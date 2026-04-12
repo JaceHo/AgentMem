@@ -221,6 +221,12 @@ async def save_fact(
     importance: float = 0.5,
     topic: str | None = None,
     location: str | None = None,
+    # Dual-layer linking: source episode for narrative context retrieval (Memori §2.2)
+    source_episode_id: str | None = None,
+    # Memori semantic triple fields (arXiv:2603.19935)
+    triple_s: str | None = None,
+    triple_p: str | None = None,
+    triple_o: str | None = None,
 ) -> str:
     """
     Save a fact to the semantic memory vectorset.
@@ -230,6 +236,10 @@ async def save_fact(
       topic:         SimpleMem topic phrase for the symbolic layer
       location:      SimpleMem location string for symbolic search
       superseded_by: empty string = active; set to winner's element ID on merge (soft-delete)
+
+    Memori fields (v1.1):
+      source_episode_id: UID of the episode this fact was extracted from (dual-layer linking)
+      triple_s/p/o:      semantic triple subject/predicate/object for precision retrieval
     """
     uid  = str(ULID())
     attr_dict: dict = {
@@ -253,6 +263,14 @@ async def save_fact(
         attr_dict["topic"] = topic[:100]
     if location:
         attr_dict["location"] = location[:100]
+    if source_episode_id:
+        attr_dict["source_episode_id"] = source_episode_id
+    if triple_s and triple_p and triple_o:
+        attr_dict["triple_s"] = triple_s[:100]
+        attr_dict["triple_p"] = triple_p[:100]
+        attr_dict["triple_o"] = triple_o[:200]
+        # Also store compact triple string for BM25 keyword matching
+        attr_dict["triple_str"] = f"{triple_s} | {triple_p} | {triple_o}"
 
     await r.execute_command("VADD", FACT_KEY, "FP32", _blob(embedding), uid,
                             "SETATTR", json.dumps(attr_dict))

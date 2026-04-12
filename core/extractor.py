@@ -45,6 +45,10 @@ class ExtractedFact:
     topic: str | None = None             # SimpleMem: topic phrase (NEW v0.9.1)
     location: str | None = None          # SimpleMem: symbolic location (NEW v0.9.1)
     importance: float = 0.5             # SimpleMem: importance score 0-1 (NEW v0.9.1)
+    # Memori-style semantic triple (arXiv:2603.19935) — optional
+    triple_s: str | None = None          # triple subject
+    triple_p: str | None = None          # triple predicate
+    triple_o: str | None = None          # triple object
 
 
 # ── Layer 1: Regex patterns (fast, ~1ms) ──────────────────────────────────────
@@ -213,17 +217,18 @@ async def _report_quality(model: str, score: int) -> None:
         pass  # best-effort; never block the caller
 
 
-# SimpleMem-aligned extraction prompt (bilingual):
+# SimpleMem + Memori aligned extraction prompt (bilingual):
 # - Φ_coref: forbids all pronouns (he/she/it/they/this/that/我/他/她)
 # - Φ_time:  converts relative time → absolute ISO 8601
 # - Multi-view indexing: lossless_restatement + keywords + timestamp +
 #   location + persons + entities + topic
 # - Importance estimation (0.0-1.0): how significant/novel this fact is
+# - Semantic triple (Memori arXiv:2603.19935): compact (s, p, o) for precision retrieval
 _EXTRACT_PROMPT = """Extract all valuable information from the following conversation as structured memory units.
 
 TODAY'S DATE: {today}
 
-[Extraction Rules — SimpleMem Section 3.1]
+[Extraction Rules — SimpleMem Section 3.1 + Memori §2.2]
 1. PRONOUN PROHIBITION: Absolutely forbid pronouns (he/she/it/they/this/that/I/we/
    他/她/它/我/你/他们/这/那). Replace with specific names or entities.
 2. ABSOLUTE TIME: Convert all relative time (yesterday/today/last week/明天/上周) to
@@ -235,6 +240,10 @@ TODAY'S DATE: {today}
 5. IMPORTANCE: Score 0.1-1.0 (1.0 = critical long-term fact, 0.5 = useful context,
    0.1 = minor detail). Preferences/rules/identity score high (0.7-1.0).
    Tool uses/env context score medium (0.4-0.6).
+6. SEMANTIC TRIPLE (optional): For facts with a clear subject-predicate-object structure,
+   extract a compact triple. Subject and object should be specific noun phrases (no pronouns).
+   Predicate should be a verb/verb-phrase (prefers, works at, lives in, uses, is, has).
+   Leave null if the fact does not have a clean SPO structure.
 
 [Output Format — JSON array]
 [{{
@@ -246,7 +255,8 @@ TODAY'S DATE: {today}
   "persons": ["name1"],
   "entities": ["entity1"],
   "topic": "brief topic phrase",
-  "importance": 0.75
+  "importance": 0.75,
+  "triple": {{"s": "subject noun phrase", "p": "predicate verb phrase", "o": "object noun phrase"}}
 }}]
 
 [Categories]
@@ -266,7 +276,8 @@ Output:
   "persons": [],
   "entities": ["bun", "npm"],
   "topic": "JavaScript package manager preference",
-  "importance": 0.9
+  "importance": 0.9,
+  "triple": {{"s": "user", "p": "prefers", "o": "bun over npm for JavaScript projects"}}
 }}]
 
 Return ONLY the JSON array. If nothing worth storing, return [].
@@ -428,6 +439,19 @@ async def _llm_extract(conversation_text: str) -> list[ExtractedFact]:
                     floor = _IMPORTANCE_FLOOR.get(category, 0.35)
                     importance = max(importance, floor)
 
+                    # Memori-style semantic triple (arXiv:2603.19935)
+                    triple = item.get("triple") or {}
+                    triple_s = triple.get("s") or None
+                    triple_p = triple.get("p") or None
+                    triple_o = triple.get("o") or None
+                    # Validate triple: all three parts must be non-empty strings
+                    if triple_s and triple_p and triple_o:
+                        triple_s = str(triple_s).strip()[:100]
+                        triple_p = str(triple_p).strip()[:100]
+                        triple_o = str(triple_o).strip()[:200]
+                    else:
+                        triple_s = triple_p = triple_o = None
+
                     facts.append(ExtractedFact(
                         content=str(content).strip()[:500],
                         category=category,
@@ -439,6 +463,9 @@ async def _llm_extract(conversation_text: str) -> list[ExtractedFact]:
                         topic=item.get("topic") or None,
                         location=item.get("location") or None,
                         importance=importance,
+                        triple_s=triple_s,
+                        triple_p=triple_p,
+                        triple_o=triple_o,
                     ))
 
                 log.info(
