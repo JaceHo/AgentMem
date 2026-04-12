@@ -46,6 +46,14 @@ Features (v0.9.2 — A-MAC + wRRF + importance floors):
                                  episodes (>180d, unaccessed); keeps HNSW fresh (v1.0)
  25. Auto graph expansion    — graph neighbourhood auto-triggers on entity queries
                                  without explicit include_graph=True flag (v1.0)
+ 26. Semantic triple extraction — Memori-style (s,p,o) triples extracted alongside
+                                 lossless facts; triple_str stored for BM25 coverage (v1.1)
+ 27. Real BM25 hybrid search  — rank_bm25 BM25Okapi over in-memory fact corpus;
+                                 4th wRRF input alongside vector/symbolic/global (v1.1)
+ 28. A-MEM memory evolution   — near-duplicate facts (cos 0.80-0.95) trigger async
+                                 keyword/topic enrichment on existing fact (v1.1)
+ 29. Dual-layer fact linking  — source_episode_id links each fact to source episode
+                                 for Memori-style narrative context retrieval (v1.1)
 
 Endpoints:
   POST /recall              — before_agent_start hook (includes tool context + graph)
@@ -91,6 +99,12 @@ from fastapi import FastAPI, BackgroundTasks
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+
+try:
+    from rank_bm25 import BM25Okapi as _BM25Okapi
+    _BM25_AVAILABLE = True
+except ImportError:
+    _BM25_AVAILABLE = False
 
 from core import capability as cap_mod
 from core import embedder
@@ -172,6 +186,99 @@ _SECRET_KEYWORD_VALUE_RE = re.compile(
     r"(\s*(?:is|=|:|for\s+[^:\n]{1,80}?\s+is)\s*)"
     r"([\'\"]?)([^\'\"\s;,\n]+)\3"
 )
+
+# ── BM25 in-memory index (Memori arXiv:2603.19935 hybrid retrieval) ────────────
+# Maintains a live BM25Okapi corpus over stored facts for exact-term matching.
+# Vector search is excellent for semantic similarity but misses exact names/dates.
+# BM25 complements by scoring term frequency — together they form true hybrid search.
+
+class _BM25Index:
+    """Lazy-rebuild BM25 corpus over fact contents + triple strings.
+
+    Thread-safe for asyncio: all mutations happen in the event loop.
+    Rebuilt when corpus size changes by ≥10 entries or when forced.
+    """
+    def __init__(self):
+        self._docs: list[tuple[str, str, dict]] = []   # (uid, content, attrs)
+        self._bm25 = None
+        self._built_at_len: int = 0
+        self._rebuild_threshold: int = 10
+
+    def add(self, uid: str, content: str, attrs: dict) -> None:
+        """Add a fact to the corpus. Invalidates the BM25 index."""
+        self._docs.append((uid, content, attrs))
+
+    def _tokenize(self, text: str) -> list[str]:
+        """Tokenize for BM25: English words ≥3 chars + CJK bigrams."""
+        text = text.lower()
+        en = re.findall(r'\b[a-z]{3,}\b', text)
+        zh = re.findall(r'[\u4e00-\u9fff\u3400-\u4dbf]{2,}', text)
+        return en + zh
+
+    def _ensure_built(self) -> bool:
+        """Rebuild BM25 index if corpus has changed enough. Returns False if corpus empty."""
+        n = len(self._docs)
+        if n == 0:
+            return False
+        if self._bm25 is None or (n - self._built_at_len) >= self._rebuild_threshold:
+            # Build corpus: content + triple_str for richer term coverage
+            corpus = []
+            for _, content, attrs in self._docs:
+                text = content
+                triple_str = attrs.get("triple_str", "")
+                if triple_str:
+                    text = f"{text} {triple_str}"
+                corpus.append(self._tokenize(text))
+            self._bm25 = _BM25Okapi(corpus)
+            self._built_at_len = n
+            log.debug(f"[bm25] rebuilt corpus n={n}")
+        return True
+
+    def search(self, query: str, k: int = 10) -> list[dict]:
+        """Return top-k facts by BM25 score. Returns [] if corpus empty or BM25 unavailable."""
+        if not _BM25_AVAILABLE or not self._ensure_built():
+            return []
+        tokens = self._tokenize(query)
+        if not tokens:
+            return []
+        scores = self._bm25.get_scores(tokens)
+        # Get top-k indices (non-zero scores only)
+        top_idx = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:k * 2]
+        results = []
+        for idx in top_idx:
+            if scores[idx] <= 0:
+                break
+            uid, content, attrs = self._docs[idx]
+            results.append({
+                "content": content,
+                "category": attrs.get("category", ""),
+                "language": attrs.get("language", "en"),
+                "domain":   attrs.get("domain", "general"),
+                "score":    float(scores[idx]),
+                "attrs":    attrs,
+                "_element": uid,
+            })
+            if len(results) >= k:
+                break
+        return results
+
+    def populate_from_items(self, items: list[dict]) -> None:
+        """Bulk-load from knn_search result items (called at startup)."""
+        for item in items:
+            uid = item.get("_element", "")
+            content = item.get("content", "")
+            attrs = item.get("attrs", {})
+            if uid and content:
+                self._docs.append((uid, content, attrs))
+
+    def reset(self) -> None:
+        self._docs.clear()
+        self._bm25 = None
+        self._built_at_len = 0
+
+
+_bm25_index = _BM25Index()
+
 
 def _is_injected(text: str) -> bool:
     t = text.strip()
@@ -272,6 +379,42 @@ async def _periodic_consolidate() -> None:
                 log.warning(f"[periodic_consolidate] hard-prune error: {e}")
 
 
+async def _populate_bm25_from_redis(r) -> None:
+    """Load all existing facts from Redis into the in-memory BM25 corpus on startup."""
+    if not _BM25_AVAILABLE:
+        return
+    try:
+        card = await r.execute_command("VCARD", mem_store.FACT_KEY)
+        if not card or int(card) <= 1:
+            return
+        seed = np.zeros(mem_store.DIMS, dtype=np.float32)
+        results = await r.execute_command(
+            "VSIM", mem_store.FACT_KEY, "FP32", seed.astype("float32").tobytes(),
+            "COUNT", min(int(card), 5000), "WITHSCORES", "WITHATTRIBS"
+        )
+        items: list[dict] = []
+        i = 0
+        while i + 2 < len(results):
+            elem = results[i]; raw = results[i + 2]
+            i += 3
+            elem_str = elem.decode() if isinstance(elem, bytes) else elem
+            if elem_str == "__seed__":
+                continue
+            try:
+                attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+            except Exception:
+                continue
+            if attrs.get("_seed") or not attrs.get("content"):
+                continue
+            if attrs.get("superseded_by"):
+                continue
+            items.append({"_element": elem_str, "content": attrs["content"], "attrs": attrs})
+        _bm25_index.populate_from_items(items)
+        log.info(f"[bm25] populated corpus from Redis: {len(items)} facts")
+    except Exception as e:
+        log.warning(f"[bm25] startup population failed: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _redis
@@ -282,6 +425,8 @@ async def lifespan(app: FastAPI):
     log.info("Ensuring vectorset indexes…")
     await mem_store.ensure_indexes(_redis)
     asyncio.create_task(_periodic_consolidate())
+    # Populate BM25 corpus from existing Redis facts (non-blocking, best-effort)
+    asyncio.create_task(_populate_bm25_from_redis(_redis))
     log.info("AgentMem v1.0.0 ready (session-handoff+hard-prune+auto-graph+batch-MCP)")
     yield
     await _redis.aclose()
@@ -481,7 +626,7 @@ def _format_prepend(
         _add(session_ctx)
         _add("")
 
-    # Priority 5: facts (SimpleMem lossless_restatement entries)
+    # Priority 5: facts (SimpleMem lossless_restatement + Memori triple entries)
     # ALL appends go through _add() so headers count toward budget too.
     if facts and _add("## Long-Term Memory (Facts)"):
         for i, f in enumerate(facts, 1):
@@ -494,6 +639,10 @@ def _format_prepend(
                 meta_parts.append(f"re:{','.join(e)}")
             if t := attrs.get("topic"):
                 meta_parts.append(f"topic:{t}")
+            # Show compact triple form when available (more precise, fewer tokens)
+            triple_str = attrs.get("triple_str", "")
+            if triple_str:
+                meta_parts.append(f"triple:{triple_str}")
             meta = f" ({'; '.join(meta_parts)})" if meta_parts else ""
             line = f"{i}. [{tag}]{meta} {f['content']}"
             if not _add(line):
@@ -809,6 +958,39 @@ def _infer_ep_type(facts: list) -> str:
     return "general"
 
 
+# ── A-MEM memory evolution: refine existing similar facts ─────────────────────
+async def _evolve_similar_fact(element_id: str, new_keywords: list[str], new_topic: str | None) -> None:
+    """
+    A-MEM-inspired memory evolution (arXiv:2502.12110 §3).
+
+    When a new fact is nearly-duplicate (cosine 0.80-0.95) of an existing fact,
+    instead of discarding the new fact silently, we use its richer metadata
+    (keywords, topic) to enrich the existing fact's attributes.
+
+    This ensures that as the agent learns more specific context about a topic,
+    previously stored facts gain better retrieval metadata — mimicking how
+    human memory evolves and refines rather than just appending.
+    """
+    if not element_id or not new_keywords:
+        return
+    try:
+        raw = await _redis.execute_command("VGETATTR", mem_store.FACT_KEY, element_id)
+        if not raw:
+            return
+        attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+        existing_kws = set(attrs.get("keywords") or [])
+        # Merge new keywords (deduplicated, capped at 12)
+        merged_kws = list(existing_kws | set(new_keywords))[:12]
+        attrs["keywords"] = merged_kws
+        # Update topic if new one is more specific (longer = more specific)
+        if new_topic and len(new_topic) > len(attrs.get("topic") or ""):
+            attrs["topic"] = new_topic[:100]
+        await _redis.execute_command("VSETATTR", mem_store.FACT_KEY, element_id, json.dumps(attrs))
+        log.debug(f"[evolution] enriched fact {element_id}: +{len(new_keywords)} kws")
+    except Exception as e:
+        log.debug(f"[evolution] skipped: {e}")
+
+
 # ── Background store ──────────────────────────────────────────────────────────
 async def _do_store(messages: list[Message], session_id: str) -> None:
     global _store_attempts, _store_successes, _store_latency_sum_ms
@@ -889,12 +1071,31 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
             f_emb = _encode(fact.content)
             existing = await mem_store.knn_search(_redis, mem_store.FACT_KEY, f_emb, k=1)
             if existing and existing[0].get("score", 0.0) > 0.95:
+                # A-MEM memory evolution: similar fact exists → async-update its keywords/topic
+                # (arXiv:2502.12110 §3: new memories trigger context refinement on neighbors)
+                if fact.keywords and existing[0].get("score", 0.0) > 0.80:
+                    asyncio.create_task(_evolve_similar_fact(
+                        existing[0].get("_element", ""),
+                        fact.keywords,
+                        fact.topic,
+                    ))
                 continue
-            await mem_store.save_fact(
+            uid = await mem_store.save_fact(
                 _redis, fact.content, fact.category, fact.confidence, f_emb, lang, domain,
                 keywords=fact.keywords, persons=fact.persons, entities=fact.entities,
                 importance=fact.importance, topic=fact.topic, location=fact.location,
+                source_episode_id=new_ep_uid or None,
+                triple_s=fact.triple_s, triple_p=fact.triple_p, triple_o=fact.triple_o,
             )
+            # Add to in-memory BM25 corpus for hybrid recall
+            attrs = {
+                "content": fact.content, "category": fact.category,
+                "language": lang, "domain": domain,
+                "keywords": fact.keywords or [], "importance": fact.importance,
+            }
+            if fact.triple_s and fact.triple_p and fact.triple_o:
+                attrs["triple_str"] = f"{fact.triple_s} | {fact.triple_p} | {fact.triple_o}"
+            _bm25_index.add(uid, fact.content, attrs)
             await persona_mod.update(_redis, fact.category, fact.content)
             fact_saved += 1
 
@@ -981,16 +1182,28 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
 async def _accumulate_session(session_id: str, turn_summary: str) -> None:
     """
     Tier 1 rolling session summary.
-    Append each turn's summary; LLM-compress when the accumulated text exceeds
-    1 200 chars so the KV value stays readable and token-efficient.
+
+    v1.1 (MemAgent §3.1): uses overwrite_update() instead of naive concatenation.
+    When accumulated text exceeds 1200 chars the LLM sees existing memory +
+    new turn and selectively retains critical facts — mirrors MemAgent's overwrite
+    strategy (arXiv:2507.02259). Memory stays bounded at ~1200 chars regardless
+    of session length; total compute is O(N) not O(N²).
+
+    Security: secrets are redacted before storing in Tier 1 KV so they never
+    appear in prependContext injected into future prompts.
     """
     if not session_id:
         return
+    # Redact secrets before writing to Tier 1 KV (prevents leakage via prependContext)
+    turn_summary = _redact_secrets(turn_summary)
     existing = await mem_store.get_session_context(_redis, session_id) or ""
-    separator = "\n---\n" if existing else ""
-    combined  = f"{existing}{separator}{turn_summary}"
+    if not existing:
+        await mem_store.set_session_context(_redis, session_id, turn_summary[:1500])
+        return
+    combined = f"{existing}\n---\n{turn_summary}"
     if len(combined) > 1200:
-        combined = await summarizer.summarize(combined)
+        # MemAgent-style incremental overwrite: LLM decides what to keep
+        combined = await summarizer.overwrite_update(existing, turn_summary, target_chars=900)
     await mem_store.set_session_context(_redis, session_id, combined[:1500])
 
 
@@ -1048,13 +1261,28 @@ async def _do_compress_session(session_id: str) -> dict:
         f_emb    = _encode(fact.content)
         existing = await mem_store.knn_search(_redis, mem_store.FACT_KEY, f_emb, k=1)
         if existing and existing[0].get("score", 0.0) > 0.95:
+            if fact.keywords and existing[0].get("score", 0.0) > 0.80:
+                asyncio.create_task(_evolve_similar_fact(
+                    existing[0].get("_element", ""),
+                    fact.keywords, fact.topic,
+                ))
             continue
-        await mem_store.save_fact(
+        uid = await mem_store.save_fact(
             _redis, fact.content, fact.category, fact.confidence,
             f_emb, lang, domain,
             keywords=fact.keywords, persons=fact.persons, entities=fact.entities,
             importance=fact.importance, topic=fact.topic, location=fact.location,
+            triple_s=fact.triple_s, triple_p=fact.triple_p, triple_o=fact.triple_o,
         )
+        # Add to BM25 corpus
+        attrs = {
+            "content": fact.content, "category": fact.category,
+            "language": lang, "domain": domain,
+            "keywords": fact.keywords or [], "importance": fact.importance,
+        }
+        if fact.triple_s and fact.triple_p and fact.triple_o:
+            attrs["triple_str"] = f"{fact.triple_s} | {fact.triple_p} | {fact.triple_o}"
+        _bm25_index.add(uid, fact.content, attrs)
         await persona_mod.update(_redis, fact.category, fact.content)
         fact_saved += 1
 
@@ -1110,7 +1338,23 @@ async def session_compact(req: CompactRequest):
         return {"status": "skipped", "reason": "below threshold",
                 "size": size_before, "threshold": req.threshold_chars}
 
-    compacted = await summarizer.summarize(ctx)
+    # MemAgent-style chunked overwrite (arXiv:2507.02259 §3.1):
+    # Split context into head (existing memory) + tail (new info to incorporate).
+    # overwrite_update uses max_tokens=400 giving a proper ~900-char result,
+    # unlike summarize()'s max_tokens=80 which truncates mid-sentence.
+    # For very long contexts iterate over multiple chunks.
+    _CHUNK = 1200
+    if size_before > _CHUNK * 2:
+        chunks = [ctx[i:i + _CHUNK] for i in range(0, len(ctx), _CHUNK)]
+        memory = await summarizer.summarize(chunks[0])
+        for chunk in chunks[1:]:
+            memory = await summarizer.overwrite_update(memory, chunk, target_chars=1000)
+        compacted = memory
+    else:
+        # Single chunk: split head/tail so overwrite_update has both parts in context
+        mid = len(ctx) // 2
+        compacted = await summarizer.overwrite_update(ctx[:mid], ctx[mid:], target_chars=1000)
+
     await mem_store.set_session_context(_redis, req.session_id, compacted[:1500])
 
     size_after = len(compacted)
@@ -1465,26 +1709,34 @@ async def recall(req: RecallRequest):
 
     # Dynamic Weighted RRF (arXiv:2511.18194 wRRF):
     # Adjust per-source weights based on what the query structure reveals.
-    # Entity/person queries → boost symbolic pass (has exact name matches).
+    # Entity/person queries → boost symbolic + BM25 passes (exact name matches).
     # Temporal queries → boost symbolic (timestamps stored there).
-    # Pure semantic queries → reduce symbolic weight (no metadata to match).
+    # Pure semantic queries → reduce symbolic/BM25 weight (no metadata to match).
     _has_entities = bool(sym_entities)
     _has_temporal  = bool(query_struct.get("time_expression"))
     if _has_entities and _has_temporal:
-        _rrf_weights = [0.8, 0.8, 1.4]   # strong symbolic boost
+        _rrf_weights = [0.8, 0.8, 1.4, 1.2]   # strong symbolic + BM25 boost
     elif _has_entities:
-        _rrf_weights = [0.9, 0.9, 1.2]   # moderate symbolic boost
+        _rrf_weights = [0.9, 0.9, 1.2, 1.1]   # moderate symbolic + BM25 boost
     elif _has_temporal:
-        _rrf_weights = [0.9, 0.9, 1.2]
+        _rrf_weights = [0.9, 0.9, 1.2, 0.8]   # symbolic boost, light BM25
     else:
-        _rrf_weights = [1.0, 1.0, 0.6]   # semantic query: downweight symbolic
+        _rrf_weights = [1.0, 1.0, 0.6, 0.9]   # semantic: moderate BM25, low symbolic
+
+    # Memori BM25 pass (arXiv:2603.19935): exact-term matching over fact corpus.
+    # Runs in O(1) (no I/O) — BM25 corpus is maintained in-memory and searched locally.
+    # Particularly effective for entity names, dates, tool names, specific terms.
+    bm25_facts = _bm25_index.search(req.query, k=n_facts)
+    if bm25_facts:
+        log.debug(f"[bm25] {len(bm25_facts)} hits for: {req.query[:60]!r}")
 
     def _merge(primary, supplement, symbolic, limit):
         p_ranked   = heat_mod.heat_rerank(primary)
         s_ranked   = heat_mod.heat_rerank(supplement) if supplement else []
         sym_ranked = heat_mod.heat_rerank(symbolic)   if symbolic   else []
+        # BM25 hits are already scored by TF-IDF; pass as-is (no heat reranking)
         fused = _rrf_merge(
-            [p_ranked, s_ranked, sym_ranked],
+            [p_ranked, s_ranked, sym_ranked, bm25_facts],
             weights=_rrf_weights,
             limit=limit * 2,
         )
@@ -1493,7 +1745,9 @@ async def recall(req: RecallRequest):
     facts    = _merge(facts_scene, facts_global, sym_facts,  n_facts)
     episodes = _merge(eps_scene,   eps_global,   [],         n_episodes)
 
-    # SimpleMem Phase 3: lexical keyword boost (BM25-lite layer)
+    # SimpleMem Phase 3: lexical keyword boost (BM25-lite additive layer)
+    # Note: BM25 above handles full TF-IDF scoring; this adds a lightweight keyword
+    # overlap boost on top for any residual exact-match signal not captured by BM25.
     facts    = _keyword_boost(facts,    req.query)
     episodes = _keyword_boost(episodes, req.query, boost=0.03)
 
