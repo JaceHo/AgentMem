@@ -155,12 +155,12 @@ AISERV_BASE  = "http://127.0.0.1:4000"
 AISERV_URL   = f"{AISERV_BASE}/v1/chat/completions"
 AISERV_KEY   = "sk-aiserv-local"
 AISERV_ROLE  = "nlp"                    # maps to /v1/role/nlp
-AISERV_FALLBACK_MODEL = "fast"          # cerebras/llama3.1-8b: sub-1s, always first
+AISERV_FALLBACK_MODEL = "fast"          # used only if /v1/role/nlp is unreachable
 AISERV_MODEL_CASCADE = []               # populated dynamically; kept for import compat
-FAST_LLM_TIMEOUT_S = 2.5
-ROLE_LLM_TIMEOUT_S = 8.0
+FAST_LLM_TIMEOUT_S = 5.0               # "fast" tier can occasionally take 3-4s under load
+ROLE_LLM_TIMEOUT_S = 10.0              # role-based models need more time for 1500-token output
 LLM_TIMEOUT_S = ROLE_LLM_TIMEOUT_S
-LLM_MAX_RETRIES = 3    # attempt 0: fast, attempt 1-2: role-based with exclude
+LLM_MAX_RETRIES = 3    # all attempts use role API; fallback model only if role API fails
 LLM_MAX_INPUT = 3000   # chars of conversation to send to LLM
 
 
@@ -325,19 +325,47 @@ def _load_proxy() -> str | None:
 
 
 def _parse_llm_json(raw: str) -> list:
-    """Robustly parse JSON from LLM response (handles markdown code fences)."""
+    """Robustly parse JSON from LLM response (handles markdown fences + truncation).
+
+    Strategy:
+    1. Strip code fences.
+    2. Try full parse (fast path).
+    3. On JSONDecodeError, truncate to last complete object before the error
+       and close the array — handles cases where Llama outputs 5k+ chars and
+       hits a formatting error mid-array (e.g. "Expecting ',' delimiter").
+    """
     raw = raw.strip()
     if raw.startswith("```"):
         raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-    # Find JSON array
     start = raw.find("[")
     if start == -1:
         return []
-    # Try from first '[' to last ']'
     end = raw.rfind("]")
     if end == -1:
-        return []
-    return json.loads(raw[start:end + 1])
+        end = len(raw)  # no closing bracket — try recovery anyway
+    chunk = raw[start : end + 1] if end < len(raw) else raw[start:]
+    # Fast path: clean parse
+    err_pos = None
+    try:
+        return json.loads(chunk)
+    except json.JSONDecodeError as e:
+        err_pos = e.pos  # capture before `e` goes out of scope
+    # Recovery: truncate at the last complete object before the error position
+    # and close the array.  Handles mid-object truncation from Llama outputs.
+    try:
+        truncated = raw[start : start + (err_pos or len(chunk))]
+        last_close = truncated.rfind("},")
+        if last_close > 0:
+            candidate = truncated[: last_close + 1] + "]"
+            return json.loads(candidate)
+        # Try closing without trailing comma
+        last_close = truncated.rfind("}")
+        if last_close > 0:
+            candidate = truncated[: last_close + 1] + "]"
+            return json.loads(candidate)
+    except Exception:
+        pass
+    return []
 
 
 async def _llm_extract(conversation_text: str) -> list[ExtractedFact]:
@@ -359,13 +387,10 @@ async def _llm_extract(conversation_text: str) -> list[ExtractedFact]:
     exclude = None
     tried_models = []
     for attempt in range(LLM_MAX_RETRIES):
-        if attempt == 0:
-            model, tier = AISERV_FALLBACK_MODEL, "fast"
-        else:
-            model, tier = await _resolve_nlp_model(exclude=exclude)
-            if model in tried_models:
-                log.warning("[extractor] duplicate route from role API: %s", model)
-                break
+        model, tier = await _resolve_nlp_model(exclude=exclude)
+        if model in tried_models:
+            log.warning("[extractor] duplicate route from role API: %s", model)
+            break
         tried_models.append(model)
         timeout_s = _timeout_for(model, tier)
         try:
