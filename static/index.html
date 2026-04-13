@@ -102,7 +102,7 @@ nav { background: var(--surface); border-bottom: 1px solid var(--border); paddin
 <header>
   <div class="status-dot" id="dot"></div>
   <h1>AgentMem</h1>
-  <span class="badge" id="ver-badge">v0.9.2</span>
+  <span class="badge" id="ver-badge">v?</span>
   <span class="ver" id="uptime-label"></span>
   <span style="margin-left:auto;color:var(--dim);font-size:12px" id="redis-status">Redis: —</span>
 </header>
@@ -128,7 +128,7 @@ nav { background: var(--surface); border-bottom: 1px solid var(--border); paddin
     </div>
   </div>
   <div style="margin-top:16px" class="card">
-    <h3>Memory Tiers &nbsp;<span style="font-size:10px;color:var(--dim)">6-tier cognitive architecture · A-MAC + wRRF v0.9.2</span></h3>
+    <h3>Memory Tiers &nbsp;<span style="font-size:10px;color:var(--dim)" id="arch-label">6-tier cognitive architecture · A-MAC + wRRF</span></h3>
     <div style="display:grid;grid-template-columns:repeat(6,1fr);gap:10px;margin-top:8px">
       <div style="text-align:center;padding:10px;background:#010409;border-radius:6px;border:1px solid var(--border)">
         <div style="font-size:9px;color:var(--dim);margin-bottom:4px">EPISODIC</div>
@@ -231,15 +231,20 @@ async function api(path) {
 
 // ── Overview ──────────────────────────────────────────────────────────────────
 async function loadOverview() {
-  const [stats, ctx, capCtx] = await Promise.all([
+  const [health, stats, ctx, capCtx] = await Promise.all([
+    api('/health'),
     api('/stats'),
     api('/capabilities/context'),
     api('/capabilities'),
   ]);
 
+  const version = health?.version ? `v${health.version}` : 'v?';
+  document.getElementById('ver-badge').textContent = version;
+  document.getElementById('arch-label').textContent = `6-tier cognitive architecture · A-MAC + wRRF ${version}`;
+
   if (stats) {
-    document.getElementById('dot').className = 'status-dot ok';
-    document.getElementById('redis-status').textContent = 'Redis: ok';
+    document.getElementById('dot').className = health?.status === 'ok' ? 'status-dot ok' : 'status-dot err';
+    document.getElementById('redis-status').textContent = `Redis: ${health?.redis || 'ok'}`;
     const sl = document.getElementById('stats-list');
     sl.innerHTML = Object.entries(stats).map(([k,v]) =>
       `<div class="stat-row"><span>${k}</span><span class="stat-val">${v}</span></div>`

@@ -121,6 +121,7 @@ from core import summarizer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [mem] %(message)s")
 log = logging.getLogger("mem")
+APP_VERSION = "1.0.0"
 
 # Attach SSE log handler — broadcasts every log record to dashboard clients
 _sse_handler = log_sse.LogSSEHandler(level=logging.INFO)
@@ -430,12 +431,12 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_periodic_consolidate())
     # Populate BM25 corpus from existing Redis facts (non-blocking, best-effort)
     asyncio.create_task(_populate_bm25_from_redis(_redis))
-    log.info("AgentMem v1.0.0 ready (session-handoff+hard-prune+auto-graph+batch-MCP)")
+    log.info("AgentMem v%s ready (session-handoff+hard-prune+auto-graph+batch-MCP)", APP_VERSION)
     yield
     await _redis.aclose()
 
 
-app = FastAPI(title="AgentMem — Local Agent Memory Service", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="AgentMem — Local Agent Memory Service", version=APP_VERSION, lifespan=lifespan)
 
 # ── Static files + SSE log router ─────────────────────────────────────────────
 import os as _os
@@ -452,7 +453,7 @@ async def dashboard():
     idx = _os.path.join(_static_dir, "index.html")
     if _os.path.exists(idx):
         return FileResponse(idx)
-    return {"message": "AgentMem v0.9.4", "docs": "/docs"}
+    return {"message": f"AgentMem v{APP_VERSION}", "docs": "/docs"}
 
 
 # ── Request / Response models ──────────────────────────────────────────────────
@@ -1516,7 +1517,7 @@ async def answer(req: AnswerRequest):
 async def health():
     try:
         await _redis.ping()
-        return {"status": "ok", "redis": "ok", "version": "1.0.0"}
+        return {"status": "ok", "redis": "ok", "version": APP_VERSION}
     except Exception as e:
         return {"status": "degraded", "error": str(e)}
 
@@ -2952,7 +2953,7 @@ async def graph_stats_endpoint():
 async def get_config():
     """Return current service configuration including auto-consolidation settings."""
     return {
-        "version":                 "0.9.2",
+        "version":                 APP_VERSION,
         "auto_consolidate_every":  _AUTO_CONSOLIDATE_EVERY,
         "stores_since_last":       _stores_since_consolidation,
         "periodic_interval_s":     3600,
