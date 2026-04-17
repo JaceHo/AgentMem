@@ -123,9 +123,14 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [mem] %(message)s")
 log = logging.getLogger("mem")
 APP_VERSION = "1.0.0"
 
-# Attach SSE log handler — broadcasts every log record to dashboard clients
+# Attach SSE log handler — broadcasts every record to dashboard clients,
+# stores it in an in-memory ring buffer, and persists it to
+# ~/.agentmem/logs/dashboard.jsonl so logs survive process restarts.
+log_sse.init_persistence()
 _sse_handler = log_sse.LogSSEHandler(level=logging.INFO)
-_sse_handler.setFormatter(logging.Formatter("%(asctime)s [%(name)s] %(message)s"))
+# Bare %(message)s — the SSE payload already carries `ts`, `level`, and `name`,
+# and the dashboard formats them itself. This avoids double-stamped output.
+_sse_handler.setFormatter(logging.Formatter("%(message)s"))
 logging.getLogger().addHandler(_sse_handler)
 
 _redis = None

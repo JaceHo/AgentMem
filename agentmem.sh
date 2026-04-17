@@ -11,8 +11,10 @@ cd "$SCRIPT_DIR"
 PORT="${AGENTMEM_PORT:-18800}"
 SERVICE_LABEL="ai.agent.memory"
 PLIST_DST="$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist"
-LOG_STDOUT="$HOME/.openclaw/logs/memory-stdout.log"
-LOG_STDERR="$HOME/.openclaw/logs/memory-stderr.log"
+LOG_DIR="$HOME/.agentmem/logs"
+LOG_STDOUT="$LOG_DIR/stdout.log"
+LOG_STDERR="$LOG_DIR/stderr.log"
+mkdir -p "$LOG_DIR"
 
 # ── Bench constants ───────────────────────────────────────────────────────────
 BENCH_PORT=18899

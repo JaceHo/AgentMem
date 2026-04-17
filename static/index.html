@@ -430,9 +430,31 @@ function escHtml(s) {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
+function fmtTs(iso) {
+  // "2026-04-18T12:34:56.789+00:00" → local "12:34:56" (just the wall clock)
+  if (!iso) return '--:--:--';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return '--:--:--';
+  const pad = n => String(n).padStart(2, '0');
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
 function appendLog(data) {
-  const entry = { level: data.level||'INFO', color: data.color||'info', msg: data.msg||data.event||'' };
+  // Drop any stray keepalive/ping events — they carry no real information
+  // and only existed to keep the SSE connection warm. The server now emits
+  // proper SSE comment-line keepalives that EventSource discards before
+  // they ever reach onmessage, but we double-guard here for old payloads.
+  if (data && (data.event === 'ping' || data.event === 'keepalive')) return;
+
+  const entry = {
+    ts:    data.ts    || new Date().toISOString(),
+    level: data.level || 'INFO',
+    color: data.color || 'info',
+    name:  data.name  || '',
+    msg:   data.msg   || '',
+  };
   if (!entry.msg) return;
+
   logs.push(entry);
   if (logs.length > 3000) logs.shift();
 
@@ -443,7 +465,6 @@ function appendLog(data) {
     b.style.display = '';
   }
 
-  // Only re-render visible log (if on logs tab)
   const box = document.getElementById('log-box');
   const level = document.getElementById('log-level').value;
   const filt  = document.getElementById('log-filter').value.toLowerCase();
@@ -453,11 +474,23 @@ function appendLog(data) {
   if ((LNUM[entry.level]||20) >= minL && (!filt || entry.msg.toLowerCase().includes(filt))) {
     const el = document.createElement('div');
     el.className = `log-line ${entry.color}`;
-    el.textContent = entry.msg;
+    const where = entry.name ? ` [${entry.name}]` : '';
+    el.textContent = `${fmtTs(entry.ts)} ${entry.level.padEnd(7)}${where} ${entry.msg}`;
     box.appendChild(el);
     if (autoScroll) box.scrollTop = box.scrollHeight;
   }
   document.getElementById('log-badge').textContent = `${logs.length} lines`;
+}
+
+async function backfillLogs() {
+  // Pull the persistent ring buffer (survives restarts) before opening SSE,
+  // so the user sees real history immediately instead of an empty box.
+  try {
+    const res = await fetch('/logs/recent?limit=500');
+    if (!res.ok) return;
+    const items = await res.json();
+    items.forEach(appendLog);
+  } catch (_) { /* ignore — SSE will populate going forward */ }
 }
 
 function startSSE() {
@@ -466,7 +499,8 @@ function startSSE() {
     try { appendLog(JSON.parse(e.data)); } catch(_) {}
   };
   es.onerror = () => {
-    appendLog({ level:'WARNING', color:'warn', msg:'[dashboard] SSE disconnected — reconnecting…' });
+    appendLog({ ts: new Date().toISOString(), level:'WARNING', color:'warn',
+                name:'dashboard', msg:'SSE disconnected — reconnecting…' });
     setTimeout(startSSE, 3000);
     es.close();
   };
@@ -536,7 +570,7 @@ async function tryEndpoint(method, path, i) {
 // ── Init ──────────────────────────────────────────────────────────────────────
 buildApiRef();
 loadOverview();
-startSSE();
+backfillLogs().then(startSSE);
 setInterval(loadOverview, 8000);
 </script>
 </body>

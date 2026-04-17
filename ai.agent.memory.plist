@@ -27,10 +27,10 @@
   <integer>5</integer>
 
   <key>StandardOutPath</key>
-  <string>/Users/jace/.openclaw/logs/memory-stdout.log</string>
+  <string>/Users/jace/.agentmem/logs/stdout.log</string>
 
   <key>StandardErrorPath</key>
-  <string>/Users/jace/.openclaw/logs/memory-stderr.log</string>
+  <string>/Users/jace/.agentmem/logs/stderr.log</string>
 
   <key>EnvironmentVariables</key>
   <dict>
