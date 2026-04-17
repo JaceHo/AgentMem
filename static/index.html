@@ -162,6 +162,41 @@ nav { background: var(--surface); border-bottom: 1px solid var(--border); paddin
       </div>
     </div>
   </div>
+  <div style="margin-top:16px" class="card">
+    <h3>Background Writer &nbsp;<span style="font-size:10px;color:var(--dim)">store pipeline · since process start</span></h3>
+    <div style="display:grid;grid-template-columns:repeat(6,1fr);gap:10px;margin-top:8px">
+      <div style="text-align:center;padding:10px;background:#010409;border-radius:6px;border:1px solid var(--border)">
+        <div style="font-size:9px;color:var(--dim);margin-bottom:4px">ATTEMPTS</div>
+        <div style="font-size:18px" id="writer-attempts">—</div>
+        <div style="font-size:10px;color:var(--dim);margin-top:4px">turns received</div>
+      </div>
+      <div style="text-align:center;padding:10px;background:#010409;border-radius:6px;border:1px solid var(--border)">
+        <div style="font-size:9px;color:var(--dim);margin-bottom:4px">SUCCESSES</div>
+        <div style="font-size:18px;color:var(--green)" id="writer-successes">—</div>
+        <div style="font-size:10px;color:var(--dim);margin-top:4px">stored</div>
+      </div>
+      <div style="text-align:center;padding:10px;background:#010409;border-radius:6px;border:1px solid var(--border)">
+        <div style="font-size:9px;color:var(--dim);margin-bottom:4px">SKIPS</div>
+        <div style="font-size:18px;color:var(--yellow)" id="writer-skips">—</div>
+        <div style="font-size:10px;color:var(--dim);margin-top:4px">filtered (heartbeat / trivial / gate)</div>
+      </div>
+      <div style="text-align:center;padding:10px;background:#010409;border-radius:6px;border:1px solid var(--border)">
+        <div style="font-size:9px;color:var(--dim);margin-bottom:4px">ERRORS</div>
+        <div style="font-size:18px;color:#ff7b72" id="writer-errors">—</div>
+        <div style="font-size:10px;color:var(--dim);margin-top:4px">exceptions</div>
+      </div>
+      <div style="text-align:center;padding:10px;background:#010409;border-radius:6px;border:1px solid var(--border)">
+        <div style="font-size:9px;color:var(--dim);margin-bottom:4px">SUCCESS RATE</div>
+        <div style="font-size:18px;color:var(--cyan)" id="writer-rate">—</div>
+        <div style="font-size:10px;color:var(--dim);margin-top:4px">successes / completed</div>
+      </div>
+      <div style="text-align:center;padding:10px;background:#010409;border-radius:6px;border:1px solid var(--border)">
+        <div style="font-size:9px;color:var(--dim);margin-bottom:4px">AVG LATENCY</div>
+        <div style="font-size:18px;color:var(--purple)" id="writer-avg">—</div>
+        <div style="font-size:10px;color:var(--dim);margin-top:4px">per attempt</div>
+      </div>
+    </div>
+  </div>
 </div>
 
 <!-- TOOLS -->
@@ -246,15 +281,29 @@ async function loadOverview() {
     document.getElementById('dot').className = health?.status === 'ok' ? 'status-dot ok' : 'status-dot err';
     document.getElementById('redis-status').textContent = `Redis: ${health?.redis || 'ok'}`;
     const sl = document.getElementById('stats-list');
-    sl.innerHTML = Object.entries(stats).map(([k,v]) =>
-      `<div class="stat-row"><span>${k}</span><span class="stat-val">${v}</span></div>`
-    ).join('');
+    sl.innerHTML = Object.entries(stats)
+      .filter(([k,v]) => v === null || typeof v !== 'object')
+      .map(([k,v]) =>
+        `<div class="stat-row"><span>${k}</span><span class="stat-val">${v ?? '—'}</span></div>`
+      ).join('');
     document.getElementById('tier-ep').textContent      = stats.episodes   ?? '—';
     document.getElementById('tier-facts').textContent   = stats.facts      ?? '—';
     document.getElementById('tier-procs').textContent   = stats.procedures ?? '—';
     document.getElementById('tier-tools').textContent   = stats.tools      ?? '—';
     document.getElementById('tier-env').textContent     = stats.env_fields ?? '—';
     document.getElementById('tier-persona').textContent = stats.persona_fields ?? '—';
+
+    const w = stats.writer || {};
+    document.getElementById('writer-attempts').textContent  = w.attempts  ?? '—';
+    document.getElementById('writer-successes').textContent = w.successes ?? '—';
+    document.getElementById('writer-skips').textContent     = w.skips     ?? '—';
+    document.getElementById('writer-errors').textContent    = w.errors    ?? '—';
+    document.getElementById('writer-rate').textContent =
+      (w.success_rate === null || w.success_rate === undefined)
+        ? 'n/a'
+        : `${(w.success_rate * 100).toFixed(1)}%`;
+    document.getElementById('writer-avg').textContent =
+      (w.avg_ms === null || w.avg_ms === undefined) ? 'n/a' : `${w.avg_ms} ms`;
   } else {
     document.getElementById('dot').className = 'status-dot err';
     document.getElementById('redis-status').textContent = 'Redis: offline';

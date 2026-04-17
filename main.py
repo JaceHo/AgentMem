@@ -1539,21 +1539,18 @@ async def stats():
         env_raw = await _redis.hgetall(cap_mod.ENV_KEY)
         counts["env_fields"] = len(env_raw)
 
-        # v0.9.7: store observability counters (since last restart)
-        counts["store_attempts"] = _store_attempts
-        counts["store_successes"] = _store_successes
-        counts["store_skips"] = _store_skips
-        counts["store_errors"] = _store_errors
-        counts["store_failures"] = _store_errors
+        # v0.9.7+: background writer observability (since process start).
+        # Nested under "writer" so the dashboard can render it as its own panel
+        # and the top-level stat list stays focused on memory tier counts.
         completed = _store_successes + _store_errors
-        if completed > 0:
-            counts["store_success_rate"] = round(_store_successes / completed, 3)
-        else:
-            counts["store_success_rate"] = None
-        if _store_attempts > 0:
-            counts["store_avg_ms"] = round(_store_latency_sum_ms / _store_attempts)
-        else:
-            counts["store_avg_ms"] = None
+        counts["writer"] = {
+            "attempts": _store_attempts,
+            "successes": _store_successes,
+            "skips": _store_skips,        # intentional drops (heartbeats, trivial, admission gate)
+            "errors": _store_errors,
+            "success_rate": round(_store_successes / completed, 3) if completed > 0 else None,
+            "avg_ms": round(_store_latency_sum_ms / _store_attempts) if _store_attempts > 0 else None,
+        }
 
         return counts
     except Exception as e:
