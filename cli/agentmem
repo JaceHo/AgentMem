@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""
+agentmem — natural-language CLI over the AgentMem service.
+
+Progressive disclosure for LLM agents:
+  agentmem                       → overview + commands
+  agentmem recall <QUERY>        → top-K memories for a query (1-line each)
+  agentmem store <TEXT>          → store a fact/memory
+  agentmem procedures <QUERY>    → recall stored procedures
+  agentmem graph <ENTITY>        → knowledge-graph neighborhood for an entity
+  agentmem stats                 → service stats
+  agentmem health                → up/down
+
+Backend: http://localhost:18800 (override via AGENTMEM_URL).
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+import urllib.request
+import urllib.error
+from typing import Any, Optional
+
+BASE = os.environ.get("AGENTMEM_URL", "http://localhost:18800").rstrip("/")
+TIMEOUT = float(os.environ.get("AGENTMEM_TIMEOUT", "10"))
+
+
+def _req(method: str, path: str, body: Optional[dict] = None) -> tuple[int, Any]:
+    url = f"{BASE}{path}"
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method)
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+            raw = r.read().decode("utf-8", errors="replace")
+            try:
+                return r.status, json.loads(raw)
+            except json.JSONDecodeError:
+                return r.status, raw
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode(errors="replace")[:500]
+    except Exception as e:
+        return 0, str(e)
+
+
+def die(msg: str, code: int = 1) -> None:
+    print(f"agentmem: {msg}", file=sys.stderr); sys.exit(code)
+
+
+def cmd_root() -> None:
+    print("agentmem — local long-term memory (port 18800)\n")
+    print("Commands:")
+    print("  agentmem recall <query>       top relevant memories for a query")
+    print("  agentmem store <text>         store a new fact / memory")
+    print("  agentmem procedures <query>   recall stored procedures (how-to memory)")
+    print("  agentmem graph <entity>       knowledge-graph neighborhood")
+    print("  agentmem stats                memory stats / counts")
+    print("  agentmem health               check service health")
+    print()
+    print("Tip: prefer this over re-asking the user for context the agent has")
+    print("seen in past sessions. Stored memories survive across all chats.")
+
+
+def cmd_recall(args: list[str]) -> None:
+    if not args: die("usage: agentmem recall <query>")
+    q = " ".join(args)
+    status, body = _req("POST", "/recall", {
+        "query": q, "memory_limit_number": 6,
+        "include_tools": False, "include_procedures": True,
+    })
+    if status != 200: die(f"recall failed ({status}): {body}")
+    ctx = (body or {}).get("prependContext") or ""
+    if ctx.strip():
+        print(ctx)
+    else:
+        print("(no relevant memories)")
+
+
+def cmd_store(args: list[str]) -> None:
+    if not args: die("usage: agentmem store <text>")
+    text = " ".join(args)
+    status, body = _req("POST", "/store", {"content": text, "type": "fact"})
+    if status != 200: die(f"store failed ({status}): {body}")
+    print(json.dumps(body, indent=2, ensure_ascii=False))
+
+
+def cmd_procedures(args: list[str]) -> None:
+    if not args: die("usage: agentmem procedures <query>")
+    q = " ".join(args)
+    status, body = _req("POST", "/recall-procedures", {"query": q, "limit": 5})
+    if status != 200: die(f"procedures failed ({status}): {body}")
+    procs = (body or {}).get("procedures") or body.get("results") or []
+    if not procs:
+        print("(no matching procedures)"); return
+    for p in procs[:5]:
+        name = p.get("name") or p.get("title") or "(untitled)"
+        desc = p.get("description") or p.get("content") or ""
+        print(f"  • {name}\n    {desc[:200]}")
+
+
+def cmd_graph(args: list[str]) -> None:
+    if not args: die("usage: agentmem graph <entity>")
+    ent = " ".join(args)
+    status, body = _req("GET", f"/graph/{urllib_quote(ent)}")
+    if status != 200: die(f"graph failed ({status}): {body}")
+    print(json.dumps(body, indent=2, ensure_ascii=False))
+
+
+def cmd_stats() -> None:
+    status, body = _req("GET", "/stats")
+    if status != 200: die(f"stats failed ({status}): {body}")
+    print(json.dumps(body, indent=2, ensure_ascii=False))
+
+
+def cmd_health() -> None:
+    status, body = _req("GET", "/health")
+    if status == 200:
+        print(f"OK  {json.dumps(body, ensure_ascii=False)}")
+    else:
+        print(f"DOWN ({status}): {body}"); sys.exit(1)
+
+
+def urllib_quote(s: str) -> str:
+    import urllib.parse
+    return urllib.parse.quote(s, safe="")
+
+
+def main(argv: list[str]) -> None:
+    if not argv: cmd_root(); return
+    cmd, rest = argv[0], argv[1:]
+    if cmd in ("-h", "--help", "help"): cmd_root(); return
+    if cmd == "recall":     cmd_recall(rest);     return
+    if cmd == "store":      cmd_store(rest);      return
+    if cmd == "procedures": cmd_procedures(rest); return
+    if cmd == "graph":      cmd_graph(rest);      return
+    if cmd == "stats":      cmd_stats();          return
+    if cmd == "health":     cmd_health();         return
+    die(f"unknown command '{cmd}' (try: agentmem help)")
+
+
+if __name__ == "__main__":
+    try:
+        main(sys.argv[1:])
+    except KeyboardInterrupt:
+        sys.exit(130)
