@@ -2024,8 +2024,20 @@ async def register_env(req: EnvState):
             env_data[k] = str(v)
 
     await cap_mod.set_env(_redis, env_data)
+
+    # Also populate the Agent Self-Model (mem:agent) with identity fields so the
+    # dashboard's "Agent Self-Model" panel isn't perpetually empty. set_agent()
+    # stamps last_seen automatically; we only forward what was actually provided.
+    agent_data: dict = {}
+    if req.agent_model:   agent_data["model"]      = req.agent_model
+    if req.agent_version: agent_data["version"]    = req.agent_version
+    if req.session_id:    agent_data["session_id"] = req.session_id
+    if req.runtime:       agent_data["runtime"]    = req.runtime
+    if agent_data:
+        await cap_mod.set_agent(_redis, agent_data)
+
     log.info(f"[env] registered env: {list(env_data.keys())}")
-    return {"status": "ok", "fields": list(env_data.keys())}
+    return {"status": "ok", "fields": list(env_data.keys()), "agent_fields": list(agent_data.keys())}
 
 
 @app.post("/recall-tools")
