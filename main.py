@@ -1509,11 +1509,11 @@ async def answer(req: AnswerRequest):
             exclude = model
         except httpx.TimeoutException:
             log.warning("[answer] %s timed out (attempt %d)", model, attempt + 1)
-            asyncio.create_task(extractor._report_quality(model, -1))
+            asyncio.create_task(extractor._report_quality(model, -1, reason="timeout"))
             exclude = model
         except Exception as e:
             log.debug("[answer] %s failed: %s", model, e)
-            asyncio.create_task(extractor._report_quality(model, -1))
+            asyncio.create_task(extractor._report_quality(model, -1, reason="other"))
             exclude = model
     return {"answer": ""}
 
@@ -2852,10 +2852,10 @@ async def _llm_merge_facts(contents: list[str]) -> str | None:
                 return resp.json()["choices"][0]["message"]["content"].strip()
     except httpx.TimeoutException:
         log.warning("[consolidate] %s timed out", model)
-        asyncio.create_task(extractor._report_quality(model, -1))
+        asyncio.create_task(extractor._report_quality(model, -1, reason="timeout"))
     except Exception as e:
         log.warning(f"[consolidate] LLM merge failed: {e}")
-        asyncio.create_task(extractor._report_quality(model, -1))
+        asyncio.create_task(extractor._report_quality(model, -1, reason="other"))
 
     return max(contents, key=len)
 

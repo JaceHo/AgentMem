@@ -157,10 +157,13 @@ AISERV_KEY   = "sk-aiserv-local"
 AISERV_ROLE  = "nlp"                    # maps to /v1/role/nlp
 AISERV_FALLBACK_MODEL = "fast"          # used only if /v1/role/nlp is unreachable
 AISERV_MODEL_CASCADE = []               # populated dynamically; kept for import compat
-FAST_LLM_TIMEOUT_S = 5.0               # "fast" tier can occasionally take 3-4s under load
+FAST_LLM_TIMEOUT_S = 4.0               # "fast" tier — tightened from 5s; aiserv now self-heals
 ROLE_LLM_TIMEOUT_S = 10.0              # role-based models need more time for 1500-token output
 LLM_TIMEOUT_S = ROLE_LLM_TIMEOUT_S
-LLM_MAX_RETRIES = 3    # all attempts use role API; fallback model only if role API fails
+# Retries dropped from 3→2: aiserv learns from our reason="timeout" feedback
+# (see _report_quality) and immediately suppresses the failing route, so a
+# 3rd attempt rarely helps and just adds latency.
+LLM_MAX_RETRIES = 2
 LLM_MAX_INPUT = 3000   # chars of conversation to send to LLM
 
 
@@ -200,21 +203,29 @@ async def _resolve_qa_model(exclude: Optional[str] = None) -> tuple[str, str]:
     return AISERV_FALLBACK_MODEL, "fast"
 
 
-async def _report_quality(model: str, score: int) -> None:
+async def _report_quality(model: str, score: int, reason: str = "") -> None:
     """Fire-and-forget: push quality signal to aiserv health matrix.
 
-    score=+1 (success) or -1 (timeout/failure). aiserv accumulates these in
-    feedback_scores which shifts _score() output — after enough -1s a slow
-    model scores ≤ 0 and is automatically excluded from role routing.
+    score=+1 (success) or -1 (timeout/failure).
+    reason: when score=-1, why it failed — "timeout" | "5xx" | "bad_json" | "other".
+            aiserv uses this to short-circuit its role router: reason="timeout"
+            triggers an urgent re-probe and writes a synthetic failed
+            ProbeResult so the model is suppressed for ~5min until the next
+            real probe. Without a reason, aiserv only adjusts blended
+            quality scores (slow signal).
     """
     try:
         async with httpx.AsyncClient(timeout=2.0) as client:
+            payload: dict = {"model": model, "score": score, "task_type": "language"}
+            if reason:
+                payload["reason"] = reason
             await client.post(
                 f"{AISERV_BASE}/v1/quality-feedback",
-                json={"model": model, "score": score, "task_type": "language"},
+                json=payload,
                 headers={"Authorization": f"Bearer {AISERV_KEY}"},
             )
-            log.debug("[extractor] quality-feedback: %s score=%+d", model, score)
+            log.debug("[extractor] quality-feedback: %s score=%+d reason=%s",
+                      model, score, reason or "n/a")
     except Exception:
         pass  # best-effort; never block the caller
 
@@ -512,19 +523,21 @@ async def _llm_extract(conversation_text: str) -> list[ExtractedFact]:
         except json.JSONDecodeError as e:
             log.warning("[extractor] %s returned non-JSON: %s", model, e)
             exclude = model
-            asyncio.create_task(_report_quality(model, -1))
+            asyncio.create_task(_report_quality(model, -1, reason="bad_json"))
         except httpx.TimeoutException:
             log.warning("[extractor] %s timed out (%.1fs)", model, timeout_s)
             exclude = model
-            # Self-healing: push -1 back to aiserv health matrix so slow models
-            # are automatically downranked/excluded from future role routing.
-            asyncio.create_task(_report_quality(model, -1))
+            # Self-healing: push -1 + reason="timeout" back to aiserv. The
+            # reason field triggers aiserv to (a) urgently re-probe this
+            # route and (b) write a synthetic failed ProbeResult so the
+            # next /v1/role/nlp call automatically suppresses this model.
+            asyncio.create_task(_report_quality(model, -1, reason="timeout"))
         except Exception as e:
             log.warning(
                 "[extractor] %s failed: %s: %s", model, type(e).__name__, e
             )
             exclude = model
-            asyncio.create_task(_report_quality(model, -1))
+            asyncio.create_task(_report_quality(model, -1, reason="other"))
 
     log.error("[extractor] All models exhausted after %d attempts (%s)",
               LLM_MAX_RETRIES, ", ".join(tried_models))

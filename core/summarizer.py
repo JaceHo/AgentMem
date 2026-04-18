@@ -56,13 +56,20 @@ async def _get_model() -> str:
     return _FALLBACK_MODEL
 
 
-async def _report_quality(model: str, score: int) -> None:
-    """Fire-and-forget quality feedback → aiserv health matrix self-corrects."""
+async def _report_quality(model: str, score: int, reason: str = "") -> None:
+    """Fire-and-forget quality feedback → aiserv health matrix self-corrects.
+
+    reason: optional ("timeout"/"5xx"/"other") — when set on score=-1, aiserv
+    triggers an urgent re-probe and temporarily suppresses the failing route.
+    """
     try:
+        payload: dict = {"model": model, "score": score, "task_type": "language"}
+        if reason:
+            payload["reason"] = reason
         async with httpx.AsyncClient(timeout=2.0) as client:
             await client.post(
                 f"{AISERV_BASE}/v1/quality-feedback",
-                json={"model": model, "score": score, "task_type": "language"},
+                json=payload,
                 headers={"Authorization": f"Bearer {AISERV_KEY}"},
             )
     except Exception:
@@ -99,10 +106,10 @@ async def summarize(text: str) -> str:
                     return choices[0]["message"]["content"].strip()
     except httpx.TimeoutException:
         log.debug("[summarizer] %s timed out", model)
-        asyncio.create_task(_report_quality(model, -1))
+        asyncio.create_task(_report_quality(model, -1, reason="timeout"))
     except Exception as e:
         log.debug("[summarizer] %s failed: %s", model, e)
-        asyncio.create_task(_report_quality(model, -1))
+        asyncio.create_task(_report_quality(model, -1, reason="other"))
 
     return text[:MAX_SUMMARY_CHARS]
 
@@ -151,10 +158,10 @@ async def overwrite_update(
                     return choices[0]["message"]["content"].strip()
     except httpx.TimeoutException:
         log.debug("[summarizer:overwrite] %s timed out", model)
-        asyncio.create_task(_report_quality(model, -1))
+        asyncio.create_task(_report_quality(model, -1, reason="timeout"))
     except Exception as e:
         log.debug("[summarizer:overwrite] %s failed: %s", model, e)
-        asyncio.create_task(_report_quality(model, -1))
+        asyncio.create_task(_report_quality(model, -1, reason="other"))
 
     # Fallback: simple truncated concatenation
     combined = f"{existing_memory}\n---\n{new_chunk}"
