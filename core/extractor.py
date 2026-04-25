@@ -157,13 +157,10 @@ AISERV_KEY   = "sk-aiserv-local"
 AISERV_ROLE  = "nlp"                    # maps to /v1/role/nlp
 AISERV_FALLBACK_MODEL = "fast"          # used only if /v1/role/nlp is unreachable
 AISERV_MODEL_CASCADE = []               # populated dynamically; kept for import compat
-FAST_LLM_TIMEOUT_S = 4.0               # "fast" tier — tightened from 5s; aiserv now self-heals
-ROLE_LLM_TIMEOUT_S = 10.0              # role-based models need more time for 1500-token output
+FAST_LLM_TIMEOUT_S = 4.0
+ROLE_LLM_TIMEOUT_S = 15.0
 LLM_TIMEOUT_S = ROLE_LLM_TIMEOUT_S
-# Retries dropped from 3→2: aiserv learns from our reason="timeout" feedback
-# (see _report_quality) and immediately suppresses the failing route, so a
-# 3rd attempt rarely helps and just adds latency.
-LLM_MAX_RETRIES = 2
+LLM_MAX_RETRIES = 3
 LLM_MAX_INPUT = 3000   # chars of conversation to send to LLM
 
 
@@ -539,8 +536,11 @@ async def _llm_extract(conversation_text: str) -> list[ExtractedFact]:
             exclude = model
             asyncio.create_task(_report_quality(model, -1, reason="other"))
 
-    log.error("[extractor] All models exhausted after %d attempts (%s)",
-              LLM_MAX_RETRIES, ", ".join(tried_models))
+    log.error(
+        "[extractor] All LLM models exhausted after %d attempts. Tried: %s. "
+        "Returning empty list - caller should use regex fallback.",
+        LLM_MAX_RETRIES, ", ".join(tried_models) if tried_models else "none"
+    )
     return []
 
 

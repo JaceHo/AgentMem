@@ -34,8 +34,8 @@ from .extractor import (
 
 log = logging.getLogger("mem")
 
-_PLAN_TIMEOUT_S = 3.0   # planning generates fewer tokens; 3s hard cap keeps recall fast
-_PLAN_MAX_RETRIES = 1   # single attempt — fail fast; retrying multiplies latency
+_PLAN_TIMEOUT_S = 5.0
+_PLAN_MAX_RETRIES = 2
 
 
 async def _llm_call(prompt: str, system: str, max_tokens: int = 300) -> str | None:
