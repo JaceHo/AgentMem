@@ -49,6 +49,9 @@ class ExtractedFact:
     triple_s: str | None = None          # triple subject
     triple_p: str | None = None          # triple predicate
     triple_o: str | None = None          # triple object
+    # LLM Wiki v2 fields (v1.1)
+    source_count: int = 1                # how many sources support this fact
+    sources: list[str] | None = None     # source identifiers
 
 
 # ── Layer 1: Regex patterns (fast, ~1ms) ──────────────────────────────────────

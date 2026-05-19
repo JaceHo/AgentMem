@@ -1,5 +1,5 @@
 """
-Redis 8 native vectorset store — v0.9.1 (SimpleMem-aligned)
+Redis 8 native vectorset store — v1.1 (LLM Wiki v2-aligned)
 
 Two vector sets:
   mem:episodes  — episodic memory (conversation turns)
@@ -15,6 +15,15 @@ SimpleMem additions (v0.9.1):
   - topic and location fields: SimpleMem symbolic layer (R_k metadata)
   - knn_search() filters out superseded entries by default
 
+LLM Wiki v2 additions (v1.1):
+  - source_count: how many independent sources support this fact (reinforcement)
+  - last_confirmed_ts: timestamp of most recent reinforcement (Ebbinghaus decay)
+  - superseded_at: timestamp when supersession occurred (version chain)
+  - superseded_reason: "merged" | "contradicted" | "updated" | "pruned"
+  - version: incrementing counter for each fact (tracks edits)
+  - confidence_decay(): Ebbinghaus forgetting curve — confidence decays
+    exponentially with time since last confirmation, resets on reinforcement
+
 Redis 8 vectorset API summary:
   VADD  key FP32 <blob> <element> [SETATTR <json>]
   VSIM  key FP32 <blob> COUNT k WITHSCORES WITHATTRIBS [FILTER <expr>]
@@ -23,6 +32,7 @@ Redis 8 vectorset API summary:
 
 import json
 import logging
+import math
 import os
 import time
 from typing import Optional
@@ -54,6 +64,80 @@ DIMS         = _embed_mod.DIMS
 # Must call close_pool() at shutdown (called from lifespan).
 _pool: aioredis.ConnectionPool | None = None
 _client: aioredis.Redis | None = None
+
+
+# ── LLM Wiki v2: Confidence decay (Ebbinghaus forgetting curve) ───────────────
+# Confidence decays exponentially with time since last confirmation.
+# Each reinforcement (new source, re-observation) resets the curve.
+# S (stability) varies by category: rules/identity decay slowly, bugs fast.
+
+_CATEGORY_STABILITY_DAYS = {
+    "identity": 365, "rule": 365, "preference": 180, "decision": 180,
+    "work": 120, "personal": 120, "location": 120,
+    "procedure": 90, "context": 60, "tool_use": 60,
+    "entity": 90, "warning": 30, "reminder": 30,
+}
+
+_DEFAULT_STABILITY_DAYS = 90
+
+
+def confidence_decay(attrs: dict) -> float:
+    """
+    Compute current effective confidence using Ebbinghaus forgetting curve.
+
+    R(t) = e^(-t/S)  where t = days since last confirmation, S = stability.
+    effective_confidence = base_confidence × R(t) × min(1, source_count/3)
+
+    - source_count ≥ 3 → full multiplier (well-supported fact)
+    - source_count = 1 → 0.33× (single source, less reliable)
+    - Reinforcement resets last_confirmed_ts → R(t) → 1.0 again
+    """
+    base = attrs.get("confidence", 0.8)
+    source_count = max(1, attrs.get("source_count", 1))
+    last_confirmed = attrs.get("last_confirmed_ts", attrs.get("ts", 0))
+    category = attrs.get("category", "general")
+
+    now_ms = int(time.time() * 1000)
+    days_since = max(0, (now_ms - last_confirmed) / 86_400_000)
+
+    stability = _CATEGORY_STABILITY_DAYS.get(category, _DEFAULT_STABILITY_DAYS)
+    retention = math.exp(-days_since / stability)
+    source_multiplier = min(1.0, source_count / 3.0)
+
+    return round(base * retention * source_multiplier, 4)
+
+
+async def reinforce_fact(
+    r: aioredis.Redis,
+    element_id: str,
+    new_source: str | None = None,
+) -> bool:
+    """
+    Reinforce a fact — increment source_count, reset last_confirmed_ts.
+
+    LLM Wiki v2: "Confidence strengthens with reinforcement. Each reinforcement
+    (access, confirmation from a new source) resets the [Ebbinghaus] curve."
+
+    Returns True if reinforcement succeeded.
+    """
+    try:
+        raw = await r.execute_command("VGETATTR", FACT_KEY, element_id)
+        if not raw:
+            return False
+        attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+        attrs["source_count"] = attrs.get("source_count", 1) + 1
+        attrs["last_confirmed_ts"] = int(time.time() * 1000)
+        attrs["version"] = attrs.get("version", 1) + 1
+        if new_source:
+            sources = attrs.get("sources", [])
+            if new_source not in sources:
+                sources.append(new_source)
+                attrs["sources"] = sources[:10]  # cap at 10
+        await r.execute_command("VSETATTR", FACT_KEY, element_id, json.dumps(attrs))
+        return True
+    except Exception as e:
+        log.warning("reinforce_fact failed for %s: %s", element_id, e)
+        return False
 
 
 def _get_pool() -> aioredis.ConnectionPool:
@@ -270,6 +354,10 @@ async def save_fact(
     triple_s: str | None = None,
     triple_p: str | None = None,
     triple_o: str | None = None,
+    # LLM Wiki v2 fields (v1.1)
+    source_count: int = 1,
+    sources: list[str] | None = None,
+    superseded_reason: str = "",
 ) -> str:
     """
     Save a fact to the semantic memory vectorset.
@@ -283,18 +371,32 @@ async def save_fact(
     Memori fields (v1.1):
       source_episode_id: UID of the episode this fact was extracted from (dual-layer linking)
       triple_s/p/o:      semantic triple subject/predicate/object for precision retrieval
+
+    LLM Wiki v2 fields (v1.1):
+      source_count:      how many independent sources support this fact (≥3 = well-supported)
+      last_confirmed_ts: timestamp of most recent reinforcement (Ebbinghaus decay anchor)
+      superseded_at:     timestamp when supersession occurred (0 = active)
+      superseded_reason: "merged" | "contradicted" | "updated" | "pruned" | ""
+      version:           incrementing counter for each fact (tracks edits)
+      sources:           list of source identifiers that contributed to this fact
     """
     uid  = str(ULID())
+    now_ms = int(time.time() * 1000)
     attr_dict: dict = {
-        "content":       content[:500],
-        "category":      category,
-        "language":      language,
-        "domain":        domain,
-        "confidence":    confidence,
-        "ts":            int(time.time() * 1000),
-        "access_count":  0,
-        "importance":    max(0.0, min(1.0, importance)),
-        "superseded_by": "",   # empty = active; set to winner_id on consolidation
+        "content":           content[:500],
+        "category":          category,
+        "language":          language,
+        "domain":            domain,
+        "confidence":        confidence,
+        "ts":                now_ms,
+        "access_count":      0,
+        "importance":        max(0.0, min(1.0, importance)),
+        "superseded_by":     "",   # empty = active; set to winner_id on consolidation
+        "source_count":      source_count,
+        "last_confirmed_ts": now_ms,
+        "superseded_at":     0,    # 0 = active; set to timestamp on supersession
+        "superseded_reason": superseded_reason,
+        "version":           1,
     }
     if keywords:
         attr_dict["keywords"] = keywords[:10]
@@ -314,6 +416,8 @@ async def save_fact(
         attr_dict["triple_o"] = triple_o[:200]
         # Also store compact triple string for BM25 keyword matching
         attr_dict["triple_str"] = f"{triple_s} | {triple_p} | {triple_o}"
+    if sources:
+        attr_dict["sources"] = sources[:10]
 
     await r.execute_command("VADD", FACT_KEY, "FP32", _blob(embedding), uid,
                             "SETATTR", json.dumps(attr_dict))
@@ -324,6 +428,7 @@ async def soft_delete_fact(
     r: aioredis.Redis,
     element_id: str,
     superseded_by: str,
+    reason: str = "merged",
 ) -> None:
     """
     Mark a fact as superseded (soft-delete, SimpleMem consolidation pattern).
@@ -331,27 +436,30 @@ async def soft_delete_fact(
     Sets superseded_by = winner's element_id. knn_search() skips these by default.
     The entry is kept for audit/history but excluded from recall.
 
+    LLM Wiki v2 additions (v1.1):
+      superseded_at:     timestamp when supersession occurred (version chain)
+      superseded_reason: "merged" | "contradicted" | "updated" | "pruned"
+
     Bug fix v0.9.2: removed the ×0.1 importance decay that was applied here.
     Phase 1 (Decay) already applies ×0.9 per 90 days; Phase 3 (Prune) removes
     entries that fall below 0.05. Applying a second ×0.1 during soft-delete
     caused double-decay: loser facts dropped from 0.5 → 0.045, landing just
     below the prune floor and being silently hard-removed the very next run.
-
-    Redis 8 vectorset has no direct VGETATTR by element ID, so we use VGETATTR
-    (available in Redis 8.0.1+) and fall back to the VSIM ELE scan.
     """
+    now_ms = int(time.time() * 1000)
     try:
-        # Redis 8.0.1+ supports VGETATTR element_id directly
         raw = await r.execute_command("VGETATTR", FACT_KEY, element_id)
         if raw:
             attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
             attrs["superseded_by"] = superseded_by
+            attrs["superseded_at"] = now_ms
+            attrs["superseded_reason"] = reason
             await r.execute_command("VSETATTR", FACT_KEY, element_id, json.dumps(attrs))
             return
     except Exception as e:
         log.warning("soft_delete_fact VGETATTR failed for %s: %s", element_id, e)
 
-    # Fallback: VSIM ELE lookup (element-space traversal, Redis 8 native)
+    # Fallback: VSIM ELE lookup
     try:
         scan = await r.execute_command(
             "VSIM", FACT_KEY, "ELE", element_id,
@@ -361,17 +469,19 @@ async def soft_delete_fact(
             raw = scan[1]
             attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
             attrs["superseded_by"] = superseded_by
+            attrs["superseded_at"] = now_ms
+            attrs["superseded_reason"] = reason
             await r.execute_command("VSETATTR", FACT_KEY, element_id, json.dumps(attrs))
             return
     except Exception as e:
         log.warning("soft_delete_fact VSIM ELE fallback failed for %s: %s", element_id, e)
 
-    # Last resort: set superseded_by with minimal attrs to ensure
-    # knn_search() will filter this entry out
+    # Last resort: set superseded_by with minimal attrs
     try:
         await r.execute_command(
             "VSETATTR", FACT_KEY, element_id,
-            json.dumps({"superseded_by": superseded_by, "content": ""})
+            json.dumps({"superseded_by": superseded_by, "content": "",
+                        "superseded_at": now_ms, "superseded_reason": reason})
         )
     except Exception as e:
         log.error("soft_delete_fact ALL methods failed for %s: %s", element_id, e)

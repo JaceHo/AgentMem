@@ -1,12 +1,17 @@
 """
-Knowledge Graph Layer — v0.9.0
+Knowledge Graph Layer — v1.1 (LLM Wiki v2-aligned)
 
-Stores entity relationships as Redis Set adjacency lists alongside facts.
+Stores entity relationships as Redis Hash adjacency lists alongside facts.
 When a fact mentions entities X and Y together, both X→Y and Y→X edges
 are recorded so graph traversal is O(1) per hop.
 
-Redis key pattern:
-    mem:graph:{entity_slug}  →  Redis Set of related entity slugs
+LLM Wiki v2 additions (v1.1):
+  - Typed relationships: edges carry a type (uses, depends_on, contradicts,
+    caused, fixed, supersedes, related_to) with confidence and source count.
+  - Graph traversal: walk outward through typed edges for impact analysis.
+  - Redis key pattern changed from Set to Hash for typed edges:
+    mem:graph:{entity_slug}  →  Redis Hash {neighbour_slug: edge_json}
+  - Legacy co-occurrence edges preserved as type="related_to".
 
 Slugs are lowercased, whitespace→underscore, non-alnum stripped.
 This ensures consistent lookup regardless of capitalisation.
@@ -14,18 +19,33 @@ This ensures consistent lookup regardless of capitalisation.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import re
+import time
 
 import redis.asyncio as aioredis
 
 GRAPH_PREFIX = "mem:graph:"
 
+# LLM Wiki v2 typed relationship vocabulary
+RELATIONSHIP_TYPES = frozenset({
+    "uses",           # A uses B (e.g., "project uses Redis")
+    "depends_on",     # A depends on B (stronger than uses)
+    "contradicts",    # A contradicts B (opposing claims)
+    "caused",         # A caused B (causal link)
+    "fixed",          # A fixed B (bug fix)
+    "supersedes",     # A supersedes B (newer version replaces older)
+    "related_to",     # Default co-occurrence (legacy)
+})
+
 
 def _slug(entity: str) -> str:
     """Normalise an entity name to a stable Redis key segment.
 
-    Preserves CJK characters (U+4E00–U+9FFF) which were previously stripped
-    by [^\w] since \w does not include Unicode CJK in Python's default ASCII mode.
+    Preserves CJK characters (U+4E00-U+9FFF) which were previously stripped
+    by ``[^\\w]`` since ``\\w`` does not include Unicode CJK in Python's
+    default ASCII mode.
     """
     s = entity.lower().strip()
     s = re.sub(r"\s+", "_", s)
@@ -42,6 +62,9 @@ async def record_entities(
     r: aioredis.Redis,
     entities: list[str],
     persons: list[str],
+    relationship_type: str = "related_to",
+    confidence: float = 0.8,
+    source: str = "",
 ) -> None:
     """
     Record co-occurrence edges for all pairs in entities + persons.
@@ -49,26 +72,181 @@ async def record_entities(
     For N items this creates N*(N-1) directed edges (stored as undirected
     by writing both directions). Uses a Redis pipeline for efficiency.
 
+    LLM Wiki v2 (v1.1): edges are now typed with confidence and source_count.
+    Stored as Redis Hash: {neighbour_slug: edge_json} where edge_json contains
+    {type, confidence, source_count, last_seen, sources}.
+
     Args:
-        r:        Redis client.
-        entities: Entity names extracted from a fact (e.g. ["Redis", "FastAPI"]).
-        persons:  Person names extracted from a fact (e.g. ["Bob", "Alice"]).
+        r:                Redis client.
+        entities:         Entity names extracted from a fact (e.g. ["Redis", "FastAPI"]).
+        persons:          Person names extracted from a fact (e.g. ["Bob", "Alice"]).
+        relationship_type: One of RELATIONSHIP_TYPES (default: "related_to").
+        confidence:       Confidence score for this edge (0-1).
+        source:           Source identifier for this edge.
     """
+    if relationship_type not in RELATIONSHIP_TYPES:
+        relationship_type = "related_to"
+
     all_ents = list(dict.fromkeys(entities + persons))  # deduplicated, order-preserved
     if len(all_ents) < 2:
         return
 
     pipe = r.pipeline(transaction=False)
+    now_ms = int(time.time() * 1000)
+
     for i, a in enumerate(all_ents):
         for b in all_ents[i + 1:]:
             slug_a = _slug(a)
             slug_b = _slug(b)
             if slug_a == slug_b:
                 continue
-            # Bidirectional edges
-            pipe.sadd(_key(a), slug_b)
-            pipe.sadd(_key(b), slug_a)
+            # Bidirectional typed edges as Hash fields
+            edge_data = json.dumps({
+                "type": relationship_type,
+                "confidence": confidence,
+                "source_count": 1,
+                "last_seen": now_ms,
+                "sources": [source][:5] if source else [],
+            })
+            pipe.hset(_key(a), slug_b, edge_data)
+            pipe.hset(_key(b), slug_a, edge_data)
     await pipe.execute()
+
+
+async def add_typed_edge(
+    r: aioredis.Redis,
+    source_entity: str,
+    target_entity: str,
+    relationship_type: str,
+    confidence: float = 0.8,
+    source: str = "",
+    bidirectional: bool = False,
+) -> None:
+    """
+    Add a typed relationship edge between two entities.
+
+    LLM Wiki v2: "Not all connections are equal. 'uses', 'depends on',
+    'contradicts', 'caused', 'fixed', 'supersedes' carry different semantic weight."
+
+    If an edge already exists between the same pair, increments source_count
+    and updates confidence to max(existing, new).
+
+    Args:
+        r:                Redis client.
+        source_entity:    Source entity name.
+        target_entity:    Target entity name.
+        relationship_type: One of RELATIONSHIP_TYPES.
+        confidence:       Confidence score for this edge (0-1).
+        source:           Source identifier.
+        bidirectional:    If True, also add the reverse edge.
+    """
+    if relationship_type not in RELATIONSHIP_TYPES:
+        relationship_type = "related_to"
+
+    slug_s = _slug(source_entity)
+    slug_t = _slug(target_entity)
+    if slug_s == slug_t:
+        return
+
+    now_ms = int(time.time() * 1000)
+
+    async def _upsert_edge(key: str, field: str) -> None:
+        existing = await r.hget(key, field)
+        if existing:
+            try:
+                edge = json.loads(existing.decode() if isinstance(existing, bytes) else existing)
+                edge["source_count"] = edge.get("source_count", 1) + 1
+                edge["confidence"] = max(edge.get("confidence", 0.5), confidence)
+                edge["last_seen"] = now_ms
+                if source and source not in edge.get("sources", []):
+                    edge.setdefault("sources", []).append(source)
+                    edge["sources"] = edge["sources"][:5]
+                await r.hset(key, field, json.dumps(edge))
+                return
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                pass
+        edge_data = json.dumps({
+            "type": relationship_type,
+            "confidence": confidence,
+            "source_count": 1,
+            "last_seen": now_ms,
+            "sources": [source][:5] if source else [],
+        })
+        await r.hset(key, field, edge_data)
+
+    await _upsert_edge(_key(source_entity), slug_t)
+    if bidirectional:
+        await _upsert_edge(_key(target_entity), slug_s)
+
+
+async def traverse(
+    r: aioredis.Redis,
+    entity: str,
+    relationship_types: list[str] | None = None,
+    max_depth: int = 2,
+    max_nodes: int = 50,
+) -> list[dict]:
+    """
+    Walk outward through typed edges for impact analysis.
+
+    LLM Wiki v2: "When someone asks 'what's the impact of upgrading Redis?',
+    the LLM shouldn't just keyword-search. It should start at the Redis node,
+    walk outward through 'depends on' and 'uses' edges, and find everything
+    downstream."
+
+    Args:
+        r:                Redis client.
+        entity:           Starting entity name.
+        relationship_types: Filter to only these edge types (None = all).
+        max_depth:        Maximum traversal depth (1-3).
+        max_nodes:        Maximum nodes to return.
+
+    Returns:
+        List of {entity, depth, edge_type, confidence, path} dicts.
+    """
+    type_filter = set(relationship_types) if relationship_types else None
+    visited: dict[str, dict] = {}  # slug → {depth, edge_type, confidence, path}
+    frontier: list[tuple[str, int, str, float, str]] = [(_slug(entity), 0, "start", 1.0, entity)]
+
+    while frontier and len(visited) < max_nodes:
+        slug, depth, edge_type, conf, path = frontier.pop(0)
+        if slug in visited:
+            continue
+        visited[slug] = {
+            "entity": slug,
+            "depth": depth,
+            "edge_type": edge_type,
+            "confidence": conf,
+            "path": path,
+        }
+        if depth >= max_depth:
+            continue
+
+        # Get neighbours from hash
+        raw_edges = await r.hgetall(_key_from_slug(slug))
+        for neighbour_raw, edge_raw in raw_edges.items():
+            n_slug = neighbour_raw.decode() if isinstance(neighbour_raw, bytes) else neighbour_raw
+            if n_slug in visited:
+                continue
+            try:
+                edge = json.loads(edge_raw.decode() if isinstance(edge_raw, bytes) else edge_raw)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                edge = {"type": "related_to", "confidence": 0.5}
+
+            e_type = edge.get("type", "related_to")
+            if type_filter and e_type not in type_filter:
+                continue
+
+            frontier.append((
+                n_slug, depth + 1, e_type,
+                min(conf, edge.get("confidence", 0.5)),
+                f"{path} → {e_type} → {n_slug}",
+            ))
+
+    # Remove the starting entity from results
+    start_slug = _slug(entity)
+    visited.pop(start_slug, None)
+    return list(visited.values())
 
 
 async def get_related(
@@ -79,7 +257,8 @@ async def get_related(
     """
     Return entity slugs related to *entity* up to *depth* hops.
 
-    depth=1 → direct neighbours only (SMEMBERS).
+    Works with both new Hash-based typed edges and legacy Set-based edges.
+    depth=1 → direct neighbours only.
     depth=2 → neighbours + their neighbours (one extra hop).
 
     Returns a flat, deduplicated list of slug strings.
@@ -90,8 +269,17 @@ async def get_related(
     for _ in range(depth):
         next_frontier: set[str] = set()
         for slug in frontier:
-            members_raw = await r.smembers(_key_from_slug(slug))
-            members = {m.decode() if isinstance(m, bytes) else m for m in members_raw}
+            # Try Hash-based typed edges first (v1.1)
+            raw_edges = await r.hgetall(_key_from_slug(slug))
+            if raw_edges:
+                members = {
+                    k.decode() if isinstance(k, bytes) else k
+                    for k in raw_edges.keys()
+                }
+            else:
+                # Fallback: legacy Set-based edges (v0.9.0)
+                members_raw = await r.smembers(_key_from_slug(slug))
+                members = {m.decode() if isinstance(m, bytes) else m for m in members_raw}
             next_frontier |= members - visited - frontier
         visited |= frontier
         frontier = next_frontier
@@ -279,23 +467,46 @@ async def get_entity_neighbors_with_counts(
     entity: str,
 ) -> list[dict]:
     """
-    Return related entities with their fact counts (for /graph/{entity} endpoint).
+    Return related entities with their edge type and connection counts.
 
-    Each result: {"entity": slug, "fact_count": N}
-    Fact count is estimated by SMEMBERS of that entity's graph key.
+    Works with both Hash-based typed edges (v1.1) and legacy Set-based edges.
     """
-    from . import store as mem_store
+    # Try Hash-based typed edges first (v1.1)
+    raw_edges = await r.hgetall(_key(entity))
+    if raw_edges:
+        results = []
+        for neighbour_raw, edge_raw in sorted(raw_edges.items(), key=lambda x: x[0]):
+            slug = neighbour_raw.decode() if isinstance(neighbour_raw, bytes) else neighbour_raw
+            try:
+                edge = json.loads(edge_raw.decode() if isinstance(edge_raw, bytes) else edge_raw)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                edge = {"type": "related_to", "confidence": 0.5, "source_count": 1}
+            # Count connections of the neighbour
+            n_edges = await r.hlen(_key_from_slug(slug))
+            if not n_edges:
+                n_edges = await r.scard(_key_from_slug(slug))
+            results.append({
+                "entity": slug,
+                "connection_count": int(n_edges or 0),
+                "edge_type": edge.get("type", "related_to"),
+                "confidence": edge.get("confidence", 0.5),
+                "source_count": edge.get("source_count", 1),
+            })
+        return results
 
+    # Fallback: legacy Set-based edges (v0.9.0)
     related_slugs_raw = await r.smembers(_key(entity))
     related_slugs = [
         (m.decode() if isinstance(m, bytes) else m) for m in related_slugs_raw
     ]
-
     results = []
     for slug in sorted(related_slugs):
-        # Estimate fact count: how many entities this slug is related to
-        # (a rough proxy — the actual count would require a full scan)
         card = await r.scard(_key_from_slug(slug))
-        results.append({"entity": slug, "connection_count": int(card or 0)})
-
+        results.append({
+            "entity": slug,
+            "connection_count": int(card or 0),
+            "edge_type": "related_to",
+            "confidence": 0.5,
+            "source_count": 1,
+        })
     return results

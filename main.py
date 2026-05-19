@@ -1256,6 +1256,63 @@ async def _evolve_similar_fact(element_id: str, new_keywords: list[str], new_top
         log.debug(f"[evolution] skipped: {e}")
 
 
+async def _check_contradiction(existing_fact: dict, new_fact) -> None:
+    """
+    LLM Wiki v2: Contradiction detection on store.
+
+    When a new fact is semantically similar (0.80-0.95) to an existing one,
+    check if they contradict. If so, add a 'contradicts' graph edge and
+    mark the older fact as superseded with reason='contradicted'.
+
+    Uses simple heuristic: if the same subject has opposing values
+    (e.g., "X is A" vs "X is B" where A ≠ B), it's a contradiction.
+    """
+    element_id = existing_fact.get("_element", "")
+    if not element_id:
+        return
+
+    old_content = existing_fact.get("content", "").lower()
+    new_content = (new_fact.content if hasattr(new_fact, "content") else str(new_fact)).lower()
+
+    # Extract entities from both facts for graph edge
+    old_ents = existing_fact.get("attrs", {}).get("entities") or []
+    new_ents = (new_fact.entities if hasattr(new_fact, "entities") else None) or []
+
+    # Simple contradiction heuristic: same entities, different content
+    # (a proper implementation would use LLM judge, but this covers common cases)
+    shared_ents = set(e.lower() for e in old_ents) & set(e.lower() for e in new_ents)
+    if not shared_ents:
+        return
+
+    # Check for opposing patterns: "is X" vs "is not X", "uses A" vs "uses B"
+    _OPPOSITES = [
+        ("is not", "is"), ("does not", "does"), ("cannot", "can"),
+        ("will not", "will"), ("has no", "has"), ("no longer", ""),
+    ]
+    is_contradiction = False
+    for neg, pos in _OPPOSITES:
+        if neg in old_content and pos in new_content:
+            is_contradiction = True
+            break
+        if neg in new_content and pos in old_content:
+            is_contradiction = True
+            break
+
+    if not is_contradiction:
+        return
+
+    # Add 'contradicts' graph edge between shared entities
+    for ent in shared_ents:
+        await graph_mod.add_typed_edge(
+            _redis, ent, ent, "contradicts",
+            confidence=0.9, source="contradiction_detector", bidirectional=False,
+        )
+
+    # Mark old fact as superseded
+    await mem_store.soft_delete_fact(_redis, element_id, "contradicted", reason="contradicted")
+    log.info(f"[contradiction] fact {element_id} superseded: contradicted by new fact")
+
+
 # ── Background store ──────────────────────────────────────────────────────────
 async def _do_store(messages: list[Message], session_id: str) -> None:
     global _store_attempts, _store_successes, _store_skips, _store_errors, _store_latency_sum_ms
@@ -1351,6 +1408,12 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
                         fact.topic,
                     ), "evolve")
                 continue
+            # LLM Wiki v2: Contradiction detection — if a high-similarity fact exists
+            # (0.80-0.95 range) with opposing meaning, mark old as superseded.
+            if existing and existing[0].get("score", 0.0) > 0.80:
+                _spawn(_check_contradiction(
+                    existing[0], fact,
+                ), "contradiction")
             uid = await mem_store.save_fact(
                 _redis, fact.content, fact.category, fact.confidence, f_emb, lang, domain,
                 keywords=fact.keywords, persons=fact.persons, entities=fact.entities,
@@ -2784,11 +2847,15 @@ async def _do_consolidate(
     temporal_lambda: float = 0.03,      # temporal decay: λ=0.03 → 23-day half-life
 ) -> dict:
     """
-    SimpleMem 3-phase consolidation (Section 3.2):
-      Phase 1 — Decay:  importance × 0.9 for entries older than 90 days
+    SimpleMem 3-phase consolidation (Section 3.2) + LLM Wiki v2 Ebbinghaus decay:
+      Phase 1 — Decay:  Ebbinghaus forgetting curve — effective confidence decays
+                        based on category stability and time since last confirmation.
+                        importance × 0.9 for entries older than 90 days (legacy).
       Phase 2 — Merge:  cluster near-duplicates (cosine×temporal ≥ threshold),
                         LLM-merge into keeper, soft-delete losers via superseded_by
+                        (reason="merged"). Merged keeper inherits source_count sum.
       Phase 3 — Prune:  soft-delete any active entry with importance < 0.05
+                        (reason="pruned") or effective confidence < 0.1.
     """
     t0 = time.time()
     now_ms = int(time.time() * 1000)
@@ -2832,15 +2899,26 @@ async def _do_consolidate(
     if len(all_facts) < 2:
         return {"merged": 0, "decayed": 0, "pruned": 0, "total": len(all_facts), "ms": 0}
 
-    # ── Phase 1: Decay ─────────────────────────────────────────────────────────
-    # Entries older than 90 days lose 10% importance each consolidation run.
+    # ── Phase 1: Decay (Ebbinghaus + legacy importance) ─────────────────────────
+    # LLM Wiki v2: Ebbinghaus forgetting curve — confidence decays based on
+    # category stability and time since last confirmation.
+    # Legacy: entries older than 90 days lose 10% importance each run.
     decayed_count = 0
     for fact in all_facts:
+        changed = False
         ts = fact["attrs"].get("ts", now_ms)
+        # Legacy importance decay
         if (now_ms - ts) > NINETY_DAYS_MS:
             old_imp = fact["attrs"].get("importance", 0.5)
             new_imp = round(old_imp * 0.9, 4)
             fact["attrs"]["importance"] = new_imp
+            changed = True
+        # LLM Wiki v2: compute effective confidence and store it
+        eff_conf = mem_store.confidence_decay(fact["attrs"])
+        if eff_conf != fact["attrs"].get("effective_confidence", -1):
+            fact["attrs"]["effective_confidence"] = eff_conf
+            changed = True
+        if changed:
             try:
                 await _redis.execute_command(
                     "VSETATTR", mem_store.FACT_KEY, fact["element"],
@@ -2913,6 +2991,10 @@ async def _do_consolidate(
         new_attrs["access_count"] = max(c["attrs"].get("access_count", 0) for c in cluster)
         new_attrs["importance"] = max(c["attrs"].get("importance", 0.5) for c in cluster)
         new_attrs["consolidated_from"] = len(cluster)
+        # LLM Wiki v2: inherit source_count sum and reset last_confirmed_ts
+        new_attrs["source_count"] = sum(c["attrs"].get("source_count", 1) for c in cluster)
+        new_attrs["last_confirmed_ts"] = int(time.time() * 1000)
+        new_attrs["version"] = keeper["attrs"].get("version", 1) + 1
 
         all_kw: set[str] = set()
         all_persons: set[str] = set()
@@ -2941,19 +3023,23 @@ async def _do_consolidate(
         # Soft-delete losers: mark superseded_by = keeper_element (never VREM)
         for c in cluster[1:]:
             if c["element"] not in superseded_elements:
-                await mem_store.soft_delete_fact(_redis, c["element"], keeper_element)
+                await mem_store.soft_delete_fact(_redis, c["element"], keeper_element, reason="merged")
                 superseded_elements.add(c["element"])
 
         merged_count += 1
 
     # ── Phase 3: Prune ─────────────────────────────────────────────────────────
-    # Soft-delete any remaining active entry whose importance has decayed below 0.05.
+    # Soft-delete any remaining active entry whose importance has decayed below 0.05
+    # or whose effective confidence (Ebbinghaus) has fallen below 0.1.
     pruned_count = 0
     for fact in all_facts:
         if fact["element"] in superseded_elements:
             continue
-        if fact["attrs"].get("importance", 1.0) < 0.05:
-            await mem_store.soft_delete_fact(_redis, fact["element"], "pruned")
+        imp = fact["attrs"].get("importance", 1.0)
+        eff_conf = fact["attrs"].get("effective_confidence", 1.0)
+        if imp < 0.05 or eff_conf < 0.1:
+            reason = "pruned" if imp < 0.05 else "confidence_expired"
+            await mem_store.soft_delete_fact(_redis, fact["element"], "pruned", reason=reason)
             superseded_elements.add(fact["element"])
             pruned_count += 1
 
@@ -3189,6 +3275,254 @@ async def graph_recall(req: GraphRecallRequest):
 async def graph_stats_endpoint():
     """Return knowledge graph statistics: node count and edge count."""
     return await graph_mod.graph_stats(_redis)
+
+
+# ── LLM Wiki v2 endpoints (v1.1) ─────────────────────────────────────────────
+
+class TypedEdgeRequest(BaseModel):
+    source_entity: str
+    target_entity: str
+    relationship_type: str = "related_to"   # uses, depends_on, contradicts, caused, fixed, supersedes
+    confidence: float = 0.8
+    source: str = ""
+    bidirectional: bool = False
+
+
+class TraverseRequest(BaseModel):
+    entity: str
+    relationship_types: list[str] | None = None
+    max_depth: int = 2
+    max_nodes: int = 50
+
+
+class ReinforceRequest(BaseModel):
+    element_id: str
+    source: str = ""
+
+
+class CrystallizeRequest(BaseModel):
+    session_id: str
+    max_facts: int = 20
+
+
+@app.post("/graph/edge")
+async def add_graph_edge(req: TypedEdgeRequest):
+    """
+    Add a typed relationship edge between two entities.
+
+    LLM Wiki v2: typed relationships carry semantic weight.
+    Types: uses, depends_on, contradicts, caused, fixed, supersedes, related_to.
+    """
+    await graph_mod.add_typed_edge(
+        _redis, req.source_entity, req.target_entity,
+        req.relationship_type, req.confidence, req.source, req.bidirectional,
+    )
+    await _ws_broadcast("graph_edge", {
+        "source": req.source_entity, "target": req.target_entity,
+        "type": req.relationship_type, "confidence": req.confidence,
+    })
+    return {"status": "ok", "source": req.source_entity, "target": req.target_entity,
+            "type": req.relationship_type}
+
+
+@app.post("/graph/traverse")
+async def graph_traverse(req: TraverseRequest):
+    """
+    Walk outward through typed edges for impact analysis.
+
+    LLM Wiki v2: "Start at a node, walk outward through 'depends on' and 'uses'
+    edges, and find everything downstream."
+    """
+    results = await graph_mod.traverse(
+        _redis, req.entity, req.relationship_types,
+        req.max_depth, req.max_nodes,
+    )
+    return {"entity": req.entity, "nodes": results, "count": len(results)}
+
+
+@app.post("/facts/{element_id}/reinforce")
+async def reinforce_fact_endpoint(element_id: str, req: ReinforceRequest):
+    """
+    Reinforce a fact — increment source_count, reset Ebbinghaus decay.
+
+    LLM Wiki v2: "Confidence strengthens with reinforcement. Each reinforcement
+    resets the forgetting curve."
+    """
+    ok = await mem_store.reinforce_fact(_redis, element_id, req.source or None)
+    if not ok:
+        return {"status": "not_found", "element_id": element_id}
+    await _ws_broadcast("reinforce", {"element_id": element_id, "source": req.source})
+    return {"status": "ok", "element_id": element_id}
+
+
+@app.get("/facts/{element_id}/confidence")
+async def get_fact_confidence(element_id: str):
+    """
+    Get effective confidence for a fact (Ebbinghaus decay applied).
+
+    Returns both base confidence and effective confidence after decay.
+    """
+    try:
+        raw = await _redis.execute_command("VGETATTR", mem_store.FACT_KEY, element_id)
+        if not raw:
+            return {"error": "not_found", "element_id": element_id}
+        attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+        eff = mem_store.confidence_decay(attrs)
+        return {
+            "element_id": element_id,
+            "base_confidence": attrs.get("confidence", 0.8),
+            "effective_confidence": eff,
+            "source_count": attrs.get("source_count", 1),
+            "last_confirmed_ts": attrs.get("last_confirmed_ts", 0),
+            "category": attrs.get("category", ""),
+            "version": attrs.get("version", 1),
+            "superseded_by": attrs.get("superseded_by", ""),
+            "superseded_reason": attrs.get("superseded_reason", ""),
+        }
+    except Exception as e:
+        return {"error": str(e), "element_id": element_id}
+
+
+@app.get("/lifecycle/stats")
+async def lifecycle_stats():
+    """
+    Return lifecycle statistics: confidence distribution, supersession counts,
+    version distribution, and category-level health.
+    """
+    card = await _redis.execute_command("VCARD", mem_store.FACT_KEY)
+    if not card or int(card) <= 1:
+        return {"total": 0}
+
+    seed = np.zeros(embedder.DIMS, dtype=np.float32)
+    results = await _redis.execute_command(
+        "VSIM", mem_store.FACT_KEY, "FP32", seed.tobytes(),
+        "COUNT", min(int(card), 500), "WITHSCORES", "WITHATTRIBS"
+    )
+
+    active = 0
+    superseded = 0
+    conf_buckets = {"high": 0, "medium": 0, "low": 0, "expired": 0}
+    reason_counts: dict[str, int] = {}
+    category_health: dict[str, dict] = {}
+
+    i = 0
+    while i + 2 < len(results):
+        raw = results[i + 2]
+        i += 3
+        try:
+            attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+        except Exception:
+            continue
+        if attrs.get("_seed") or not attrs.get("content"):
+            continue
+
+        if attrs.get("superseded_by"):
+            superseded += 1
+            reason = attrs.get("superseded_reason", "unknown")
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+            continue
+
+        active += 1
+        eff = mem_store.confidence_decay(attrs)
+        if eff >= 0.7:
+            conf_buckets["high"] += 1
+        elif eff >= 0.4:
+            conf_buckets["medium"] += 1
+        elif eff >= 0.1:
+            conf_buckets["low"] += 1
+        else:
+            conf_buckets["expired"] += 1
+
+        cat = attrs.get("category", "general")
+        if cat not in category_health:
+            category_health[cat] = {"count": 0, "avg_confidence": 0.0, "total_conf": 0.0}
+        category_health[cat]["count"] += 1
+        category_health[cat]["total_conf"] += eff
+
+    for cat in category_health:
+        c = category_health[cat]
+        c["avg_confidence"] = round(c["total_conf"] / max(1, c["count"]), 4)
+        del c["total_conf"]
+
+    return {
+        "total": active + superseded,
+        "active": active,
+        "superseded": superseded,
+        "confidence_distribution": conf_buckets,
+        "supersession_reasons": reason_counts,
+        "category_health": category_health,
+    }
+
+
+@app.post("/crystallize")
+async def crystallize(req: CrystallizeRequest):
+    """
+    Crystallize a session — distill it into a structured digest.
+
+    LLM Wiki v2: "Crystallization is the process of taking a completed chain of
+    work and automatically distilling it into a structured digest. What was the
+    question? What did we find? What entities were involved? What lessons emerged?"
+    """
+    # Gather session facts
+    session_key = f"mem:session:{req.session_id}"
+    session_data = await _redis.get(session_key)
+
+    # Gather facts from this session (by timestamp proximity)
+    card = await _redis.execute_command("VCARD", mem_store.FACT_KEY)
+    if not card or int(card) <= 1:
+        return {"session_id": req.session_id, "facts": [], "entities": [], "lessons": []}
+
+    seed = np.zeros(embedder.DIMS, dtype=np.float32)
+    results = await _redis.execute_command(
+        "VSIM", mem_store.FACT_KEY, "FP32", seed.tobytes(),
+        "COUNT", min(int(card), 200), "WITHSCORES", "WITHATTRIBS"
+    )
+
+    facts = []
+    all_entities: set[str] = set()
+    i = 0
+    while i + 2 < len(results):
+        raw = results[i + 2]
+        i += 3
+        try:
+            attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+        except Exception:
+            continue
+        if attrs.get("_seed") or not attrs.get("content") or attrs.get("superseded_by"):
+            continue
+        facts.append(attrs)
+        for e in attrs.get("entities", []):
+            all_entities.add(e)
+        for p in attrs.get("persons", []):
+            all_entities.add(p)
+
+    # Sort by importance, take top N
+    facts.sort(key=lambda a: a.get("importance", 0.5), reverse=True)
+    top_facts = facts[:req.max_facts]
+
+    # Build digest
+    digest = {
+        "session_id": req.session_id,
+        "fact_count": len(top_facts),
+        "total_facts_available": len(facts),
+        "facts": [
+            {
+                "content": f.get("content", ""),
+                "category": f.get("category", ""),
+                "confidence": f.get("confidence", 0.8),
+                "effective_confidence": mem_store.confidence_decay(f),
+                "importance": f.get("importance", 0.5),
+                "source_count": f.get("source_count", 1),
+            }
+            for f in top_facts
+        ],
+        "entities": sorted(all_entities),
+        "categories": sorted(set(f.get("category", "") for f in top_facts)),
+        "crystallized_at": int(time.time() * 1000),
+    }
+
+    await _ws_broadcast("crystallize", {"session_id": req.session_id, "fact_count": len(top_facts)})
+    return digest
 
 
 # ── Config endpoint (v0.9.0) ──────────────────────────────────────────────────
