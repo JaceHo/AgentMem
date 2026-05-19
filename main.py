@@ -428,15 +428,33 @@ async def _populate_bm25_from_redis(r) -> None:
 async def lifespan(app: FastAPI):
     global _redis
     log.info("Loading embedding model…")
-    embedder.get_model()
+    embedder._get_provider()  # warm up embedding model
     log.info("Connecting to Redis…")
     _redis = await mem_store.get_client()
+
+    # Dimension guard: if existing vectorset has different dims than current
+    # provider, force local (384-dim) to avoid corrupting vector search.
+    try:
+        info = await _redis.execute_command("VINFO", mem_store.FACT_KEY)
+        if info:
+            # VINFO returns flat list: [key, val, key, val, ...]
+            info_dict = dict(zip(info[::2], info[1::2]))
+            existing_dims = int(info_dict.get(b"vector-dim", info_dict.get("vector-dim", 0)))
+            if existing_dims and existing_dims != embedder.DIMS:
+                log.warning("Dimension mismatch: existing vectors=%d, provider=%s dims=%d — forcing local provider",
+                            existing_dims, embedder._get_provider().name, embedder.DIMS)
+                embedder._reset_provider("local")
+                mem_store.DIMS = embedder.DIMS
+    except Exception:
+        pass  # no existing vectorset, safe to use any provider
+
     log.info("Ensuring vectorset indexes…")
     await mem_store.ensure_indexes(_redis)
     asyncio.create_task(_periodic_consolidate())
     # Populate BM25 corpus from existing Redis facts (non-blocking, best-effort)
     asyncio.create_task(_populate_bm25_from_redis(_redis))
-    log.info("AgentMem v%s ready (session-handoff+hard-prune+auto-graph+batch-MCP)", APP_VERSION)
+    await _init_compat(_redis)
+    log.info("AgentMem v%s ready (session-handoff+hard-prune+auto-graph+batch-MCP+compat)", APP_VERSION)
     yield
     await _redis.aclose()
 
@@ -450,6 +468,9 @@ if _os.path.isdir(_static_dir):
     app.mount("/static", StaticFiles(directory=_static_dir), name="static")
 
 app.include_router(log_sse.log_sse_router)
+
+from api_compat import router as _compat_router, init_compat as _init_compat
+app.include_router(_compat_router)
 
 
 @app.get("/", include_in_schema=False)
@@ -1522,7 +1543,8 @@ async def answer(req: AnswerRequest):
 async def health():
     try:
         await _redis.ping()
-        return {"status": "ok", "redis": "ok", "version": APP_VERSION}
+        return {"status": "ok", "redis": "ok", "version": APP_VERSION,
+                "embedding": embedder.get_provider_info()}
     except Exception as e:
         return {"status": "degraded", "error": str(e)}
 

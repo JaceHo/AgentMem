@@ -1,20 +1,28 @@
 #!/usr/bin/env python3
 """
-agentmem — natural-language CLI over the AgentMem service.
+agentmem — Developer's Memory CLI
 
-Progressive disclosure for LLM agents:
+Memory commands (query the running service):
   agentmem                       → overview + commands
-  agentmem recall <QUERY>        → top-K memories for a query (1-line each)
+  agentmem recall <QUERY>        → top-K memories for a query
   agentmem store <TEXT>          → store a fact/memory
   agentmem procedures <QUERY>    → recall stored procedures
-  agentmem graph <ENTITY>        → knowledge-graph neighborhood for an entity
+  agentmem graph <ENTITY>        → knowledge-graph neighborhood
   agentmem stats                 → service stats
   agentmem health                → up/down
+
+Service commands (manage the service itself):
+  agentmem start [--host H] [--port P] [--dev]
+  agentmem connect [AGENT] [--all] [--dry-run] [--force]
+  agentmem doctor
+  agentmem demo
+  agentmem version
 
 Backend: http://localhost:18800 (override via AGENTMEM_URL).
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import sys
@@ -50,8 +58,8 @@ def die(msg: str, code: int = 1) -> None:
 
 
 def cmd_root() -> None:
-    print("agentmem — local long-term memory (port 18800)\n")
-    print("Commands:")
+    print("agentmem — Developer's Memory (port 18800)\n")
+    print("Memory commands (query the running service):")
     print("  agentmem recall <query>       top relevant memories for a query")
     print("  agentmem store <text>         store a new fact / memory")
     print("  agentmem procedures <query>   recall stored procedures (how-to memory)")
@@ -59,9 +67,18 @@ def cmd_root() -> None:
     print("  agentmem stats                memory stats / counts")
     print("  agentmem health               check service health")
     print()
-    print("Tip: prefer this over re-asking the user for context the agent has")
-    print("seen in past sessions. Stored memories survive across all chats.")
+    print("Service commands:")
+    print("  agentmem start [--host H] [--port P] [--dev]   start the server")
+    print("  agentmem connect [agent] [--all]               wire into AI agents")
+    print("  agentmem doctor                                diagnose issues")
+    print("  agentmem migrate-embeddings --provider <name>  switch embedding provider")
+    print("  agentmem demo                                  quick demo")
+    print("  agentmem version                               print version")
+    print()
+    print("Tip: stored memories survive across all chats.")
 
+
+# ── Memory commands ───────────────────────────────────────────────────────────
 
 def cmd_recall(args: list[str]) -> None:
     if not args: die("usage: agentmem recall <query>")
@@ -103,7 +120,8 @@ def cmd_procedures(args: list[str]) -> None:
 def cmd_graph(args: list[str]) -> None:
     if not args: die("usage: agentmem graph <entity>")
     ent = " ".join(args)
-    status, body = _req("GET", f"/graph/{urllib_quote(ent)}")
+    import urllib.parse
+    status, body = _req("GET", f"/graph/{urllib.parse.quote(ent, safe='')}")
     if status != 200: die(f"graph failed ({status}): {body}")
     print(json.dumps(body, indent=2, ensure_ascii=False))
 
@@ -122,21 +140,439 @@ def cmd_health() -> None:
         print(f"DOWN ({status}): {body}"); sys.exit(1)
 
 
-def urllib_quote(s: str) -> str:
-    import urllib.parse
-    return urllib.parse.quote(s, safe="")
+# ── Service commands ──────────────────────────────────────────────────────────
+
+def cmd_start(args: list[str]) -> None:
+    import uvicorn
+    host = "0.0.0.0"
+    port = 18800
+    dev = False
+    i = 0
+    while i < len(args):
+        if args[i] == "--host" and i + 1 < len(args):
+            host = args[i + 1]; i += 2
+        elif args[i] == "--port" and i + 1 < len(args):
+            port = int(args[i + 1]); i += 2
+        elif args[i] == "--dev":
+            dev = True; i += 1
+        else:
+            i += 1
+
+    host = os.getenv("AGENTMEM_HOST", host)
+    port = int(os.getenv("AGENTMEM_PORT", str(port)))
+
+    print(f"🧠 AgentMem — starting on {host}:{port}")
+    uvicorn.run("main:app", host=host, port=port, reload=dev)
+
+
+def cmd_connect(args: list[str]) -> None:
+    from connect import run_connect
+
+    agent_name = ""
+    dry_run = False
+    force = False
+    all_agents = False
+    i = 0
+    while i < len(args):
+        if args[i] == "--all":
+            all_agents = True; i += 1
+        elif args[i] == "--dry-run":
+            dry_run = True; i += 1
+        elif args[i] == "--force":
+            force = True; i += 1
+        elif not args[i].startswith("-"):
+            agent_name = args[i]; i += 1
+        else:
+            i += 1
+
+    run_connect(agent_name=agent_name, dry_run=dry_run, force=force, all_agents=all_agents)
+
+
+def cmd_doctor(args: list[str]) -> None:
+    print("\n🩺 AgentMem Doctor\n")
+
+    issues = []
+
+    redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
+    print(f"  Redis URL: {redis_url}")
+    try:
+        import redis.asyncio as aioredis
+        async def _check():
+            r = aioredis.from_url(redis_url, decode_responses=True)
+            await r.ping()
+            info = await r.info("server")
+            ver = info.get("redis_version", "?")
+            print(f"  Redis version: {ver}")
+            try:
+                card = await r.execute_command("VCARD", "mem:episodes")
+                print("  ✓ Redis vectorset support detected")
+            except Exception:
+                print("  ⚠ Redis vectorset NOT available (need Redis 8+)")
+                issues.append("Redis 8+ with vectorset support required")
+            await r.aclose()
+        asyncio.run(_check())
+    except Exception as e:
+        print(f"  ❌ Redis connection failed: {e}")
+        issues.append(f"Redis unreachable: {e}")
+
+    print()
+    # Add project root to path so core module is importable
+    _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _project_root not in sys.path:
+        sys.path.insert(0, _project_root)
+    try:
+        from core import embedder
+        print("  ✓ Embedder module loaded")
+    except Exception as e:
+        print(f"  ❌ Embedder module: {e}")
+        issues.append(f"Embedder: {e}")
+
+    try:
+        import httpx
+        print("  ✓ httpx (hooks dependency)")
+    except ImportError:
+        print("  ⚠ httpx not installed (hooks won't work)")
+        issues.append("pip install httpx")
+
+    try:
+        from ulid import ULID
+        print("  ✓ ulid")
+    except ImportError:
+        print("  ⚠ ulid not installed")
+        issues.append("pip install ulid-py")
+
+    print()
+    agents = []
+    if os.path.isdir(os.path.expanduser("~/.claude")):
+        agents.append("claude-code")
+    if os.path.isdir(os.path.expanduser("~/.codex")):
+        agents.append("codex")
+    if os.path.isdir(os.path.expanduser("~/.cursor")):
+        agents.append("cursor")
+    if os.path.isfile(os.path.expanduser("~/.gemini/settings.json")):
+        agents.append("gemini-cli")
+
+    if agents:
+        print(f"  Detected agents: {', '.join(agents)}")
+    else:
+        print("  No supported agents detected")
+
+    print()
+    if issues:
+        print(f"  ❌ {len(issues)} issue(s) found:")
+        for i, issue in enumerate(issues, 1):
+            print(f"     {i}. {issue}")
+    else:
+        print("  ✓ All checks passed!")
+
+    print()
+
+
+def cmd_demo(args: list[str]) -> None:
+    try:
+        import httpx
+    except ImportError:
+        print("❌ httpx not installed. Run: pip install httpx")
+        return
+
+    client = httpx.Client(base_url=BASE, timeout=5.0)
+
+    print(f"\n🧪 AgentMem Demo\n")
+    print(f"  Backend: {BASE}\n")
+
+    print("  1. Liveness check...")
+    try:
+        resp = client.get("/agentmemory/livez")
+        print(f"     {resp.json()}")
+    except Exception as e:
+        print(f"     ❌ Server not reachable: {e}")
+        print("     Start with: agentmem start")
+        return
+
+    print("\n  2. Starting session...")
+    try:
+        resp = client.post("/agentmemory/session/start", json={
+            "sessionId": "demo_session",
+            "project": os.getcwd(),
+        })
+        result = resp.json()
+        print(f"     Status: {result.get('status')}")
+    except Exception as e:
+        print(f"     ❌ {e}")
+
+    print("\n  3. Storing observation...")
+    try:
+        resp = client.post("/agentmemory/observe", json={
+            "hookType": "demo",
+            "sessionId": "demo_session",
+            "project": os.getcwd(),
+            "data": {
+                "tool_name": "demo_tool",
+                "tool_input": "demo input",
+                "tool_output": "This is a demo observation from agentmem CLI",
+            },
+        })
+        print(f"     {resp.json()}")
+    except Exception as e:
+        print(f"     ❌ {e}")
+
+    print("\n  4. Remembering a fact...")
+    try:
+        resp = client.post("/agentmemory/remember", json={
+            "content": "AgentMem combines 6-tier cognitive memory with developer-friendly hooks and MCP integration",
+            "type": "fact",
+            "sessionId": "demo_session",
+        })
+        print(f"     {resp.json()}")
+    except Exception as e:
+        print(f"     ❌ {e}")
+
+    print("\n  5. Searching memories...")
+    try:
+        resp = client.post("/agentmemory/search", json={
+            "query": "developer memory integration",
+            "limit": 5,
+        })
+        result = resp.json()
+        ctx = result.get("context", "")
+        if ctx:
+            print(f"     Found context ({len(ctx)} chars)")
+        else:
+            print(f"     {result}")
+    except Exception as e:
+        print(f"     ❌ {e}")
+
+    print("\n  6. Ending session...")
+    try:
+        resp = client.post("/agentmemory/session/end", json={
+            "sessionId": "demo_session",
+            "project": os.getcwd(),
+        })
+        print(f"     {resp.json()}")
+    except Exception as e:
+        print(f"     ❌ {e}")
+
+    print("\n  ✓ Demo complete!\n")
+
+
+def cmd_migrate_embeddings(args: list[str]) -> None:
+    """Re-embed all vectors using a different embedding provider.
+
+    Usage: agentmem migrate-embeddings [--provider PROVIDER] [--dry-run]
+
+    This reads all entries from each vectorset, re-embeds the content text
+    with the new provider, and rebuilds the vectorsets. Required when
+    switching from local (384-dim) to ollama (768-dim) or vice versa.
+    """
+    _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _project_root not in sys.path:
+        sys.path.insert(0, _project_root)
+
+    provider_name = None
+    dry_run = False
+    i = 0
+    while i < len(args):
+        if args[i] == "--provider" and i + 1 < len(args):
+            provider_name = args[i + 1]; i += 2
+        elif args[i] == "--dry-run":
+            dry_run = True; i += 1
+        else:
+            i += 1
+
+    if not provider_name:
+        print("Usage: agentmem migrate-embeddings --provider <local|ollama|openai|gemini> [--dry-run]")
+        print()
+        print("Providers:")
+        print("  local   — sentence-transformers MiniLM (384-dim, no API key)")
+        print("  ollama  — local Ollama nomic-embed-text (768-dim, needs model)")
+        print("  openai  — OpenAI text-embedding-3-small (1536-dim, needs key)")
+        print("  gemini  — Google Gemini embedding (768-dim, needs key)")
+        return
+
+    import numpy as np
+    import redis.asyncio as aioredis
+    from core import embedder, store as mem_store
+
+    async def _migrate():
+        # Force the new provider
+        embedder._reset_provider(provider_name)
+        new_dims = embedder.DIMS
+        print(f"\n🔄 Migrating embeddings to provider: {provider_name} ({new_dims}-dim)\n")
+
+        r = await mem_store.get_client()
+
+        # Check current state
+        for vset_name, vset_key in [
+            ("Episodes", mem_store.EPISODE_KEY),
+            ("Facts", mem_store.FACT_KEY),
+            ("Procedures", mem_store.PROC_KEY),
+        ]:
+            try:
+                card = await r.execute_command("VCARD", vset_key)
+                info = await r.execute_command("VINFO", vset_key)
+                info_dict = dict(zip(info[::2], info[1::2]))
+                old_dims = int(info_dict.get(b"vector-dim", info_dict.get("vector-dim", 0)))
+                print(f"  {vset_name}: {max(0, int(card or 0) - 1)} entries, current dims={old_dims}")
+            except Exception:
+                print(f"  {vset_name}: empty or not found")
+
+        if dry_run:
+            print("\n  (dry-run, not making changes)")
+            await r.aclose()
+            return
+
+        # Phase 1: Read ALL entries from all vectorsets (before changing dims)
+        all_data = {}
+        for vset_name, vset_key in [
+            ("Episodes", mem_store.EPISODE_KEY),
+            ("Facts", mem_store.FACT_KEY),
+            ("Procedures", mem_store.PROC_KEY),
+        ]:
+            try:
+                card = await r.execute_command("VCARD", vset_key)
+                if not card or int(card) <= 1:
+                    print(f"\n  {vset_name}: nothing to migrate")
+                    all_data[vset_name] = {"key": vset_key, "entries": []}
+                    continue
+            except Exception:
+                print(f"\n  {vset_name}: skipping (not found)")
+                all_data[vset_name] = {"key": vset_key, "entries": []}
+                continue
+
+            # Read all entries using zero vector matching current dims
+            # Get actual dims from VINFO (handles mixed-dim state after partial migration)
+            try:
+                info = await r.execute_command("VINFO", vset_key)
+                info_dict = dict(zip(info[::2], info[1::2]))
+                old_dims = int(info_dict.get(b"vector-dim", info_dict.get("vector-dim", mem_store.DIMS)))
+            except Exception:
+                old_dims = mem_store.DIMS
+            seed = np.zeros(old_dims, dtype=np.float32)
+            results = await r.execute_command(
+                "VSIM", vset_key, "FP32", mem_store._blob(seed),
+                "COUNT", min(int(card), 5000), "WITHSCORES", "WITHATTRIBS"
+            )
+
+            entries = []
+            i = 0
+            while i + 2 < len(results):
+                elem = results[i]; raw = results[i + 2]
+                i += 3
+                elem_str = elem.decode() if isinstance(elem, bytes) else elem
+                if elem_str == "__seed__":
+                    continue
+                try:
+                    attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+                except Exception:
+                    continue
+                if attrs.get("_seed"):
+                    continue
+                entries.append({"uid": elem_str, "attrs": attrs})
+
+            all_data[vset_name] = {"key": vset_key, "entries": entries}
+            print(f"\n  {vset_name}: read {len(entries)} entries")
+
+        # Phase 2: Re-embed all content with new provider
+        for vset_name, data in all_data.items():
+            entries = data["entries"]
+            if not entries:
+                continue
+
+            print(f"\n  {vset_name}: re-embedding {len(entries)} entries...")
+            texts = []
+            for e in entries:
+                content = e["attrs"].get("content", "") or e["attrs"].get("task", "")
+                texts.append(content)
+
+            new_vecs = []
+            batch_size = 32
+            for j in range(0, len(texts), batch_size):
+                batch = texts[j:j+batch_size]
+                vecs = embedder.encode_batch(batch)
+                new_vecs.extend(vecs)
+                print(f"    embedded {min(j+batch_size, len(texts))}/{len(texts)}")
+
+            data["vectors"] = new_vecs
+
+        # Phase 3: Delete old vectorsets and rebuild with new dims
+        mem_store.DIMS = new_dims
+        for vset_name, data in all_data.items():
+            vset_key = data["key"]
+            entries = data["entries"]
+            vecs = data.get("vectors", [])
+
+            if not entries:
+                continue
+
+            # Delete old vectorset
+            await r.delete(vset_key)
+
+            # Re-create with new seed
+            seed = np.zeros(new_dims, dtype=np.float32)
+            seed_attr = json.dumps({"_seed": True, "content": "",
+                                    "language": "en", "domain": "general",
+                                    "access_count": 0, "ts": 0,
+                                    "importance": 0.0, "superseded_by": ""})
+            await r.execute_command("VADD", vset_key, "FP32", mem_store._blob(seed),
+                                    "__seed__", "SETATTR", seed_attr)
+
+            # Re-add all entries with new embeddings
+            for e, vec in zip(entries, vecs):
+                await r.execute_command("VADD", vset_key, "FP32",
+                                        mem_store._blob(vec), e["uid"],
+                                        "SETATTR", json.dumps(e["attrs"]))
+
+            print(f"    ✓ {vset_name} migrated ({len(entries)} entries, {new_dims}-dim)")
+
+        # Also update tool capability vectorset
+        try:
+            from core.capability import ensure_tool_index
+            await r.delete(mem_store.TOOL_KEY)
+            await ensure_tool_index(r, new_dims)
+            print(f"\n  Tools: re-indexed with {new_dims}-dim")
+        except Exception as e:
+            print(f"\n  Tools: skip ({e})")
+
+        await r.aclose()
+        print(f"\n  ✓ Migration complete! Provider: {provider_name}, dims: {new_dims}")
+        print(f"  Restart the server to apply: ./agentmem.sh restart --force")
+
+    asyncio.run(_migrate())
+
+
+def cmd_version(args: list[str]) -> None:
+    try:
+        from main import APP_VERSION
+        print(f"agentmem v{APP_VERSION}")
+    except Exception:
+        print("agentmem v0.9.6")
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+SERVICE_COMMANDS = {"start", "connect", "doctor", "demo", "version", "migrate-embeddings"}
+MEMORY_COMMANDS = {"recall", "store", "procedures", "graph", "stats", "health"}
 
 
 def main(argv: list[str]) -> None:
     if not argv: cmd_root(); return
     cmd, rest = argv[0], argv[1:]
     if cmd in ("-h", "--help", "help"): cmd_root(); return
+
     if cmd == "recall":     cmd_recall(rest);     return
     if cmd == "store":      cmd_store(rest);      return
     if cmd == "procedures": cmd_procedures(rest); return
     if cmd == "graph":      cmd_graph(rest);      return
     if cmd == "stats":      cmd_stats();          return
     if cmd == "health":     cmd_health();         return
+
+    if cmd == "start":      cmd_start(rest);      return
+    if cmd == "connect":    cmd_connect(rest);    return
+    if cmd == "doctor":     cmd_doctor(rest);     return
+    if cmd == "demo":       cmd_demo(rest);       return
+    if cmd == "version":    cmd_version(rest);    return
+    if cmd == "migrate-embeddings": cmd_migrate_embeddings(rest); return
+
     die(f"unknown command '{cmd}' (try: agentmem help)")
 
 

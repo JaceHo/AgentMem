@@ -1,0 +1,13 @@
+.git
+__pycache__
+*.pyc
+.venv
+venv
+*.egg-info
+.env
+*.bak
+node_modules
+agentmemory
+*.log
+.uv
+uv.lock

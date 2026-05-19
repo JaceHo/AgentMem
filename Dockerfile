@@ -1,0 +1,27 @@
+FROM python:3.12-slim AS base
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential curl && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Pre-download the embedding model so the container starts fast
+RUN python -c "from sentence_transformers import SentenceTransformer; \
+    SentenceTransformer('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')"
+
+COPY . .
+
+ENV AGENTMEM_HOST=0.0.0.0 \
+    AGENTMEM_PORT=18800 \
+    REDIS_URL=redis://redis:6379
+
+EXPOSE 18800
+
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+    CMD curl -sf http://localhost:18800/health || exit 1
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "18800", \
+     "--log-level", "info", "--timeout-graceful-shutdown", "0"]

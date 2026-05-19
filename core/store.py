@@ -41,7 +41,9 @@ ENV_KEY      = "mem:env"        # capability: environment state hash
 AGENT_KEY    = "mem:agent"      # capability: agent self-model hash
 SESSION_PRE  = "mem:session:"
 PERSONA_KEY  = "mem:persona"
-DIMS         = 384
+from core import embedder as _embed_mod
+
+DIMS         = _embed_mod.DIMS
 
 
 def _blob(arr: np.ndarray) -> bytes:
