@@ -22,6 +22,7 @@ Redis 8 vectorset API summary:
 """
 
 import json
+import logging
 import os
 import time
 from typing import Optional
@@ -29,6 +30,8 @@ from typing import Optional
 import numpy as np
 import redis.asyncio as aioredis
 from ulid import ULID
+
+log = logging.getLogger(__name__)
 
 REDIS_URL    = os.getenv("REDIS_URL", "redis://localhost:6379")
 EPISODE_KEY  = "mem:episodes"
@@ -45,13 +48,49 @@ from core import embedder as _embed_mod
 
 DIMS         = _embed_mod.DIMS
 
+# ── Shared connection pool (singleton) ────────────────────────────────────────
+# Prevents connection leaks: get_client() returns the SAME Redis instance
+# backed by a shared ConnectionPool instead of creating a new pool per call.
+# Must call close_pool() at shutdown (called from lifespan).
+_pool: aioredis.ConnectionPool | None = None
+_client: aioredis.Redis | None = None
 
-def _blob(arr: np.ndarray) -> bytes:
-    return arr.astype(np.float32).tobytes()
+
+def _get_pool() -> aioredis.ConnectionPool:
+    global _pool
+    if _pool is None:
+        _pool = aioredis.ConnectionPool.from_url(
+            REDIS_URL,
+            decode_responses=False,
+            max_connections=20,
+        )
+    return _pool
 
 
 async def get_client() -> aioredis.Redis:
-    return aioredis.from_url(REDIS_URL, decode_responses=False)
+    """Return the shared Redis client (backed by a connection pool).
+
+    Safe to call from any async context. Always returns the same instance.
+    """
+    global _client
+    if _client is None:
+        _client = aioredis.Redis(connection_pool=_get_pool())
+    return _client
+
+
+async def close_pool() -> None:
+    """Close the shared Redis client and connection pool. Call at shutdown."""
+    global _client, _pool
+    if _client is not None:
+        await _client.aclose()
+        _client = None
+    if _pool is not None:
+        await _pool.disconnect()
+        _pool = None
+
+
+def _blob(arr: np.ndarray) -> bytes:
+    return arr.astype(np.float32).tobytes()
 
 
 async def ensure_indexes(r: aioredis.Redis) -> None:
@@ -103,7 +142,8 @@ async def knn_search(
 
     try:
         results = await r.execute_command(*cmd)
-    except Exception:
+    except Exception as e:
+        log.error("knn_search VSIM failed on %s: %s", vset_key, e)
         return []
 
     items: list[dict] = []
@@ -120,7 +160,8 @@ async def knn_search(
 
         try:
             attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
-        except Exception:
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            log.warning("knn_search: failed to parse attrs for %s: %s", elem_str, e)
             attrs = {}
 
         if attrs.get("_seed") or not attrs.get("content"):
@@ -204,8 +245,8 @@ async def update_episode_next_id(r: aioredis.Redis, uid: str, next_uid: str) -> 
             attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
             attrs["next_episode_id"] = next_uid
             await r.execute_command("VSETATTR", EPISODE_KEY, uid, json.dumps(attrs))
-    except Exception:
-        pass  # VGETATTR not available or episode not found — chain stays partial
+    except Exception as e:
+        log.warning("update_episode_next_id failed for %s→%s: %s", uid, next_uid, e)
 
 
 async def save_fact(
@@ -307,8 +348,8 @@ async def soft_delete_fact(
             attrs["superseded_by"] = superseded_by
             await r.execute_command("VSETATTR", FACT_KEY, element_id, json.dumps(attrs))
             return
-    except Exception:
-        pass  # VGETATTR not available; fall through to VSIM scan
+    except Exception as e:
+        log.warning("soft_delete_fact VGETATTR failed for %s: %s", element_id, e)
 
     # Fallback: VSIM ELE lookup (element-space traversal, Redis 8 native)
     try:
@@ -322,8 +363,8 @@ async def soft_delete_fact(
             attrs["superseded_by"] = superseded_by
             await r.execute_command("VSETATTR", FACT_KEY, element_id, json.dumps(attrs))
             return
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning("soft_delete_fact VSIM ELE fallback failed for %s: %s", element_id, e)
 
     # Last resort: set superseded_by with minimal attrs to ensure
     # knn_search() will filter this entry out
@@ -332,8 +373,8 @@ async def soft_delete_fact(
             "VSETATTR", FACT_KEY, element_id,
             json.dumps({"superseded_by": superseded_by, "content": ""})
         )
-    except Exception:
-        pass
+    except Exception as e:
+        log.error("soft_delete_fact ALL methods failed for %s: %s", element_id, e)
 
 
 async def link_proc_to_tools(
@@ -378,7 +419,8 @@ async def scan_all_procedures(r: aioredis.Redis, max_count: int = 1000) -> list[
             "VSIM", PROC_KEY, "FP32", _blob(seed),
             "COUNT", min(int(card), max_count), "WITHSCORES", "WITHATTRIBS"
         )
-    except Exception:
+    except Exception as e:
+        log.error("scan_all_procedures VSIM failed: %s", e)
         return []
     procs: list[dict] = []
     i = 0

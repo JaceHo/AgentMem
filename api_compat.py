@@ -58,6 +58,11 @@ _redis = None
 
 
 def _get_redis():
+    """Get Redis client — prefers the shared pool from store.get_client().
+
+    Falls back to the module-level _redis set by init_compat() for backward
+    compatibility. This avoids the circular import from main._redis.
+    """
     global _redis
     if _redis is None:
         from core import store as mem_store
@@ -67,9 +72,16 @@ def _get_redis():
         except RuntimeError:
             loop = None
         if loop and loop.is_running():
+            # Can't await get_client() in sync context — return None
             log.warning("[compat] Redis not initialized — call init_compat() at startup")
             return None
     return _redis
+
+
+async def _r():
+    """Async helper: get the Redis client via the shared connection pool."""
+    from core import store as mem_store
+    return await mem_store.get_client()
 
 
 async def init_compat(redis_client) -> None:
@@ -210,7 +222,8 @@ def _sid(req) -> str:
 
 async def _observe_internal(session_id: str, project: str, cwd: str,
                             hook_type: str, data: dict) -> dict:
-    from main import _encode, _admission_gate, _redis as main_redis
+    from main import _encode, _admission_gate
+    main_redis = await _r()
 
     r = main_redis
     if r is None:
@@ -283,7 +296,7 @@ async def livez():
 
 @router.get("/health")
 async def health():
-    from main import _redis as main_redis
+    main_redis = await _r()
     try:
         await main_redis.ping()
         return {"status": "ok", "redis": "connected"}
@@ -312,7 +325,7 @@ async def session_start(req: SessionStartRequest, request: Request):
     sid = _sid(req)
     project = req.project or req.cwd or os.getcwd()
 
-    from main import _redis as main_redis
+    main_redis = await _r()
     from core import store as mem_store
 
     session_key = f"mem:session:{sid}"
@@ -349,7 +362,8 @@ async def session_end(req: SessionEndRequest, request: Request, background_tasks
     sid = _sid(req)
 
     async def _do_end():
-        from main import _redis as main_redis, _do_compress_session
+        from main import _do_compress_session
+        main_redis = await _r()
         try:
             await _do_compress_session(sid)
         except Exception as e:
@@ -393,7 +407,8 @@ async def summarize(req: SummarizeRequest, request: Request, background_tasks: B
     sid = _sid(req)
 
     async def _do_summarize():
-        from main import _redis as main_redis, _do_compress_session
+        from main import _do_compress_session
+        main_redis = await _r()
         try:
             await _do_compress_session(sid)
         except Exception as e:
@@ -411,7 +426,8 @@ async def enrich(req: EnrichRequest, request: Request):
     if auth_err:
         return auth_err
 
-    from main import _redis as main_redis, _encode
+    from main import _encode
+    main_redis = await _r()
     from core import store as mem_store
 
     files = req.files or []
@@ -447,7 +463,9 @@ async def context(req: ContextRequest, request: Request):
     if auth_err:
         return auth_err
 
-    from main import _redis as main_redis, _encode, _format_prepend
+    from main import _encode
+    from main import _encode, _format_prepend
+    main_redis = await _r()
     from core import store as mem_store, persona as persona_mod
 
     sid = _sid(req)
@@ -487,7 +505,7 @@ async def session_commit(req: SessionCommitRequest, request: Request):
     if auth_err:
         return auth_err
 
-    from main import _redis as main_redis
+    main_redis = await _r()
 
     sid = _sid(req)
     commit_key = f"mem:commit:{req.sha}"
@@ -505,7 +523,7 @@ async def session_commit(req: SessionCommitRequest, request: Request):
 
 @router.get("/session/by-commit")
 async def session_by_commit(sha: str = "", request: Request = None):
-    from main import _redis as main_redis
+    main_redis = await _r()
 
     if not sha:
         return {"error": "sha parameter required"}
@@ -523,7 +541,7 @@ async def session_by_commit(sha: str = "", request: Request = None):
 
 @router.get("/commits")
 async def commits(branch: str = "", repo: str = "", limit: int = 20):
-    from main import _redis as main_redis
+    main_redis = await _r()
 
     cursor, keys = await main_redis.scan(match="mem:commit:*", count=limit)
     results = []
@@ -551,7 +569,9 @@ async def claude_bridge_sync(req: ClaudeBridgeSyncRequest, request: Request):
     if auth_err:
         return auth_err
 
-    from main import _redis as main_redis, _encode, _format_prepend
+    from main import _encode
+    from main import _encode, _format_prepend
+    main_redis = await _r()
     from core import store as mem_store, persona as persona_mod
 
     sid = _sid(req)
@@ -598,7 +618,8 @@ async def consolidate_pipeline(req: ConsolidatePipelineRequest, request: Request
         return auth_err
 
     async def _do_consolidate():
-        from main import _redis as main_redis, _do_consolidate
+        from main import _do_consolidate
+        main_redis = await _r()
         try:
             await _do_consolidate()
         except Exception as e:
@@ -626,7 +647,9 @@ async def search(req: SearchRequest, request: Request):
     if auth_err:
         return auth_err
 
-    from main import _redis as main_redis, _encode, _format_prepend
+    from main import _encode
+    from main import _encode, _format_prepend
+    main_redis = await _r()
     from core import store as mem_store, persona as persona_mod
 
     sid = _sid(req)
@@ -685,7 +708,8 @@ async def remember(req: RememberRequest, request: Request):
     if auth_err:
         return auth_err
 
-    from main import _redis as main_redis, _encode
+    from main import _encode
+    main_redis = await _r()
     from core import store as mem_store
 
     sid = _sid(req)
@@ -713,7 +737,8 @@ async def forget(req: ForgetRequest, request: Request):
     if auth_err:
         return auth_err
 
-    from main import _redis as main_redis, _encode
+    from main import _encode
+    main_redis = await _r()
     from core import store as mem_store
 
     emb = _encode(req.query)
@@ -775,7 +800,7 @@ async def compress_file(filePath: str = "", request: Request = None):
 
 @router.get("/sessions")
 async def sessions(limit: int = 20):
-    from main import _redis as main_redis
+    main_redis = await _r()
 
     cursor, keys = await main_redis.scan(match="mem:session:*", count=limit)
     results = []
@@ -796,7 +821,7 @@ async def sessions(limit: int = 20):
 
 @router.get("/observations")
 async def observations(sessionId: str = "", limit: int = 20):
-    from main import _redis as main_redis
+    main_redis = await _r()
     from core import store as mem_store
 
     import numpy as np
@@ -844,7 +869,8 @@ async def file_context(req: FileContextRequest, request: Request):
     if auth_err:
         return auth_err
 
-    from main import _redis as main_redis, _encode
+    from main import _encode
+    main_redis = await _r()
     from core import store as mem_store
 
     files = [f.strip() for f in req.files.split(",") if f.strip()]
@@ -876,7 +902,8 @@ async def patterns(req: PatternsRequest, request: Request):
     if auth_err:
         return auth_err
 
-    from main import _redis as main_redis, _encode
+    from main import _encode
+    main_redis = await _r()
     from core import store as mem_store
 
     query = req.query or "recurring patterns"
@@ -905,7 +932,8 @@ async def smart_search(req: SmartSearchRequest, request: Request):
     if auth_err:
         return auth_err
 
-    from main import _redis as main_redis, _encode, _rrf_merge
+    from main import _encode, _rrf_merge
+    main_redis = await _r()
     from core import store as mem_store
 
     emb = _encode(req.query)
@@ -932,7 +960,7 @@ async def timeline(req: TimelineRequest, request: Request):
     if auth_err:
         return auth_err
 
-    from main import _redis as main_redis
+    main_redis = await _r()
     from core import store as mem_store
 
     import numpy as np
@@ -978,7 +1006,7 @@ async def timeline(req: TimelineRequest, request: Request):
 
 @router.get("/profile")
 async def profile():
-    from main import _redis as main_redis
+    main_redis = await _r()
     from core import persona as persona_mod
 
     ctx = await persona_mod.get_context(main_redis)
@@ -989,7 +1017,7 @@ async def profile():
 
 @router.get("/export")
 async def export_data():
-    from main import _redis as main_redis
+    main_redis = await _r()
     from core import store as mem_store
 
     import numpy as np
@@ -1025,7 +1053,8 @@ async def import_data(req: ImportRequest, request: Request):
     if auth_err:
         return auth_err
 
-    from main import _redis as main_redis, _encode
+    from main import _encode
+    main_redis = await _r()
     from core import store as mem_store
 
     data = req.data
@@ -1070,7 +1099,7 @@ async def import_data(req: ImportRequest, request: Request):
 
 @router.get("/memories")
 async def memories(limit: int = 50, category: str = ""):
-    from main import _redis as main_redis
+    main_redis = await _r()
     from core import store as mem_store
 
     import numpy as np
@@ -1104,7 +1133,7 @@ async def memories(limit: int = 50, category: str = ""):
 
 @router.get("/memories/{memory_id}")
 async def memory_detail(memory_id: str):
-    from main import _redis as main_redis
+    main_redis = await _r()
     from core import store as mem_store
 
     try:
@@ -1135,7 +1164,7 @@ async def semantic(limit: int = 50):
 
 @router.get("/procedural")
 async def procedural(limit: int = 50):
-    from main import _redis as main_redis
+    main_redis = await _r()
     from core import store as mem_store
 
     import numpy as np
@@ -1167,7 +1196,7 @@ async def procedural(limit: int = 50):
 
 @router.get("/relations")
 async def relations_list():
-    from main import _redis as main_redis
+    main_redis = await _r()
     from core import graph as graph_mod
 
     stats = await graph_mod.graph_stats(main_redis)

@@ -43,12 +43,65 @@ def heat_rerank(items: list[dict]) -> list[dict]:
     return sorted(items, key=lambda x: x["heat_score"], reverse=True)
 
 
-async def bump_heat(r: aioredis.Redis, vset_key: str, element: str, attrs: dict) -> None:
-    """Increment access_count and update last_accessed (fire-and-forget ok)."""
-    attrs = dict(attrs)  # copy
-    attrs["access_count"] = attrs.get("access_count", 0) + 1
-    attrs["last_accessed"] = int(time.time() * 1000)
+# ── Atomic heat bump via Lua script ───────────────────────────────────────────
+# Race condition fix: the old Python read-modify-write pattern lost increments
+# under concurrent access (two coroutines both read access_count=N, both write
+# N+1 instead of N+2). This Lua script does the read+increment+write atomically
+# inside Redis, which is single-threaded for Lua execution.
+
+_BUMP_HEAT_LUA = """
+local key = KEYS[1]
+local elem = ARGV[1]
+local now_ms = ARGV[2]
+local count_field = ARGV[3] or 'access_count'
+local time_field = ARGV[4] or 'last_accessed'
+
+local raw = redis.call('VGETATTR', key, elem)
+if not raw then return 0 end
+
+local ok, attrs = pcall(cjson.decode, raw)
+if not ok or type(attrs) ~= 'table' then return 0 end
+
+attrs[count_field] = (attrs[count_field] or 0) + 1
+attrs[time_field] = tonumber(now_ms)
+
+local new_json = cjson.encode(attrs)
+redis.call('VSETATTR', key, elem, new_json)
+return 1
+"""
+
+_bump_script = None  # cached Script object
+
+
+async def atomic_bump(
+    r: aioredis.Redis,
+    vset_key: str,
+    element: str,
+    count_field: str = "access_count",
+    time_field: str = "last_accessed",
+) -> None:
+    """Atomically increment a counter field and timestamp in a vectorset element's attrs.
+
+    Uses a Redis Lua script to avoid the read-modify-write race condition.
+    """
+    global _bump_script
+    now_ms = int(time.time() * 1000)
     try:
-        await r.execute_command("VSETATTR", vset_key, element, json.dumps(attrs))
+        if _bump_script is None:
+            _bump_script = r.register_script(_BUMP_HEAT_LUA)
+        await _bump_script(
+            keys=[vset_key],
+            args=[element, str(now_ms), count_field, time_field],
+        )
     except Exception:
         pass
+
+
+async def bump_heat(r: aioredis.Redis, vset_key: str, element: str, attrs: dict) -> None:
+    """Atomically increment access_count and update last_accessed.
+
+    Uses atomic_bump (Redis Lua script) to avoid the read-modify-write race.
+    The `attrs` parameter is kept for API compatibility but is no longer used
+    for the write — the Lua script reads fresh attrs from Redis.
+    """
+    await atomic_bump(r, vset_key, element, "access_count", "last_accessed")

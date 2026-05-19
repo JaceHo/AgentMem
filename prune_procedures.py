@@ -37,6 +37,11 @@ async def load_all_procedures(r):
     """Fetch all non-seed, non-superseded procedures with their attributes."""
     # Use VSIM with a zero vector to enumerate all entries
     dims = 384
+    try:
+        from core import embedder
+        dims = embedder.DIMS
+    except ImportError:
+        pass
     zero = np.zeros(dims, dtype=np.float32).tobytes()
     raw = await r.execute_command(
         "VSIM", PROC_KEY, "FP32", zero,

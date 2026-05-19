@@ -63,9 +63,12 @@ def _infer_category(name: str, description: str) -> str:
 
 # ── Tool Registry ──────────────────────────────────────────────────────────────
 
-async def ensure_tool_index(r: aioredis.Redis, dims: int = 384) -> None:
+async def ensure_tool_index(r: aioredis.Redis, dims: int | None = None) -> None:
     """Seed mem:tools vectorset so VSIM works on empty sets."""
     import numpy as np
+    if dims is None:
+        from . import embedder
+        dims = embedder.DIMS
     card = await r.execute_command("VCARD", TOOL_KEY)
     if not card:
         seed = np.zeros(dims, dtype=np.float32)
@@ -79,7 +82,7 @@ async def register_tool(
     r: aioredis.Redis,
     name: str,
     description: str,
-    embedding,                          # np.ndarray (384-dim)
+    embedding,                          # np.ndarray (dims from embedder.DIMS)
     category: str = "",
     source: str = "builtin",            # builtin | mcp | plugin | skill
     parameters: list[str] | None = None,
@@ -195,23 +198,24 @@ async def recall_tools(
 
 
 async def _bump_use_count(r: aioredis.Redis, element: str, attrs: dict) -> None:
-    attrs = dict(attrs)
-    attrs["use_count"] = attrs.get("use_count", 0) + 1
-    attrs["last_used"] = int(time.time() * 1000)
-    try:
-        await r.execute_command("VSETATTR", TOOL_KEY, element, json.dumps(attrs))
-    except Exception:
-        pass
+    """Atomically increment use_count for a tool element.
+
+    Uses the same atomic Lua script as heat.bump_heat to avoid
+    the read-modify-write race condition under concurrent access.
+    """
+    from .heat import atomic_bump
+    await atomic_bump(r, TOOL_KEY, element, "use_count", "last_used")
 
 
 async def list_all_tools(r: aioredis.Redis) -> list[dict]:
     """Return all registered tools (no embedding needed — scan via VSIM with zero vec)."""
     import numpy as np
+    from . import embedder
     card = await r.execute_command("VCARD", TOOL_KEY)
     if not card or int(card) <= 1:
         return []
 
-    seed = np.zeros(384, dtype=np.float32)
+    seed = np.zeros(embedder.DIMS, dtype=np.float32)
     try:
         results = await r.execute_command(
             "VSIM", TOOL_KEY, "FP32", seed.tobytes(),

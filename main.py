@@ -107,6 +107,40 @@ try:
 except ImportError:
     _BM25_AVAILABLE = False
 
+
+# ── Background task manager ────────────────────────────────────────────────────
+# Replaces bare asyncio.create_task() calls with tracked tasks that:
+#   1. Capture and log exceptions (no silent failures)
+#   2. Limit concurrency (max 50 concurrent background tasks)
+#   3. Are cancelled on shutdown
+_bg_tasks: set[asyncio.Task] = set()
+_BG_TASK_LIMIT = 50
+
+
+def _spawn(coro, name: str = "bg") -> None:
+    """Fire-and-forget a coroutine as a tracked background task.
+
+    Unlike bare asyncio.create_task(), this:
+    - Logs uncaught exceptions instead of silently swallowing them
+    - Limits concurrent background tasks to prevent memory leaks
+    - Tracks tasks so they can be cancelled at shutdown
+    """
+    if len(_bg_tasks) >= _BG_TASK_LIMIT:
+        log.warning("[bg] task limit (%d) reached, dropping %s", _BG_TASK_LIMIT, name)
+        return
+    task = asyncio.create_task(coro)
+    _bg_tasks.add(task)
+    task.add_done_callback(lambda t: _bg_tasks.discard(t))
+    task.add_done_callback(lambda t: t.exception() if not t.cancelled() and t.exception() else None)
+    # Log exceptions from background tasks
+    def _log_exception(t: asyncio.Task):
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc:
+            log.error("[bg:%s] unhandled exception: %s", name, exc)
+    task.add_done_callback(_log_exception)
+
 from core import capability as cap_mod
 from core import embedder
 from core import extractor
@@ -204,7 +238,8 @@ _SECRET_KEYWORD_VALUE_RE = re.compile(
 class _BM25Index:
     """Lazy-rebuild BM25 corpus over fact contents + triple strings.
 
-    Thread-safe for asyncio: all mutations happen in the event loop.
+    Thread-safe: uses asyncio.Lock to prevent concurrent mutation during search.
+    Superseded facts (superseded_by != "") are excluded from search results.
     Rebuilt when corpus size changes by ≥10 entries or when forced.
     """
     def __init__(self):
@@ -212,10 +247,12 @@ class _BM25Index:
         self._bm25 = None
         self._built_at_len: int = 0
         self._rebuild_threshold: int = 10
+        self._lock = asyncio.Lock()
 
-    def add(self, uid: str, content: str, attrs: dict) -> None:
+    async def add(self, uid: str, content: str, attrs: dict) -> None:
         """Add a fact to the corpus. Invalidates the BM25 index."""
-        self._docs.append((uid, content, attrs))
+        async with self._lock:
+            self._docs.append((uid, content, attrs))
 
     def _tokenize(self, text: str) -> list[str]:
         """Tokenize for BM25: English words ≥3 chars + CJK bigrams."""
@@ -231,8 +268,12 @@ class _BM25Index:
             return False
         if self._bm25 is None or (n - self._built_at_len) >= self._rebuild_threshold:
             # Build corpus: content + triple_str for richer term coverage
+            # Skip superseded facts (soft-deleted by consolidation)
             corpus = []
             for _, content, attrs in self._docs:
+                if attrs.get("superseded_by"):
+                    corpus.append([])  # empty token list → zero BM25 score
+                    continue
                 text = content
                 triple_str = attrs.get("triple_str", "")
                 if triple_str:
@@ -243,47 +284,53 @@ class _BM25Index:
             log.debug(f"[bm25] rebuilt corpus n={n}")
         return True
 
-    def search(self, query: str, k: int = 10) -> list[dict]:
+    async def search(self, query: str, k: int = 10) -> list[dict]:
         """Return top-k facts by BM25 score. Returns [] if corpus empty or BM25 unavailable."""
-        if not _BM25_AVAILABLE or not self._ensure_built():
-            return []
-        tokens = self._tokenize(query)
-        if not tokens:
-            return []
-        scores = self._bm25.get_scores(tokens)
-        # Get top-k indices (non-zero scores only)
-        top_idx = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:k * 2]
-        results = []
-        for idx in top_idx:
-            if scores[idx] <= 0:
-                break
-            uid, content, attrs = self._docs[idx]
-            results.append({
-                "content": content,
-                "category": attrs.get("category", ""),
-                "language": attrs.get("language", "en"),
-                "domain":   attrs.get("domain", "general"),
-                "score":    float(scores[idx]),
-                "attrs":    attrs,
-                "_element": uid,
-            })
-            if len(results) >= k:
-                break
-        return results
+        async with self._lock:
+            if not _BM25_AVAILABLE or not self._ensure_built():
+                return []
+            tokens = self._tokenize(query)
+            if not tokens:
+                return []
+            scores = self._bm25.get_scores(tokens)
+            # Get top-k indices (non-zero scores only, skip superseded)
+            top_idx = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:k * 2]
+            results = []
+            for idx in top_idx:
+                if scores[idx] <= 0:
+                    break
+                uid, content, attrs = self._docs[idx]
+                # Skip superseded facts (soft-deleted by consolidation)
+                if attrs.get("superseded_by"):
+                    continue
+                results.append({
+                    "content": content,
+                    "category": attrs.get("category", ""),
+                    "language": attrs.get("language", "en"),
+                    "domain":   attrs.get("domain", "general"),
+                    "score":    float(scores[idx]),
+                    "attrs":    attrs,
+                    "_element": uid,
+                })
+                if len(results) >= k:
+                    break
+            return results
 
-    def populate_from_items(self, items: list[dict]) -> None:
+    async def populate_from_items(self, items: list[dict]) -> None:
         """Bulk-load from knn_search result items (called at startup)."""
-        for item in items:
-            uid = item.get("_element", "")
-            content = item.get("content", "")
-            attrs = item.get("attrs", {})
-            if uid and content:
-                self._docs.append((uid, content, attrs))
+        async with self._lock:
+            for item in items:
+                uid = item.get("_element", "")
+                content = item.get("content", "")
+                attrs = item.get("attrs", {})
+                if uid and content:
+                    self._docs.append((uid, content, attrs))
 
-    def reset(self) -> None:
-        self._docs.clear()
-        self._bm25 = None
-        self._built_at_len = 0
+    async def reset(self) -> None:
+        async with self._lock:
+            self._docs.clear()
+            self._bm25 = None
+            self._built_at_len = 0
 
 
 _bm25_index = _BM25Index()
@@ -418,7 +465,7 @@ async def _populate_bm25_from_redis(r) -> None:
             if attrs.get("superseded_by"):
                 continue
             items.append({"_element": elem_str, "content": attrs["content"], "attrs": attrs})
-        _bm25_index.populate_from_items(items)
+        await _bm25_index.populate_from_items(items)
         log.info(f"[bm25] populated corpus from Redis: {len(items)} facts")
     except Exception as e:
         log.warning(f"[bm25] startup population failed: {e}")
@@ -450,13 +497,17 @@ async def lifespan(app: FastAPI):
 
     log.info("Ensuring vectorset indexes…")
     await mem_store.ensure_indexes(_redis)
-    asyncio.create_task(_periodic_consolidate())
+    _spawn(_periodic_consolidate(), "consolidate")
     # Populate BM25 corpus from existing Redis facts (non-blocking, best-effort)
-    asyncio.create_task(_populate_bm25_from_redis(_redis))
+    _spawn(_populate_bm25_from_redis(_redis), "bm25-populate")
     await _init_compat(_redis)
     log.info("AgentMem v%s ready (session-handoff+hard-prune+auto-graph+batch-MCP+compat)", APP_VERSION)
     yield
-    await _redis.aclose()
+    # Cancel tracked background tasks before closing Redis
+    for t in list(_bg_tasks):
+        t.cancel()
+    _bg_tasks.clear()
+    await mem_store.close_pool()
 
 
 app = FastAPI(title="AgentMem — Local Agent Memory Service", version=APP_VERSION, lifespan=lifespan)
@@ -1140,11 +1191,11 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
                 # A-MEM memory evolution: similar fact exists → async-update its keywords/topic
                 # (arXiv:2502.12110 §3: new memories trigger context refinement on neighbors)
                 if fact.keywords and existing[0].get("score", 0.0) > 0.80:
-                    asyncio.create_task(_evolve_similar_fact(
+                    _spawn(_evolve_similar_fact(
                         existing[0].get("_element", ""),
                         fact.keywords,
                         fact.topic,
-                    ))
+                    ), "evolve")
                 continue
             uid = await mem_store.save_fact(
                 _redis, fact.content, fact.category, fact.confidence, f_emb, lang, domain,
@@ -1161,7 +1212,7 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
             }
             if fact.triple_s and fact.triple_p and fact.triple_o:
                 attrs["triple_str"] = f"{fact.triple_s} | {fact.triple_p} | {fact.triple_o}"
-            _bm25_index.add(uid, fact.content, attrs)
+            await _bm25_index.add(uid, fact.content, attrs)
             await persona_mod.update(_redis, fact.category, fact.content)
             fact_saved += 1
 
@@ -1182,8 +1233,9 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
             # Complete doubly-linked chain: tell prev episode its successor
             prev_ep_id = (await _redis.get(f"{mem_store.SESSION_PRE}{session_id}:last_ep") or b"").decode()
             if prev_ep_id and prev_ep_id != new_ep_uid:
-                asyncio.create_task(
-                    mem_store.update_episode_next_id(_redis, prev_ep_id, new_ep_uid)
+                _spawn(
+                    mem_store.update_episode_next_id(_redis, prev_ep_id, new_ep_uid),
+                    "ep-chain",
                 )
             # Advance the session's last-episode pointer
             await mem_store.set_last_episode_id(_redis, session_id, new_ep_uid)
@@ -1228,7 +1280,7 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
         _stores_since_consolidation += fact_saved
         if _stores_since_consolidation >= _AUTO_CONSOLIDATE_EVERY:
             _stores_since_consolidation = 0
-            asyncio.create_task(_do_consolidate())
+            _spawn(_do_consolidate(), "consolidate")
             log.info("[store] auto-consolidation triggered")
 
         ms = int((time.time() - t0) * 1000)
@@ -1333,7 +1385,7 @@ async def _do_compress_session(session_id: str) -> dict:
         existing = await mem_store.knn_search(_redis, mem_store.FACT_KEY, f_emb, k=1)
         if existing and existing[0].get("score", 0.0) > 0.95:
             if fact.keywords and existing[0].get("score", 0.0) > 0.80:
-                asyncio.create_task(_evolve_similar_fact(
+                _spawn(_evolve_similar_fact(
                     existing[0].get("_element", ""),
                     fact.keywords, fact.topic,
                 ))
@@ -1525,16 +1577,16 @@ async def answer(req: AnswerRequest):
                 raw = resp.json()["choices"][0]["message"]["content"].strip()
                 answer = _parse_answer_raw(raw)
                 if answer:
-                    asyncio.create_task(extractor._report_quality(model, +1))
+                    _spawn(extractor._report_quality(model, +1), "quality")
                     return {"answer": answer}
             exclude = model
         except httpx.TimeoutException:
             log.warning("[answer] %s timed out (attempt %d)", model, attempt + 1)
-            asyncio.create_task(extractor._report_quality(model, -1, reason="timeout"))
+            _spawn(extractor._report_quality(model, -1, reason="timeout"), "quality")
             exclude = model
         except Exception as e:
             log.debug("[answer] %s failed: %s", model, e)
-            asyncio.create_task(extractor._report_quality(model, -1, reason="other"))
+            _spawn(extractor._report_quality(model, -1, reason="other"), "quality")
             exclude = model
     return {"answer": ""}
 
@@ -1800,7 +1852,7 @@ async def recall(req: RecallRequest):
     # Memori BM25 pass (arXiv:2603.19935): exact-term matching over fact corpus.
     # Runs in O(1) (no I/O) — BM25 corpus is maintained in-memory and searched locally.
     # Particularly effective for entity names, dates, tool names, specific terms.
-    bm25_facts = _bm25_index.search(req.query, k=n_facts)
+    bm25_facts = await _bm25_index.search(req.query, k=n_facts)
     if bm25_facts:
         log.debug(f"[bm25] {len(bm25_facts)} hits for: {req.query[:60]!r}")
 
@@ -1950,7 +2002,7 @@ async def recall(req: RecallRequest):
 
 @app.post("/store")
 async def store_memory(req: StoreRequest):
-    asyncio.create_task(_do_store(req.messages, req.session_id))
+    _spawn(_do_store(req.messages, req.session_id), "store")
     return {"status": "queued"}
 
 
@@ -2870,14 +2922,14 @@ async def _llm_merge_facts(contents: list[str]) -> str | None:
                 headers={"Authorization": f"Bearer {_AISERV_KEY}"},
             )
             if resp.status_code == 200:
-                asyncio.create_task(extractor._report_quality(model, +1))
+                _spawn(extractor._report_quality(model, +1), "quality")
                 return resp.json()["choices"][0]["message"]["content"].strip()
     except httpx.TimeoutException:
         log.warning("[consolidate] %s timed out", model)
-        asyncio.create_task(extractor._report_quality(model, -1, reason="timeout"))
+        _spawn(extractor._report_quality(model, -1, reason="timeout"), "quality")
     except Exception as e:
         log.warning(f"[consolidate] LLM merge failed: {e}")
-        asyncio.create_task(extractor._report_quality(model, -1, reason="other"))
+        _spawn(extractor._report_quality(model, -1, reason="other"), "quality")
 
     return max(contents, key=len)
 

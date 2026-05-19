@@ -27,6 +27,7 @@ Env vars:
 from __future__ import annotations
 
 import os
+import threading
 from abc import ABC, abstractmethod
 from typing import Optional
 
@@ -37,21 +38,24 @@ import numpy as np
 DIMS: int = 384  # default for local MiniLM; overridden by provider
 
 _provider: Optional[BaseProvider] = None
+_provider_lock = threading.Lock()  # protects _provider and DIMS mutations
 
 
 def _get_provider() -> BaseProvider:
     global _provider, DIMS
-    if _provider is None:
-        _provider = _detect_provider()
-        DIMS = _provider.dims
-    return _provider
+    with _provider_lock:
+        if _provider is None:
+            _provider = _detect_provider()
+            DIMS = _provider.dims
+        return _provider
 
 
 def _reset_provider(name: str = "local") -> None:
     """Force-switch to a specific provider (used by dimension guard)."""
     global _provider, DIMS
-    _provider = _create_provider(name)
-    DIMS = _provider.dims
+    with _provider_lock:
+        _provider = _create_provider(name)
+        DIMS = _provider.dims
 
 
 def encode(text: str) -> np.ndarray:
@@ -94,6 +98,7 @@ class LocalProvider(BaseProvider):
     # 384-dim, fast (~3ms/text), no API key needed.
     _MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
     _model = None
+    _model_lock = threading.Lock()
 
     def __init__(self):
         dims_override = os.environ.get("EMBEDDING_DIMS")
@@ -101,10 +106,11 @@ class LocalProvider(BaseProvider):
             self.dims = int(dims_override)
 
     def _get_model(self):
-        if self._model is None:
-            from sentence_transformers import SentenceTransformer
-            LocalProvider._model = SentenceTransformer(self._MODEL_NAME)
-        return self._model
+        with self._model_lock:
+            if self._model is None:
+                from sentence_transformers import SentenceTransformer
+                LocalProvider._model = SentenceTransformer(self._MODEL_NAME)
+            return self._model
 
     def encode(self, text: str) -> np.ndarray:
         return self._get_model().encode(text, normalize_embeddings=True)
