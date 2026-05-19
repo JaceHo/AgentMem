@@ -96,7 +96,7 @@ from typing import Any
 
 import httpx
 import numpy as np
-from fastapi import FastAPI, BackgroundTasks
+from fastapi import FastAPI, BackgroundTasks, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -443,7 +443,7 @@ async def _populate_bm25_from_redis(r) -> None:
         card = await r.execute_command("VCARD", mem_store.FACT_KEY)
         if not card or int(card) <= 1:
             return
-        seed = np.zeros(mem_store.DIMS, dtype=np.float32)
+        seed = np.zeros(embedder.DIMS, dtype=np.float32)
         results = await r.execute_command(
             "VSIM", mem_store.FACT_KEY, "FP32", seed.astype("float32").tobytes(),
             "COUNT", min(int(card), 5000), "WITHSCORES", "WITHATTRIBS"
@@ -500,7 +500,6 @@ async def lifespan(app: FastAPI):
     _spawn(_periodic_consolidate(), "consolidate")
     # Populate BM25 corpus from existing Redis facts (non-blocking, best-effort)
     _spawn(_populate_bm25_from_redis(_redis), "bm25-populate")
-    await _init_compat(_redis)
     log.info("AgentMem v%s ready (session-handoff+hard-prune+auto-graph+batch-MCP+compat)", APP_VERSION)
     yield
     # Cancel tracked background tasks before closing Redis
@@ -520,8 +519,6 @@ if _os.path.isdir(_static_dir):
 
 app.include_router(log_sse.log_sse_router)
 
-from api_compat import router as _compat_router, init_compat as _init_compat
-app.include_router(_compat_router)
 
 
 @app.get("/", include_in_schema=False)
@@ -614,6 +611,111 @@ class ProcedureFeedbackRequest(BaseModel):
     task_prefix: str                    # first ~80 chars of task to identify procedure
     success: bool
     session_id: str = ""
+
+# ── Compat request models (absorbed from agentmemory scaffold) ─────────────────
+class CompatSessionStartRequest(BaseModel):
+    sessionId: str = ""
+    session_id: str = ""
+    project: str = ""
+    cwd: str = ""
+
+class CompatSessionEndRequest(BaseModel):
+    sessionId: str = ""
+    session_id: str = ""
+    project: str = ""
+    cwd: str = ""
+
+class ObserveRequest(BaseModel):
+    hookType: str = ""
+    sessionId: str = ""
+    session_id: str = ""
+    project: str = ""
+    cwd: str = ""
+    timestamp: str = ""
+    data: dict = {}
+
+class SummarizeRequest(BaseModel):
+    sessionId: str = ""
+    session_id: str = ""
+    project: str = ""
+    cwd: str = ""
+
+class EnrichRequest(BaseModel):
+    sessionId: str = ""
+    session_id: str = ""
+    project: str = ""
+    cwd: str = ""
+    files: list[str] = []
+    query: str = ""
+
+class ContextRequest(BaseModel):
+    sessionId: str = ""
+    session_id: str = ""
+    project: str = ""
+    cwd: str = ""
+    query: str = ""
+    token_budget: int = 1500
+
+class SessionCommitRequest(BaseModel):
+    sessionId: str = ""
+    session_id: str = ""
+    sha: str = ""
+    message: str = ""
+    branch: str = ""
+    repo: str = ""
+    cwd: str = ""
+
+class SearchRequest(BaseModel):
+    query: str
+    limit: int = 10
+    format: str = "full"
+    token_budget: int | None = None
+    sessionId: str = ""
+    session_id: str = ""
+
+class RememberRequest(BaseModel):
+    content: str
+    type: str = "fact"
+    concepts: str = ""
+    files: str = ""
+    sessionId: str = ""
+    session_id: str = ""
+
+class ForgetRequest(BaseModel):
+    query: str
+    limit: int = 10
+    dry_run: bool = True
+
+class FileContextRequest(BaseModel):
+    files: str
+    sessionId: str = ""
+    session_id: str = ""
+
+class PatternsRequest(BaseModel):
+    query: str = ""
+    limit: int = 10
+
+class SmartSearchRequest(BaseModel):
+    query: str
+    limit: int = 10
+    depth: str = "auto"
+
+class TimelineRequest(BaseModel):
+    sessionId: str = ""
+    session_id: str = ""
+    from_: str = ""
+    to: str = ""
+    limit: int = 20
+
+class ClaudeBridgeSyncRequest(BaseModel):
+    sessionId: str = ""
+    session_id: str = ""
+    project: str = ""
+    cwd: str = ""
+
+class ImportRequest(BaseModel):
+    data: dict = {}
+    version: str = ""
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -2644,7 +2746,7 @@ async def _do_consolidate(
         return {"merged": 0, "decayed": 0, "pruned": 0, "ms": 0}
 
     try:
-        seed = np.zeros(mem_store.DIMS, dtype=np.float32)
+        seed = np.zeros(embedder.DIMS, dtype=np.float32)
         results = await _redis.execute_command(
             "VSIM", mem_store.FACT_KEY, "FP32", seed.tobytes(),
             "COUNT", min(int(card), 500), "WITHSCORES", "WITHATTRIBS"
@@ -2840,7 +2942,7 @@ async def _do_hard_prune() -> dict:
         card = await _redis.execute_command("VCARD", vset_key)
         if not card or int(card) <= 1:
             return 0
-        seed = np.zeros(mem_store.DIMS, dtype=np.float32)
+        seed = np.zeros(embedder.DIMS, dtype=np.float32)
         try:
             results = await _redis.execute_command(
                 "VSIM", vset_key, "FP32", seed.tobytes(),
@@ -2965,7 +3067,7 @@ async def admin_delete_facts_by_content(pattern: str = "Always send a report"):
     if not card or int(card) <= 1:
         return {"deleted": 0, "message": "no facts to scan"}
 
-    seed = np.zeros(mem_store.DIMS, dtype=np.float32)
+    seed = np.zeros(embedder.DIMS, dtype=np.float32)
     results = await _redis.execute_command(
         "VSIM", mem_store.FACT_KEY, "FP32", seed.tobytes(),
         "COUNT", min(int(card), 500), "WITHSCORES", "WITHATTRIBS"
@@ -3050,3 +3152,906 @@ async def get_config():
         "consolidate_threshold":   0.85,
         "session_ttl_s":           14400,
     }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Absorbed agentmemory scaffold endpoints (no /agentmemory prefix)
+# These provide full compatibility with rohitg00/agentmemory hooks & MCP tools.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _compat_sid(req) -> str:
+    """Extract session ID from compat request (supports both camelCase and snake_case)."""
+    return req.sessionId or req.session_id or f"ses_{int(time.time())}"
+
+
+def _compat_check_auth(request: Request) -> dict | None:
+    """Check AGENTMEMORY_SECRET bearer token if configured."""
+    secret = _os.getenv("AGENTMEMORY_SECRET", "")
+    if not secret:
+        return None
+    auth = request.headers.get("authorization", "")
+    if auth != f"Bearer {secret}":
+        return {"status_code": 401, "error": "unauthorized"}
+    return None
+
+
+async def _observe_internal(session_id: str, project: str, cwd: str,
+                            hook_type: str, data: dict) -> dict:
+    """Core observe logic shared by /observe endpoint."""
+    tool_name = data.get("tool_name", "")
+    tool_input = data.get("tool_input", "")
+    tool_output = data.get("tool_output", "")
+
+    content_parts = []
+    if tool_name:
+        content_parts.append(f"Tool: {tool_name}")
+    if tool_input:
+        inp = tool_input if isinstance(tool_input, str) else json.dumps(tool_input, ensure_ascii=False)
+        content_parts.append(f"Input: {inp[:2000]}")
+    if tool_output:
+        out = tool_output if isinstance(tool_output, str) else json.dumps(tool_output, ensure_ascii=False)
+        content_parts.append(f"Output: {out[:4000]}")
+
+    content = "\n".join(content_parts)
+    if not content.strip():
+        return {"status": "ok", "action": "skipped_empty"}
+
+    if _is_trivial(content) or _is_injected(content):
+        return {"status": "ok", "action": "skipped_filter"}
+    if _contains_secret(content):
+        content = _redact_secrets(content)
+
+    if not await _admission_gate(content):
+        return {"status": "ok", "action": "skipped_gate"}
+
+    emb = _encode(content)
+    uid = await mem_store.save_episode(
+        _redis, session_id, content, emb,
+        ep_type=hook_type,
+    )
+
+    try:
+        from core import extractor
+        facts = await extractor.extract_facts(content, session_id)
+        for fact_text, fact_attrs in facts:
+            fact_emb = _encode(fact_text)
+            await mem_store.save_fact(
+                _redis,
+                content=fact_text,
+                category=fact_attrs.get("category", "fact"),
+                confidence=fact_attrs.get("confidence", 0.7),
+                embedding=fact_emb,
+                language=fact_attrs.get("language", "en"),
+                domain=fact_attrs.get("domain", "general"),
+                keywords=fact_attrs.get("keywords"),
+                importance=fact_attrs.get("importance", 0.5),
+                source_episode_id=uid,
+            )
+    except Exception as e:
+        log.warning("[observe] fact extraction failed: %s", e)
+
+    return {"status": "ok", "action": "observed", "id": uid}
+
+
+# ── Liveness / Feature flags ──────────────────────────────────────────────────
+
+@app.get("/livez")
+async def livez():
+    return {"status": "ok", "service": "agentmem"}
+
+
+@app.get("/config/flags")
+async def config_flags():
+    return {
+        "graphExtractionEnabled": _os.getenv("GRAPH_EXTRACTION_ENABLED", "false").lower() == "true",
+        "consolidationEnabled": True,
+        "autoCompressEnabled": True,
+        "contextInjectionEnabled": _os.getenv("AGENTMEMORY_INJECT_CONTEXT", "true").lower() == "true",
+    }
+
+
+# ── Session lifecycle (agentmemory hooks) ─────────────────────────────────────
+
+@app.post("/session/start")
+async def compat_session_start(req: CompatSessionStartRequest, request: Request):
+    auth_err = _compat_check_auth(request)
+    if auth_err:
+        return auth_err
+
+    sid = _compat_sid(req)
+    project = req.project or req.cwd or _os.getcwd()
+
+    session_key = f"mem:session:{sid}"
+    await _redis.set(session_key, json.dumps({
+        "session_id": sid,
+        "project": project,
+        "started_at": time.time(),
+        "observations": 0,
+    }), ex=14400)
+
+    persona_ctx = await persona_mod.get_context(_redis)
+
+    pinned_raw = await _redis.get("mem:pinned:session_summary")
+    last_summary = pinned_raw.decode() if pinned_raw else None
+
+    context_parts = []
+    if persona_ctx:
+        context_parts.append(persona_ctx)
+    if last_summary:
+        context_parts.append(f"## Last Session Summary\n{last_summary[:600]}")
+
+    context = "\n\n".join(context_parts) if context_parts else None
+
+    return {"status": "ok", "sessionId": sid, "context": context}
+
+
+@app.post("/session/end")
+async def compat_session_end(req: CompatSessionEndRequest, request: Request,
+                              background_tasks: BackgroundTasks):
+    auth_err = _compat_check_auth(request)
+    if auth_err:
+        return auth_err
+
+    sid = _compat_sid(req)
+
+    async def _do_end():
+        try:
+            await _do_compress_session(sid)
+        except Exception as e:
+            log.warning("[session/end] compress failed: %s", e)
+
+    background_tasks.add_task(_do_end)
+    return {"status": "ok", "sessionId": sid}
+
+
+# ── Observe (post-tool-use, prompt-submit, subagent hooks) ────────────────────
+
+@app.post("/observe")
+async def observe(req: ObserveRequest, request: Request, background_tasks: BackgroundTasks):
+    auth_err = _compat_check_auth(request)
+    if auth_err:
+        return auth_err
+
+    sid = _compat_sid(req)
+    project = req.project or req.cwd or ""
+    hook_type = req.hookType or "observe"
+    data = req.data or {}
+
+    async def _do_observe():
+        try:
+            await _observe_internal(sid, project, req.cwd or "", hook_type, data)
+        except Exception as e:
+            log.warning("[observe] background error: %s", e)
+
+    background_tasks.add_task(_do_observe)
+    return {"status": "ok"}
+
+
+# ── Summarize (stop hook) ─────────────────────────────────────────────────────
+
+@app.post("/summarize")
+async def compat_summarize(req: SummarizeRequest, request: Request,
+                            background_tasks: BackgroundTasks):
+    auth_err = _compat_check_auth(request)
+    if auth_err:
+        return auth_err
+
+    sid = _compat_sid(req)
+
+    async def _do_summarize():
+        try:
+            await _do_compress_session(sid)
+        except Exception as e:
+            log.warning("[summarize] compress failed: %s", e)
+
+    background_tasks.add_task(_do_summarize)
+    return {"status": "ok", "sessionId": sid}
+
+
+# ── Enrich (pre-tool-use hook) ────────────────────────────────────────────────
+
+@app.post("/enrich")
+async def enrich(req: EnrichRequest, request: Request):
+    auth_err = _compat_check_auth(request)
+    if auth_err:
+        return auth_err
+
+    files = req.files or []
+    query = req.query or ""
+
+    file_contexts = []
+    for f in files[:5]:
+        fname = _os.path.basename(f)
+        emb = _encode(fname)
+        results = await mem_store.knn_search(_redis, mem_store.FACT_KEY, emb, k=3)
+        for r in results:
+            attrs = r.get("attrs", {})
+            if attrs.get("content"):
+                file_contexts.append(attrs["content"][:200])
+
+    if query:
+        emb = _encode(query)
+        results = await mem_store.knn_search(_redis, mem_store.FACT_KEY, emb, k=5)
+        for r in results:
+            attrs = r.get("attrs", {})
+            if attrs.get("content"):
+                file_contexts.append(attrs["content"][:200])
+
+    context = "\n".join(file_contexts[:10]) if file_contexts else None
+    return {"status": "ok", "context": context}
+
+
+# ── Context (pre-compact hook) ────────────────────────────────────────────────
+
+@app.post("/context")
+async def compat_context(req: ContextRequest, request: Request):
+    auth_err = _compat_check_auth(request)
+    if auth_err:
+        return auth_err
+
+    sid = _compat_sid(req)
+    query = req.query or ""
+    budget = req.token_budget or 1500
+
+    persona_ctx = await persona_mod.get_context(_redis)
+    session_ctx = await mem_store.get_session_context(_redis, sid)
+
+    pinned_raw = await _redis.get("mem:pinned:session_summary")
+    last_summary = pinned_raw.decode() if pinned_raw else None
+
+    facts = []
+    episodes = []
+    if query:
+        emb = _encode(query)
+        facts = await mem_store.knn_search(_redis, mem_store.FACT_KEY, emb, k=8)
+        episodes = await mem_store.knn_search(_redis, mem_store.EPISODE_KEY, emb, k=6)
+
+    prepend = _format_prepend(
+        facts=facts,
+        episodes=episodes,
+        session_ctx=session_ctx,
+        persona_ctx=persona_ctx or "",
+        token_budget=budget,
+        last_session_summary=last_summary,
+    )
+
+    return {"status": "ok", "context": prepend}
+
+
+# ── Session commit (post-commit hook) ─────────────────────────────────────────
+
+@app.post("/session/commit")
+async def compat_session_commit(req: SessionCommitRequest, request: Request):
+    auth_err = _compat_check_auth(request)
+    if auth_err:
+        return auth_err
+
+    sid = _compat_sid(req)
+    commit_key = f"mem:commit:{req.sha}"
+    await _redis.hset(commit_key, mapping={
+        "sha": req.sha,
+        "message": req.message,
+        "branch": req.branch,
+        "repo": req.repo,
+        "session_id": sid,
+        "timestamp": str(int(time.time() * 1000)),
+    })
+
+    return {"status": "ok", "sha": req.sha}
+
+
+@app.get("/session/by-commit")
+async def session_by_commit(sha: str = ""):
+    if not sha:
+        return {"error": "sha parameter required"}
+
+    commit_key = f"mem:commit:{sha}"
+    data = await _redis.hgetall(commit_key)
+    if not data:
+        return {"error": "commit not found", "sha": sha}
+
+    result = {k.decode() if isinstance(k, bytes) else k:
+              v.decode() if isinstance(v, bytes) else v
+              for k, v in data.items()}
+    return result
+
+
+@app.get("/commits")
+async def commits(branch: str = "", repo: str = "", limit: int = 20):
+    cursor, keys = await _redis.scan(match="mem:commit:*", count=limit)
+    results = []
+    for key in keys:
+        k = key.decode() if isinstance(key, bytes) else key
+        data = await _redis.hgetall(k)
+        if data:
+            entry = {dk.decode() if isinstance(dk, bytes) else dk:
+                     dv.decode() if isinstance(dv, bytes) else dv
+                     for dk, dv in data.items()}
+            if branch and entry.get("branch") != branch:
+                continue
+            if repo and entry.get("repo") != repo:
+                continue
+            results.append(entry)
+    results.sort(key=lambda x: x.get("timestamp", "0"), reverse=True)
+    return {"commits": results[:limit]}
+
+
+# ── Claude bridge sync ────────────────────────────────────────────────────────
+
+@app.post("/claude-bridge/sync")
+async def claude_bridge_sync(req: ClaudeBridgeSyncRequest, request: Request):
+    auth_err = _compat_check_auth(request)
+    if auth_err:
+        return auth_err
+
+    sid = _compat_sid(req)
+    project = req.project or req.cwd or ""
+
+    persona_ctx = await persona_mod.get_context(_redis)
+    session_ctx = await mem_store.get_session_context(_redis, sid)
+
+    pinned_raw = await _redis.get("mem:pinned:session_summary")
+    last_summary = pinned_raw.decode() if pinned_raw else None
+
+    emb = _encode(project or "project context")
+    facts = await mem_store.knn_search(_redis, mem_store.FACT_KEY, emb, k=10)
+    episodes = await mem_store.knn_search(_redis, mem_store.EPISODE_KEY, emb, k=6)
+
+    prepend = _format_prepend(
+        facts=facts,
+        episodes=episodes,
+        session_ctx=session_ctx,
+        persona_ctx=persona_ctx or "",
+        token_budget=2000,
+        last_session_summary=last_summary,
+    )
+
+    memory_md_path = _os.path.expanduser("~/.claude/AGENTMEM_MEMORY.md")
+    if prepend:
+        try:
+            _os.makedirs(_os.path.dirname(memory_md_path), exist_ok=True)
+            with open(memory_md_path, "w") as f:
+                f.write(prepend)
+        except Exception as e:
+            log.warning("[claude-bridge] write failed: %s", e)
+
+    return {"status": "ok", "memoryPath": memory_md_path if prepend else None}
+
+
+# ── Consolidate pipeline (session-end hook) ───────────────────────────────────
+
+@app.post("/consolidate-pipeline")
+async def compat_consolidate_pipeline(request: Request, background_tasks: BackgroundTasks):
+    auth_err = _compat_check_auth(request)
+    if auth_err:
+        return auth_err
+
+    async def _do_consolidate_compat():
+        try:
+            await _do_consolidate()
+        except Exception as e:
+            log.warning("[consolidate-pipeline] error: %s", e)
+
+    background_tasks.add_task(_do_consolidate_compat)
+    return {"status": "ok"}
+
+
+# ── Crystals auto (session-end hook) ──────────────────────────────────────────
+
+@app.post("/crystals/auto")
+async def crystals_auto(request: Request):
+    auth_err = _compat_check_auth(request)
+    if auth_err:
+        return auth_err
+    return {"status": "ok", "crystals": []}
+
+
+# ── Search (MCP memory_recall) ────────────────────────────────────────────────
+
+@app.post("/search")
+async def compat_search(req: SearchRequest, request: Request):
+    auth_err = _compat_check_auth(request)
+    if auth_err:
+        return auth_err
+
+    sid = _compat_sid(req)
+    emb = _encode(req.query)
+
+    facts = await mem_store.knn_search(_redis, mem_store.FACT_KEY, emb, k=req.limit)
+    episodes = await mem_store.knn_search(_redis, mem_store.EPISODE_KEY, emb, k=req.limit)
+
+    persona_ctx = await persona_mod.get_context(_redis)
+    session_ctx = await mem_store.get_session_context(_redis, sid)
+
+    pinned_raw = await _redis.get("mem:pinned:session_summary")
+    last_summary = pinned_raw.decode() if pinned_raw else None
+
+    budget = req.token_budget or 1500
+
+    if req.format == "compact":
+        results = []
+        for f in facts:
+            attrs = f.get("attrs", {})
+            results.append({
+                "content": f.get("content", "")[:200],
+                "category": attrs.get("category", ""),
+                "score": round(f.get("score", 0), 3),
+            })
+        for e in episodes:
+            attrs = e.get("attrs", {})
+            results.append({
+                "content": e.get("content", "")[:200],
+                "category": attrs.get("category", ""),
+                "score": round(e.get("score", 0), 3),
+            })
+        return {"results": results}
+
+    prepend = _format_prepend(
+        facts=facts, episodes=episodes,
+        session_ctx=session_ctx, persona_ctx=persona_ctx or "",
+        token_budget=budget, last_session_summary=last_summary,
+    )
+    return {"context": prepend, "facts": len(facts), "episodes": len(episodes)}
+
+
+# ── Remember (MCP memory_save) ────────────────────────────────────────────────
+
+@app.post("/remember")
+async def compat_remember(req: RememberRequest, request: Request):
+    auth_err = _compat_check_auth(request)
+    if auth_err:
+        return auth_err
+
+    sid = _compat_sid(req)
+    content = req.content
+    emb = _encode(content)
+
+    uid = await mem_store.save_fact(
+        _redis,
+        content=content,
+        category=req.type or "fact",
+        confidence=0.8,
+        embedding=emb,
+        keywords=[c.strip() for c in req.concepts.split(",") if c.strip()] if req.concepts else None,
+        importance=0.8,
+    )
+
+    return {"status": "ok", "id": uid}
+
+
+# ── Forget (MCP memory_forget) ────────────────────────────────────────────────
+
+@app.post("/forget")
+async def compat_forget(req: ForgetRequest, request: Request):
+    auth_err = _compat_check_auth(request)
+    if auth_err:
+        return auth_err
+
+    emb = _encode(req.query)
+    facts = await mem_store.knn_search(_redis, mem_store.FACT_KEY, emb, k=req.limit)
+
+    if req.dry_run:
+        return {
+            "status": "dry_run",
+            "would_delete": len(facts),
+            "memories": [f.get("content", "")[:100] for f in facts],
+        }
+
+    deleted = 0
+    for f in facts:
+        elem = f.get("_element", "")
+        if elem:
+            await _redis.execute_command("VREM", mem_store.FACT_KEY, elem)
+            deleted += 1
+
+    return {"status": "ok", "deleted": deleted}
+
+
+# ── Compress file ─────────────────────────────────────────────────────────────
+
+@app.post("/compress-file")
+async def compress_file(filePath: str = ""):
+    if not filePath or not _os.path.isfile(filePath):
+        return {"error": "file not found", "path": filePath}
+
+    try:
+        with open(filePath, "r") as f:
+            content = f.read()
+
+        backup_path = filePath.replace(".md", ".original.md")
+        if not _os.path.exists(backup_path):
+            with open(backup_path, "w") as f:
+                f.write(content)
+
+        lines = content.split("\n")
+        compressed = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("#") or stripped.startswith("http") or stripped.startswith("```"):
+                compressed.append(line)
+            elif stripped and len(stripped) > 20:
+                compressed.append(stripped[:120] + "…")
+            elif stripped:
+                compressed.append(line)
+
+        with open(filePath, "w") as f:
+            f.write("\n".join(compressed))
+
+        return {"status": "ok", "original_lines": len(lines), "compressed_lines": len(compressed)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ── Sessions list ─────────────────────────────────────────────────────────────
+
+@app.get("/sessions")
+async def compat_sessions(limit: int = 20):
+    cursor, keys = await _redis.scan(match="mem:session:*", count=limit)
+    results = []
+    for key in keys:
+        k = key.decode() if isinstance(key, bytes) else key
+        raw = await _redis.get(k)
+        if raw:
+            try:
+                data = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+                results.append(data)
+            except Exception:
+                pass
+    results.sort(key=lambda x: x.get("started_at", 0), reverse=True)
+    return {"sessions": results[:limit]}
+
+
+# ── Observations list ─────────────────────────────────────────────────────────
+
+@app.get("/observations")
+async def compat_observations(sessionId: str = "", limit: int = 20):
+    seed = np.zeros(embedder.DIMS, dtype=np.float32)
+    card = await _redis.execute_command("VCARD", mem_store.EPISODE_KEY)
+    if not card or int(card) <= 1:
+        return {"observations": []}
+
+    results_raw = await _redis.execute_command(
+        "VSIM", mem_store.EPISODE_KEY, "FP32", seed.astype("float32").tobytes(),
+        "COUNT", min(int(card), limit + 1), "WITHSCORES", "WITHATTRIBS"
+    )
+
+    items = []
+    i = 0
+    while i + 2 < len(results_raw):
+        elem = results_raw[i]
+        raw = results_raw[i + 2]
+        i += 3
+        elem_str = elem.decode() if isinstance(elem, bytes) else elem
+        if elem_str == "__seed__":
+            continue
+        try:
+            attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+        except Exception:
+            continue
+        if sessionId and attrs.get("session_id") != sessionId:
+            continue
+        items.append({
+            "id": elem_str,
+            "content": attrs.get("content", "")[:300],
+            "session_id": attrs.get("session_id", ""),
+            "tool_name": attrs.get("tool_name", ""),
+            "timestamp": attrs.get("ts", 0),
+        })
+
+    return {"observations": items[:limit]}
+
+
+# ── File context ──────────────────────────────────────────────────────────────
+
+@app.post("/file-context")
+async def file_context(req: FileContextRequest, request: Request):
+    auth_err = _compat_check_auth(request)
+    if auth_err:
+        return auth_err
+
+    files = [f.strip() for f in req.files.split(",") if f.strip()]
+    sid = _compat_sid(req)
+
+    all_results = []
+    for f in files[:10]:
+        fname = _os.path.basename(f)
+        emb = _encode(fname)
+        results = await mem_store.knn_search(_redis, mem_store.EPISODE_KEY, emb, k=5,
+                                              filter_expr=f'.session_id != "{sid}"')
+        for r in results:
+            attrs = r.get("attrs", {})
+            all_results.append({
+                "file": f,
+                "content": attrs.get("content", "")[:300],
+                "session_id": attrs.get("session_id", ""),
+                "score": round(r.get("score", 0), 3),
+            })
+
+    return {"results": all_results}
+
+
+# ── Patterns ──────────────────────────────────────────────────────────────────
+
+@app.post("/patterns")
+async def compat_patterns(req: PatternsRequest, request: Request):
+    auth_err = _compat_check_auth(request)
+    if auth_err:
+        return auth_err
+
+    query = req.query or "recurring patterns"
+    emb = _encode(query)
+    facts = await mem_store.knn_search(_redis, mem_store.FACT_KEY, emb, k=req.limit)
+
+    categories = {}
+    for f in facts:
+        cat = f.get("attrs", {}).get("category", "unknown")
+        categories[cat] = categories.get(cat, 0) + 1
+
+    return {
+        "patterns": [{"category": k, "count": v} for k, v in
+                     sorted(categories.items(), key=lambda x: x[1], reverse=True)],
+        "memories": [{"content": f.get("content", "")[:200],
+                       "category": f.get("attrs", {}).get("category", "")}
+                      for f in facts[:req.limit]],
+    }
+
+
+# ── Smart search ──────────────────────────────────────────────────────────────
+
+@app.post("/smart-search")
+async def smart_search(req: SmartSearchRequest, request: Request):
+    auth_err = _compat_check_auth(request)
+    if auth_err:
+        return auth_err
+
+    emb = _encode(req.query)
+
+    facts = await mem_store.knn_search(_redis, mem_store.FACT_KEY, emb, k=req.limit)
+    episodes = await mem_store.knn_search(_redis, mem_store.EPISODE_KEY, emb, k=req.limit)
+
+    merged = _rrf_merge([facts, episodes], weights=[1.0, 0.8], limit=req.limit)
+
+    return {
+        "results": [{
+            "content": m.get("content", "")[:300],
+            "category": m.get("attrs", {}).get("category", ""),
+            "score": round(m.get("score", 0), 4),
+        } for m in merged],
+    }
+
+
+# ── Timeline ──────────────────────────────────────────────────────────────────
+
+@app.post("/timeline")
+async def compat_timeline(req: TimelineRequest, request: Request):
+    auth_err = _compat_check_auth(request)
+    if auth_err:
+        return auth_err
+
+    seed = np.zeros(embedder.DIMS, dtype=np.float32)
+    card = await _redis.execute_command("VCARD", mem_store.EPISODE_KEY)
+    if not card or int(card) <= 1:
+        return {"timeline": []}
+
+    results_raw = await _redis.execute_command(
+        "VSIM", mem_store.EPISODE_KEY, "FP32", seed.astype("float32").tobytes(),
+        "COUNT", min(int(card), req.limit + 1), "WITHSCORES", "WITHATTRIBS"
+    )
+
+    items = []
+    i = 0
+    while i + 2 < len(results_raw):
+        elem = results_raw[i]
+        raw = results_raw[i + 2]
+        i += 3
+        elem_str = elem.decode() if isinstance(elem, bytes) else elem
+        if elem_str == "__seed__":
+            continue
+        try:
+            attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+        except Exception:
+            continue
+        sid = req.sessionId or req.session_id
+        if sid and attrs.get("session_id") != sid:
+            continue
+        items.append({
+            "id": elem_str,
+            "content": attrs.get("content", "")[:200],
+            "timestamp": attrs.get("ts", 0),
+            "session_id": attrs.get("session_id", ""),
+            "category": attrs.get("category", ""),
+        })
+
+    items.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
+    return {"timeline": items[:req.limit]}
+
+
+# ── Profile ───────────────────────────────────────────────────────────────────
+
+@app.get("/profile")
+async def compat_profile():
+    ctx = await persona_mod.get_context(_redis)
+    return {"profile": ctx or ""}
+
+
+# ── Export / Import ───────────────────────────────────────────────────────────
+
+@app.get("/export")
+async def compat_export():
+    export = {"version": "1.2.0", "exported_at": time.time(), "facts": [], "episodes": []}
+
+    for key, label in [(mem_store.FACT_KEY, "facts"), (mem_store.EPISODE_KEY, "episodes")]:
+        card = await _redis.execute_command("VCARD", key)
+        if not card or int(card) <= 1:
+            continue
+        seed = np.zeros(embedder.DIMS, dtype=np.float32)
+        results = await _redis.execute_command(
+            "VSIM", key, "FP32", seed.astype("float32").tobytes(),
+            "COUNT", min(int(card), 5000), "WITHSCORES", "WITHATTRIBS"
+        )
+        i = 0
+        while i + 2 < len(results):
+            elem = results[i]; raw = results[i + 2]; i += 3
+            elem_str = elem.decode() if isinstance(elem, bytes) else elem
+            if elem_str == "__seed__":
+                continue
+            try:
+                attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+            except Exception:
+                continue
+            export[label].append({"id": elem_str, **attrs})
+
+    return export
+
+
+@app.post("/import")
+async def compat_import(req: ImportRequest, request: Request):
+    auth_err = _compat_check_auth(request)
+    if auth_err:
+        return auth_err
+
+    data = req.data
+    imported = 0
+
+    for item in data.get("episodes", []):
+        content = item.get("content", "")
+        if not content:
+            continue
+        emb = _encode(content)
+        await mem_store.save_episode(
+            _redis,
+            session_id=item.get("session_id", ""),
+            content=content,
+            embedding=emb,
+            ep_type=item.get("ep_type", item.get("category", "general")),
+        )
+        imported += 1
+
+    for item in data.get("facts", []):
+        content = item.get("content", "")
+        if not content:
+            continue
+        emb = _encode(content)
+        await mem_store.save_fact(
+            _redis,
+            content=content,
+            category=item.get("category", "fact"),
+            confidence=item.get("confidence", 0.7),
+            embedding=emb,
+            language=item.get("language", "en"),
+            domain=item.get("domain", "general"),
+            keywords=item.get("keywords"),
+            importance=item.get("importance", 0.5),
+        )
+        imported += 1
+
+    return {"status": "ok", "imported": imported}
+
+
+# ── Memories list ─────────────────────────────────────────────────────────────
+
+async def _list_memories(limit: int = 50, category: str = "") -> dict:
+    """Shared logic for listing memories (used by /memories and /semantic)."""
+    seed = np.zeros(embedder.DIMS, dtype=np.float32)
+    card = await _redis.execute_command("VCARD", mem_store.FACT_KEY)
+    if not card or int(card) <= 1:
+        return {"memories": []}
+
+    results_raw = await _redis.execute_command(
+        "VSIM", mem_store.FACT_KEY, "FP32", seed.astype("float32").tobytes(),
+        "COUNT", min(int(card), limit + 1), "WITHSCORES", "WITHATTRIBS"
+    )
+
+    items = []
+    i = 0
+    while i + 2 < len(results_raw):
+        elem = results_raw[i]; raw = results_raw[i + 2]; i += 3
+        elem_str = elem.decode() if isinstance(elem, bytes) else elem
+        if elem_str == "__seed__":
+            continue
+        try:
+            attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+        except Exception:
+            continue
+        if category and attrs.get("category") != category:
+            continue
+        items.append({"id": elem_str, **attrs})
+
+    return {"memories": items[:limit]}
+
+
+@app.get("/memories")
+async def compat_memories(limit: int = 50, category: str = ""):
+    return await _list_memories(limit=limit, category=category)
+
+
+@app.get("/memories/{memory_id}")
+async def memory_detail(memory_id: str):
+    try:
+        raw = await _redis.execute_command("VGETATTR", mem_store.FACT_KEY, memory_id)
+        if raw:
+            attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+            return {"id": memory_id, **attrs}
+    except Exception:
+        pass
+
+    try:
+        raw = await _redis.execute_command("VGETATTR", mem_store.EPISODE_KEY, memory_id)
+        if raw:
+            attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+            return {"id": memory_id, **attrs}
+    except Exception:
+        pass
+
+    return {"error": "memory not found", "id": memory_id}
+
+
+# ── Semantic / Procedural / Relations (read-only list views) ──────────────────
+
+@app.get("/semantic")
+async def compat_semantic(limit: int = 50):
+    return await _list_memories(limit=limit)
+
+
+@app.get("/procedural")
+async def compat_procedural(limit: int = 50):
+    seed = np.zeros(embedder.DIMS, dtype=np.float32)
+    card = await _redis.execute_command("VCARD", mem_store.PROC_KEY)
+    if not card or int(card) <= 1:
+        return {"procedures": []}
+
+    results_raw = await _redis.execute_command(
+        "VSIM", mem_store.PROC_KEY, "FP32", seed.astype("float32").tobytes(),
+        "COUNT", min(int(card), limit + 1), "WITHSCORES", "WITHATTRIBS"
+    )
+
+    items = []
+    i = 0
+    while i + 2 < len(results_raw):
+        elem = results_raw[i]; raw = results_raw[i + 2]; i += 3
+        elem_str = elem.decode() if isinstance(elem, bytes) else elem
+        if elem_str == "__seed__":
+            continue
+        try:
+            attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+        except Exception:
+            continue
+        items.append({"id": elem_str, **attrs})
+
+    return {"procedures": items[:limit]}
+
+
+@app.get("/relations")
+async def compat_relations():
+    stats = await graph_mod.graph_stats(_redis)
+    return {"relations": stats}
+
+
+# ── Viewer ────────────────────────────────────────────────────────────────────
+
+@app.get("/viewer")
+async def compat_viewer():
+    idx = _os.path.join(_static_dir, "index.html")
+    if _os.path.exists(idx):
+        return FileResponse(idx)
+    return {"message": "AgentMem Viewer", "version": "1.2.0"}
