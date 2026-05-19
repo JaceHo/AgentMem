@@ -8,3 +8,9 @@ __pycache__/
 # Runtime state — digest ingestion progress trackers
 .digest-state.json
 .digest-claudecode-state.json
+.digest*
+.venv
+.vscode
+.claudecode
+.benchmarks
+.coverage

@@ -82,6 +82,23 @@ def async_http_client():
 
 
 @pytest.fixture
+async def agentmem_client():
+    """
+    Async HTTP client specifically for AgentMem API testing.
+    
+    Uses the same base URL as async_http_client but with better error handling
+    and automatic cleanup for integration tests.
+    """
+    from main import app
+    from httpx import AsyncClient, ASGITransport
+    
+    transport = ASGITransport(app=app)
+    client = AsyncClient(transport=transport, base_url="http://test")
+    yield client
+    await client.aclose()
+
+
+@pytest.fixture
 def sample_messages():
     """Sample conversation messages for testing."""
     return [

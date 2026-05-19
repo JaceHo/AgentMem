@@ -68,9 +68,10 @@ def cmd_root() -> None:
     print("  agentmem health               check service health")
     print()
     print("Service commands:")
-    print("  agentmem start [--host H] [--port P] [--dev]   start the server")
-    print("  agentmem connect [agent] [--all]               wire into AI agents")
-    print("  agentmem doctor                                diagnose issues")
+    print("  agentmem start [--host H] [--port P] [--dev] [--no-auto]   start the server")
+    print("  agentmem connect [agent] [--all] [--force]                 wire into AI agents")
+    print("  (auto-connect is default on start; use --no-auto to skip)")
+    print("  agentmem doctor                                            diagnose issues")
     print("  agentmem migrate-embeddings --provider <name>  switch embedding provider")
     print("  agentmem demo                                  quick demo")
     print("  agentmem version                               print version")
@@ -147,6 +148,7 @@ def cmd_start(args: list[str]) -> None:
     host = "0.0.0.0"
     port = 18800
     dev = False
+    no_auto = False
     i = 0
     while i < len(args):
         if args[i] == "--host" and i + 1 < len(args):
@@ -155,11 +157,42 @@ def cmd_start(args: list[str]) -> None:
             port = int(args[i + 1]); i += 2
         elif args[i] == "--dev":
             dev = True; i += 1
+        elif args[i] == "--no-auto":
+            no_auto = True; i += 1
         else:
             i += 1
 
     host = os.getenv("AGENTMEM_HOST", host)
     port = int(os.getenv("AGENTMEM_PORT", str(port)))
+
+    # Auto-connect detected agents unless --no-auto
+    if not no_auto:
+        import threading
+        def _auto_connect():
+            import time
+            # Wait for service to be ready
+            for _ in range(40):
+                try:
+                    s, _ = _req("GET", "/health")
+                    if s == 200:
+                        break
+                except Exception:
+                    pass
+                time.sleep(1)
+            else:
+                return
+            try:
+                _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                if _project_root not in sys.path:
+                    sys.path.insert(0, _project_root)
+                from connect import run_connect
+                run_connect(all_agents=True)
+            except Exception as e:
+                print(f"[agentmem] auto-connect failed: {e}", file=sys.stderr)
+        t = threading.Thread(target=_auto_connect, daemon=True)
+        t.start()
+    else:
+        print("  (--no-auto: skipping agent auto-connect)")
 
     print(f"🧠 AgentMem — starting on {host}:{port}")
     uvicorn.run("main:app", host=host, port=port, reload=dev)

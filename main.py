@@ -498,9 +498,10 @@ async def lifespan(app: FastAPI):
     log.info("Ensuring vectorset indexes…")
     await mem_store.ensure_indexes(_redis)
     _spawn(_periodic_consolidate(), "consolidate")
+    _spawn(_auto_crystallize(), "crystallize")  # Auto-crystallize sessions every 6h
     # Populate BM25 corpus from existing Redis facts (non-blocking, best-effort)
     _spawn(_populate_bm25_from_redis(_redis), "bm25-populate")
-    log.info("AgentMem v%s ready (session-handoff+hard-prune+auto-graph+batch-MCP+compat)", APP_VERSION)
+    log.info("AgentMem v%s ready (session-handoff+hard-prune+auto-graph+batch-MCP+compat+auto-crystallize)", APP_VERSION)
     yield
     # Cancel tracked background tasks before closing Redis
     for t in list(_bg_tasks):
@@ -827,12 +828,13 @@ def _format_prepend(
     proc_ctx: list[dict] | None = None,
     token_budget: int = 1500,
     last_session_summary: str | None = None,
+    crystal_digests: list[dict] | None = None,
 ) -> str:
     """
     Build the context string injected into the agent's system prompt.
 
     SimpleMem Section 3.3 token-budget packing:
-    Priority order: persona → last_session_summary → env → tools → skills → session_ctx → facts → episodes
+    Priority order: persona → last_session_summary → crystallized digests → env → tools → skills → session_ctx → facts → episodes
     Greedy packing: stop adding items when token_budget is exhausted.
     Output wrapped in <cross_session_memory> XML tags (SimpleMem convention).
     """
@@ -858,6 +860,27 @@ def _format_prepend(
     # in the previous session, regardless of current query similarity.
     if last_session_summary and _add("## Last Session Summary"):
         _add(last_session_summary[:600])
+        _add("")
+
+    # Priority 1.7: crystallized digests (lessons learned from past sessions)
+    # Auto-generated summaries of completed work chains with key findings
+    if crystal_digests and _add("## Lessons Learned"):
+        for digest in crystal_digests[:3]:  # top 3 digests
+            summary = digest.get("summary", "")
+            fact_count = digest.get("fact_count", 0)
+            entities = digest.get("entities", [])
+            
+            # Format: summary + key stats
+            digest_text = f"- **Completed Session** ({fact_count} facts): {summary}"
+            if not _add(digest_text):
+                break
+            
+            # Add key entities if space allows
+            if entities and len(entities) <= 5:
+                entity_str = ", ".join(entities[:5])
+                if not _add(f"  Key entities: {entity_str}"):
+                    break
+        
         _add("")
 
     # Priority 2: environment context
@@ -1974,6 +1997,42 @@ async def recall(req: RecallRequest):
         gather_tasks.append(_fetch_procs(emb))
     else:
         gather_tasks.append(asyncio.sleep(0))
+    
+    # Crystallized digests (index 8): fetch recent auto-crystallized session summaries
+    async def _fetch_crystallized_digests() -> list[dict]:
+        """Fetch top-3 most recent crystallized session digests for lessons learned."""
+        try:
+            pattern = "mem:crystallized:*"
+            cursor = 0
+            digests = []
+            
+            while True:
+                cursor, keys = await _redis.scan(cursor, match=pattern, count=50)
+                
+                for key in keys:
+                    key_str = key.decode() if isinstance(key, bytes) else key
+                    raw = await _redis.get(key)
+                    if not raw:
+                        continue
+                    
+                    try:
+                        digest = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+                        digests.append(digest)
+                    except Exception:
+                        continue
+                
+                if cursor == 0 or len(digests) >= 10:
+                    break
+            
+            # Sort by crystallized_at (most recent first), return top 3
+            digests.sort(key=lambda d: d.get("crystallized_at", 0), reverse=True)
+            return digests[:3]
+        
+        except Exception as e:
+            log.warning(f"[recall] failed to fetch crystallized digests: {e}")
+            return []
+    
+    gather_tasks.append(_fetch_crystallized_digests())
 
     results = await asyncio.gather(*gather_tasks)
     persona_ctx  = results[0]
@@ -1988,6 +2047,7 @@ async def recall(req: RecallRequest):
     ) if _pinned_raw else None
     tools_raw    = results[7] if isinstance(results[7], list) else []
     procs_raw    = results[8] if isinstance(results[8], list) else []
+    crystal_digests = results[9] if isinstance(results[9], list) else []
 
     # Symbolic structured pass (AgentMem §3.3 extension):
     # If the query mentions specific persons or entities, do a targeted scan
@@ -2211,6 +2271,7 @@ async def recall(req: RecallRequest):
         proc_ctx=proc_ctx or None,
         token_budget=req.token_budget,
         last_session_summary=_handoff,
+        crystal_digests=crystal_digests or None,  # Auto-crystallized lessons learned
     )
     ms = int((time.time() - t0) * 1000)
 
@@ -3255,6 +3316,227 @@ async def admin_delete_facts_by_content(pattern: str = "Always send a report"):
     return {"deleted": deleted, "pattern": pattern}
 
 
+# ── User Feedback Endpoints (v1.2.0) ──────────────────────────────────────────
+# Enable users to rate, pin, and delete memories for continuous quality improvement
+
+class FeedbackRequest(BaseModel):
+    element_id: str
+    rating: int  # 1-5 stars (1=unhelpful, 5=very helpful)
+    comment: str = ""
+
+
+@app.post("/feedback")
+async def provide_feedback(req: FeedbackRequest):
+    """
+    User rates memory relevance (1-5 stars). Adjusts importance and confidence.
+    
+    - Rating 4-5: boost importance × 1.2, reinforce fact (increment source_count)
+    - Rating 1-2: reduce importance × 0.7, flag for review
+    - Rating 3: no change
+    
+    This creates a reinforcement learning loop where the system learns from
+    user preferences over time.
+    """
+    if req.rating < 1 or req.rating > 5:
+        return {"error": "rating must be 1-5"}
+    
+    try:
+        raw = await _redis.execute_command("VGETATTR", mem_store.FACT_KEY, req.element_id)
+        if not raw:
+            return {"status": "not_found", "element_id": req.element_id}
+        
+        attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+        
+        # Apply feedback-based adjustments
+        if req.rating >= 4:
+            # Positive feedback: boost importance and reinforce
+            old_importance = attrs.get("importance", 0.5)
+            attrs["importance"] = min(1.0, old_importance * 1.2)
+            attrs["user_rating"] = req.rating
+            attrs["user_rating_ts"] = int(time.time() * 1000)
+            if req.comment:
+                attrs["user_comment"] = req.comment[:500]
+            
+            # Reinforce fact (increment source_count, reset decay)
+            await mem_store.reinforce_fact(_redis, req.element_id, source=f"user_feedback_{req.rating}")
+            
+            # Update Redis attrs
+            await _redis.execute_command(
+                "VSETATTR", mem_store.FACT_KEY, req.element_id,
+                json.dumps(attrs, ensure_ascii=False)
+            )
+            
+            log.info(f"[feedback] positive rating {req.rating}/5 for {req.element_id}, "
+                    f"importance {old_importance:.2f} → {attrs['importance']:.2f}")
+            
+            return {
+                "status": "ok",
+                "element_id": req.element_id,
+                "new_importance": attrs["importance"],
+                "action": "boosted_and_reinforced"
+            }
+        
+        elif req.rating <= 2:
+            # Negative feedback: reduce importance, flag for review
+            old_importance = attrs.get("importance", 0.5)
+            attrs["importance"] = max(0.05, old_importance * 0.7)
+            attrs["user_rating"] = req.rating
+            attrs["user_rating_ts"] = int(time.time() * 1000)
+            attrs["needs_review"] = True
+            if req.comment:
+                attrs["user_comment"] = req.comment[:500]
+            
+            # Update Redis attrs
+            await _redis.execute_command(
+                "VSETATTR", mem_store.FACT_KEY, req.element_id,
+                json.dumps(attrs, ensure_ascii=False)
+            )
+            
+            log.info(f"[feedback] negative rating {req.rating}/5 for {req.element_id}, "
+                    f"importance {old_importance:.2f} → {attrs['importance']:.2f}")
+            
+            return {
+                "status": "ok",
+                "element_id": req.element_id,
+                "new_importance": attrs["importance"],
+                "action": "reduced_and_flagged_for_review"
+            }
+        
+        else:
+            # Neutral rating (3): just record it
+            attrs["user_rating"] = req.rating
+            attrs["user_rating_ts"] = int(time.time() * 1000)
+            if req.comment:
+                attrs["user_comment"] = req.comment[:500]
+            
+            await _redis.execute_command(
+                "VSETATTR", mem_store.FACT_KEY, req.element_id,
+                json.dumps(attrs, ensure_ascii=False)
+            )
+            
+            return {
+                "status": "ok",
+                "element_id": req.element_id,
+                "action": "recorded_neutral_rating"
+            }
+    
+    except Exception as e:
+        log.error(f"[feedback] error processing feedback: {e}")
+        return {"error": str(e)}
+
+
+@app.post("/facts/{element_id}/pin")
+async def pin_fact(element_id: str):
+    """
+    Pin fact permanently (importance = 1.0, never pruned).
+    
+    Pinned facts are excluded from consolidation pruning phase.
+    Use for critical rules, identity facts, or essential procedures.
+    """
+    try:
+        raw = await _redis.execute_command("VGETATTR", mem_store.FACT_KEY, element_id)
+        if not raw:
+            return {"status": "not_found", "element_id": element_id}
+        
+        attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+        attrs["pinned"] = True
+        attrs["pinned_at"] = int(time.time() * 1000)
+        attrs["importance"] = 1.0  # maximum importance
+        
+        await _redis.execute_command(
+            "VSETATTR", mem_store.FACT_KEY, element_id,
+            json.dumps(attrs, ensure_ascii=False)
+        )
+        
+        log.info(f"[pin] pinned fact {element_id}: {attrs.get('content', '')[:80]}")
+        
+        return {
+            "status": "ok",
+            "element_id": element_id,
+            "action": "pinned_permanently"
+        }
+    
+    except Exception as e:
+        log.error(f"[pin] error pinning fact: {e}")
+        return {"error": str(e)}
+
+
+@app.delete("/facts/{element_id}")
+async def delete_fact(element_id: str):
+    """
+    User-initiated hard delete (immediate VREM).
+    
+    Unlike soft-delete (superseded_by), this physically removes the fact
+    from the vectorset. Use with caution — no undo.
+    """
+    try:
+        # Verify fact exists
+        raw = await _redis.execute_command("VGETATTR", mem_store.FACT_KEY, element_id)
+        if not raw:
+            return {"status": "not_found", "element_id": element_id}
+        
+        attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+        content_preview = attrs.get("content", "")[:80]
+        
+        # Physical removal
+        await _redis.execute_command("VREM", mem_store.FACT_KEY, element_id)
+        
+        # Invalidate BM25 index
+        await _bm25_index.reset()
+        _spawn(_populate_bm25_from_redis(_redis), "bm25-rebuild-after-delete")
+        
+        log.info(f"[delete] user-deleted fact {element_id}: {content_preview}")
+        
+        return {
+            "status": "ok",
+            "element_id": element_id,
+            "action": "hard_deleted"
+        }
+    
+    except Exception as e:
+        log.error(f"[delete] error deleting fact: {e}")
+        return {"error": str(e)}
+
+
+@app.get("/facts/{element_id}/metadata")
+async def get_fact_metadata(element_id: str):
+    """
+    Get full metadata for a fact including user ratings, pins, lifecycle info.
+    
+    Useful for debugging and understanding why a fact was stored/retrieved.
+    """
+    try:
+        raw = await _redis.execute_command("VGETATTR", mem_store.FACT_KEY, element_id)
+        if not raw:
+            return {"status": "not_found", "element_id": element_id}
+        
+        attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+        eff_conf = mem_store.confidence_decay(attrs)
+        
+        return {
+            "element_id": element_id,
+            "content": attrs.get("content", "")[:500],
+            "category": attrs.get("category", ""),
+            "importance": attrs.get("importance", 0.5),
+            "confidence": attrs.get("confidence", 0.8),
+            "effective_confidence": eff_conf,
+            "source_count": attrs.get("source_count", 1),
+            "access_count": attrs.get("access_count", 0),
+            "created_at": attrs.get("ts", 0),
+            "last_confirmed_ts": attrs.get("last_confirmed_ts", 0),
+            "version": attrs.get("version", 1),
+            "pinned": attrs.get("pinned", False),
+            "user_rating": attrs.get("user_rating"),
+            "user_comment": attrs.get("user_comment"),
+            "needs_review": attrs.get("needs_review", False),
+            "superseded_by": attrs.get("superseded_by", ""),
+            "superseded_reason": attrs.get("superseded_reason", ""),
+        }
+    
+    except Exception as e:
+        return {"error": str(e), "element_id": element_id}
+
+
 # ── Knowledge Graph endpoints (v0.9.0) ────────────────────────────────────────
 
 class GraphRecallRequest(BaseModel):
@@ -3659,6 +3941,230 @@ async def config_flags():
         "autoCompressEnabled": True,
         "contextInjectionEnabled": _os.getenv("AGENTMEMORY_INJECT_CONTEXT", "true").lower() == "true",
     }
+
+
+# ── Automatic Crystallization Background Task ────────────────────────────────
+
+async def _crystallize_session_inline(session_id: str, session_obj: dict, max_facts: int = 20) -> dict | None:
+    """
+    Inline crystallization logic (same as /crystallize endpoint but without HTTP overhead).
+    
+    Returns digest dict or None if crystallization fails.
+    """
+    try:
+        # Gather facts from this session
+        card = await _redis.execute_command("VCARD", mem_store.FACT_KEY)
+        if not card or int(card) <= 1:
+            return None
+        
+        seed = np.zeros(embedder.DIMS, dtype=np.float32)
+        results = await _redis.execute_command(
+            "VSIM", mem_store.FACT_KEY, "FP32", seed.tobytes(),
+            "COUNT", min(int(card), 200), "WITHSCORES", "WITHATTRIBS"
+        )
+        
+        facts = []
+        all_entities: set[str] = set()
+        i = 0
+        while i + 2 < len(results):
+            raw = results[i + 2]
+            i += 3
+            try:
+                attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+            except Exception:
+                continue
+            
+            if attrs.get("_seed") or not attrs.get("content") or attrs.get("superseded_by"):
+                continue
+            
+            # Filter by session timestamp proximity
+            session_ts = session_obj.get("ts", 0)
+            fact_ts = attrs.get("ts", 0)
+            if abs(fact_ts - session_ts) < 3600000:  # within 1 hour
+                facts.append(attrs)
+                for e in attrs.get("entities", []):
+                    all_entities.add(e)
+                for p in attrs.get("persons", []):
+                    all_entities.add(p)
+        
+        if not facts:
+            return None
+        
+        # Sort by importance, take top N
+        facts.sort(key=lambda a: a.get("importance", 0.5), reverse=True)
+        top_facts = facts[:max_facts]
+        
+        # Generate summary using LLM (reuse existing summarizer)
+        # Note: Ensure 'summarizer' is imported or available in scope
+        fact_texts = [f.get("content", "") for f in top_facts[:10]]  # top 10 for summary
+        summary_prompt = (
+            "Summarize these key findings from a completed work session in 2-3 sentences. "
+            "Focus on what was accomplished, what was learned, and any important decisions made.\n\n"
+            + "\n".join(f"- {t}" for t in fact_texts)
+        )
+        
+        summary = ""
+        try:
+            from core import summarizer
+            summary = await summarizer.summarize(summary_prompt)
+        except ImportError:
+            summary = "Auto-crystallized session summary (summarizer unavailable)."
+        except Exception as e:
+            log.warning(f"[crystallize] summarization failed: {e}")
+            summary = "Auto-crystallized session summary (summarization error)."
+        
+        # Build digest
+        digest = {
+            "session_id": session_id,
+            "summary": summary[:500],
+            "fact_count": len(top_facts),
+            "total_facts_available": len(facts),
+            "facts": [
+                {
+                    "content": f.get("content", ""),
+                    "category": f.get("category", ""),
+                    "confidence": f.get("confidence", 0.8),
+                    "effective_confidence": mem_store.confidence_decay(f),
+                    "importance": f.get("importance", 0.5),
+                    "source_count": f.get("source_count", 1),
+                }
+                for f in top_facts
+            ],
+            "entities": sorted(all_entities)[:20],  # top 20 entities
+            "categories": sorted(set(f.get("category", "") for f in top_facts)),
+            "crystallized_at": int(time.time() * 1000),
+            "auto_crystallized": True,
+        }
+        
+        return digest
+    
+    except Exception as e:
+        log.warning(f"[crystallize] inline crystallization failed for {session_id}: {e}")
+        return None
+
+
+async def _auto_crystallize() -> None:
+    """
+    Background task: automatically crystallize sessions older than 24h.
+    
+    Crystallization distills completed work chains into structured digests.
+    Runs every 6 hours.
+    """
+    from datetime import timedelta
+    
+    while True:
+        await asyncio.sleep(21600)  # 6 hours
+        try:
+            now_ms = int(time.time() * 1000)
+            twenty_four_hours_ms = 24 * 3600 * 1000
+            
+            # Scan all session keys to find candidates
+            session_pattern = "mem:session:*"
+            cursor = 0
+            crystallized_count = 0
+            
+            while True:
+                cursor, keys = await _redis.scan(cursor, match=session_pattern, count=100)
+                
+                for key in keys:
+                    key_str = key.decode() if isinstance(key, bytes) else key
+                    session_id = key_str.replace("mem:session:", "")
+                    
+                    # Check if already crystallized
+                    crystal_key = f"mem:crystallized:{session_id}"
+                    exists = await _redis.exists(crystal_key)
+                    if exists:
+                        continue
+                    
+                    # Get session metadata
+                    session_data = await _redis.get(key)
+                    if not session_data:
+                        continue
+                    
+                    try:
+                        session_obj = json.loads(session_data.decode() if isinstance(session_data, bytes) else session_data)
+                    except Exception:
+                        continue
+                    
+                    # Check age
+                    ts = session_obj.get("ts", 0)
+                    # Fallback to started_at if ts is missing
+                    if not ts:
+                        started_at = session_obj.get("started_at", 0)
+                        if started_at:
+                            ts = int(started_at * 1000)
+                    
+                    if not ts:
+                        continue
+                        
+                    age_ms = now_ms - ts
+                    if age_ms < twenty_four_hours_ms:
+                        continue  # too recent
+                    
+                    # Count facts in this session (approximate by timestamp proximity)
+                    card = await _redis.execute_command("VCARD", mem_store.FACT_KEY)
+                    if not card or int(card) <= 5:
+                        continue  # not enough facts
+                    
+                    seed = np.zeros(embedder.DIMS, dtype=np.float32)
+                    results = await _redis.execute_command(
+                        "VSIM", mem_store.FACT_KEY, "FP32", seed.tobytes(),
+                        "COUNT", min(int(card), 200), "WITHSCORES", "WITHATTRIBS"
+                    )
+                    
+                    fact_count = 0
+                    i = 0
+                    while i + 2 < len(results):
+                        raw = results[i + 2]
+                        i += 3
+                        try:
+                            attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+                        except Exception:
+                            continue
+                        
+                        # Check if fact is from this session (within ±1 hour of session start)
+                        fact_ts = attrs.get("ts", 0)
+                        if abs(fact_ts - ts) < 3600000:  # 1 hour window
+                            if not attrs.get("superseded_by"):
+                                fact_count += 1
+                    
+                    if fact_count < 5:
+                        continue  # not substantial enough
+                    
+                    # Crystallize this session
+                    log.info(f"[crystallize] auto-crystallizing session {session_id} ({fact_count} facts, age={age_ms/3600000:.1f}h)")
+                    
+                    # Call crystallize logic inline
+                    digest = await _crystallize_session_inline(session_id, session_obj, fact_count)
+                    
+                    if digest:
+                        # Store digest with 90-day TTL
+                        await _redis.setex(
+                            crystal_key,
+                            90 * 86400,  # 90 days
+                            json.dumps(digest, ensure_ascii=False)
+                        )
+                        crystallized_count += 1
+                        await _ws_broadcast("crystallize_auto", {
+                            "session_id": session_id,
+                            "fact_count": fact_count,
+                            "digest_summary": digest.get("summary", "")[:200]
+                        })
+                
+                if cursor == 0:
+                    break
+            
+            if crystallized_count > 0:
+                log.info(f"[crystallize] auto-crystallized {crystallized_count} sessions")
+        
+        except Exception as e:
+            log.warning(f"[crystallize] auto-crystallization error: {e}", exc_info=True)
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Start background tasks."""
+    asyncio.create_task(_auto_crystallize())
 
 
 # ── Session lifecycle (agentmemory hooks) ─────────────────────────────────────

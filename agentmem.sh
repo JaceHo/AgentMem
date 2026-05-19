@@ -90,6 +90,24 @@ _register_capabilities() {
     echo "[agentmem] skills+agents registration skipped (service not ready)"
 }
 
+_auto_connect() {
+    # Auto-connect all detected agents (claude-code, codex, cursor, gemini-cli, cline).
+    # Runs in background after service is healthy. Skipped when --no-auto is passed.
+    for i in $(seq 1 40); do
+        if curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
+            echo "[agentmem] auto-connecting detected agents..."
+            uv run python -c "
+import sys; sys.path.insert(0, '$SCRIPT_DIR')
+from connect import run_connect
+run_connect(all_agents=True)
+" 2>&1 | sed 's/^/  /'
+            return
+        fi
+        sleep 1
+    done
+    echo "[agentmem] auto-connect skipped (service not ready in time)"
+}
+
 # ── Commands ──────────────────────────────────────────────────────────────────
 
 case "${1:-help}" in
@@ -97,6 +115,10 @@ case "${1:-help}" in
     start)
         print_banner
         check_deps
+
+        # Parse flags
+        NO_AUTO=false
+        for arg in "$@"; do [ "$arg" = "--no-auto" ] && NO_AUTO=true; done
 
         if is_running; then
             echo "Service already running on :$PORT"
@@ -115,6 +137,11 @@ case "${1:-help}" in
             echo ""
             _kill_stale
             _register_capabilities &
+            if ! $NO_AUTO; then
+                _auto_connect &
+            else
+                echo "  (--no-auto: skipping agent auto-connect)"
+            fi
             uv run uvicorn main:app \
                 --host 0.0.0.0 \
                 --port "$PORT" \
@@ -127,10 +154,20 @@ case "${1:-help}" in
     start-fg)
         print_banner
         check_deps
+
+        # Parse flags
+        NO_AUTO=false
+        for arg in "$@"; do [ "$arg" = "--no-auto" ] && NO_AUTO=true; done
+
         echo "  Starting in foreground on :$PORT"
         echo ""
         _kill_stale
         ( _register_capabilities & )  # double-fork: orphan to launchd, not zombie of uv run
+        if ! $NO_AUTO; then
+            ( _auto_connect & )
+        else
+            echo "  (--no-auto: skipping agent auto-connect)"
+        fi
         exec uv run uvicorn main:app \
             --host 0.0.0.0 \
             --port "$PORT" \
@@ -153,9 +190,13 @@ case "${1:-help}" in
         ;;
 
     restart)
-        # Parse --force flag
+        # Parse --force and --no-auto flags
         FORCE=false
-        for arg in "$@"; do [ "$arg" = "--force" ] && FORCE=true; done
+        NO_AUTO=false
+        for arg in "$@"; do
+            [ "$arg" = "--force" ] && FORCE=true
+            [ "$arg" = "--no-auto" ] && NO_AUTO=true
+        done
 
         uid="$(id -u)"
         if ! $FORCE && ! _check_connections; then
@@ -178,6 +219,10 @@ case "${1:-help}" in
         echo ""
         echo "Re-registering skills + agents..."
         uv run python "$SCRIPT_DIR/scripts/register-skills.py"
+        if ! $NO_AUTO; then
+            echo ""
+            _auto_connect
+        fi
         echo ""
         echo "--- stdout (last 20 lines) ---"
         tail -20 "$LOG_STDOUT" 2>/dev/null || true
@@ -440,8 +485,10 @@ PYEOF
         echo "Usage: $0 <command> [options]"
         echo ""
         echo "Service control:"
-        echo "  start          Start via launchd (falls back to direct if not installed)"
+        echo "  start          Start via launchd (auto-connects all detected agents)"
+        echo "  start --no-auto  Start without auto-connecting agents"
         echo "  start-fg       Start in foreground — used by launchd itself (Ctrl+C to stop)"
+        echo "  start-fg --no-auto  Foreground without auto-connect"
         echo "  stop           Stop via launchd (KeepAlive will restart; use 'disable' to prevent)"
         echo "  restart        Restart via launchd kickstart -k"
         echo "  restart --force  Restart even with active connections"
