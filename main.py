@@ -96,7 +96,7 @@ from typing import Any
 
 import httpx
 import numpy as np
-from fastapi import FastAPI, BackgroundTasks, Request
+from fastapi import FastAPI, BackgroundTasks, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -516,9 +516,61 @@ import os as _os
 _static_dir = _os.path.join(_os.path.dirname(__file__), "static")
 if _os.path.isdir(_static_dir):
     app.mount("/static", StaticFiles(directory=_static_dir), name="static")
+    # Mount css/js subdirs at root so <link href="/css/..."> and <script src="/js/..."> work
+    _css_dir = _os.path.join(_static_dir, "css")
+    _js_dir = _os.path.join(_static_dir, "js")
+    if _os.path.isdir(_css_dir):
+        app.mount("/css", StaticFiles(directory=_css_dir), name="css")
+    if _os.path.isdir(_js_dir):
+        app.mount("/js", StaticFiles(directory=_js_dir), name="js")
 
 app.include_router(log_sse.log_sse_router)
 
+# ── WebSocket for real-time dashboard updates ─────────────────────────────────
+_ws_clients: set[WebSocket] = set()
+
+
+async def _ws_broadcast(event: str, data: dict) -> None:
+    """Push an event to all connected WebSocket clients."""
+    if not _ws_clients:
+        return
+    msg = json.dumps({"event": event, **data, "ts": time.time()})
+    dead = set()
+    for ws in _ws_clients:
+        try:
+            await ws.send_text(msg)
+        except Exception:
+            dead.add(ws)
+    _ws_clients.difference_update(dead)
+
+
+@app.websocket("/ws")
+async def ws_endpoint(ws: WebSocket):
+    await ws.accept()
+    _ws_clients.add(ws)
+    try:
+        # Send initial state
+        await ws.send_text(json.dumps({
+            "event": "connected",
+            "version": APP_VERSION,
+            "ts": time.time(),
+        }))
+        while True:
+            # Keep alive — client pings or we just wait for disconnect
+            data = await ws.receive_text()
+            # Client can request specific data
+            try:
+                msg = json.loads(data)
+                if msg.get("type") == "ping":
+                    await ws.send_text(json.dumps({"event": "pong", "ts": time.time()}))
+                elif msg.get("type") == "subscribe":
+                    pass  # all events broadcast by default
+            except (json.JSONDecodeError, KeyError):
+                pass
+    except WebSocketDisconnect:
+        pass
+    finally:
+        _ws_clients.discard(ws)
 
 
 @app.get("/", include_in_schema=False)
@@ -2105,6 +2157,7 @@ async def recall(req: RecallRequest):
 @app.post("/store")
 async def store_memory(req: StoreRequest):
     _spawn(_do_store(req.messages, req.session_id), "store")
+    await _ws_broadcast("store", {"session_id": req.session_id})
     return {"status": "queued"}
 
 
@@ -3040,6 +3093,7 @@ async def _llm_merge_facts(contents: list[str]) -> str | None:
 async def consolidate(background_tasks: BackgroundTasks):
     """Trigger memory consolidation — merges similar facts to reduce redundancy."""
     background_tasks.add_task(_do_consolidate)
+    await _ws_broadcast("consolidate", {"status": "queued"})
     return {"status": "consolidation_queued"}
 
 
@@ -3616,6 +3670,7 @@ async def compat_remember(req: RememberRequest, request: Request):
         importance=0.8,
     )
 
+    await _ws_broadcast("remember", {"id": uid, "type": req.type or "fact"})
     return {"status": "ok", "id": uid}
 
 
@@ -3644,6 +3699,7 @@ async def compat_forget(req: ForgetRequest, request: Request):
             await _redis.execute_command("VREM", mem_store.FACT_KEY, elem)
             deleted += 1
 
+    await _ws_broadcast("forget", {"deleted": deleted})
     return {"status": "ok", "deleted": deleted}
 
 
