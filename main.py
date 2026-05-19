@@ -131,8 +131,8 @@ def _spawn(coro, name: str = "bg") -> None:
     task = asyncio.create_task(coro)
     _bg_tasks.add(task)
     task.add_done_callback(lambda t: _bg_tasks.discard(t))
-    task.add_done_callback(lambda t: t.exception() if not t.cancelled() and t.exception() else None)
-    # Log exceptions from background tasks
+    # Log exceptions from background tasks (also consumes the exception
+    # to prevent Python's "Task exception was never retrieved" warning)
     def _log_exception(t: asyncio.Task):
         if t.cancelled():
             return
@@ -1301,12 +1301,16 @@ async def _check_contradiction(existing_fact: dict, new_fact) -> None:
     if not is_contradiction:
         return
 
-    # Add 'contradicts' graph edge between shared entities
-    for ent in shared_ents:
-        await graph_mod.add_typed_edge(
-            _redis, ent, ent, "contradicts",
-            confidence=0.9, source="contradiction_detector", bidirectional=False,
-        )
+    # Add 'contradicts' graph edges between old and new fact entities
+    # (not self-edges — connect entities from the old fact to entities
+    # from the new fact that are different but share the same subject)
+    for old_ent in old_ents:
+        for new_ent in new_ents:
+            if old_ent.lower() != new_ent.lower():
+                await graph_mod.add_typed_edge(
+                    _redis, old_ent, new_ent, "contradicts",
+                    confidence=0.9, source="contradiction_detector", bidirectional=True,
+                )
 
     # Mark old fact as superseded
     await mem_store.soft_delete_fact(_redis, element_id, "contradicted", reason="contradicted")
@@ -1377,6 +1381,7 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
         is_dup = bool(similar and similar[0].get("score", 0.0) > 0.95)
         ep_saved = 0
         new_ep_uid = ""
+        prev_ep_id = ""
         if not is_dup:
             # Causal chain: look up the previous episode for this session
             prev_ep_id = await mem_store.get_last_episode_id(_redis, session_id)
@@ -1448,7 +1453,7 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
             except Exception:
                 pass  # VGETATTR not critical — ep_type stays "general"
             # Complete doubly-linked chain: tell prev episode its successor
-            prev_ep_id = (await _redis.get(f"{mem_store.SESSION_PRE}{session_id}:last_ep") or b"").decode()
+            # (prev_ep_id was already fetched before save_episode above)
             if prev_ep_id and prev_ep_id != new_ep_uid:
                 _spawn(
                     mem_store.update_episode_next_id(_redis, prev_ep_id, new_ep_uid),
@@ -1622,7 +1627,7 @@ async def _do_compress_session(session_id: str) -> dict:
         }
         if fact.triple_s and fact.triple_p and fact.triple_o:
             attrs["triple_str"] = f"{fact.triple_s} | {fact.triple_p} | {fact.triple_o}"
-        _bm25_index.add(uid, fact.content, attrs)
+        await _bm25_index.add(uid, fact.content, attrs)
         await persona_mod.update(_redis, fact.category, fact.content)
         fact_saved += 1
 
@@ -2934,11 +2939,21 @@ async def _do_consolidate(
     merged_count = 0
     superseded_elements: set[str] = set()
 
+    # Precompute all fact embeddings in batch to avoid re-encoding inside the loop.
+    # This reduces Phase 2 from O(N²) encoding cost to O(N) — each fact's embedding
+    # is computed once and reused for both knn_search and keeper re-embedding.
+    fact_embeddings: dict[str, np.ndarray] = {}
+    for fact in all_facts:
+        fact_embeddings[fact["element"]] = _encode(fact["attrs"]["content"])
+
+    # Build a lookup dict for O(1) element → fact mapping (replaces O(N) scan)
+    fact_by_element: dict[str, dict] = {f["element"]: f for f in all_facts}
+
     for fact in all_facts:
         if fact["element"] in superseded_elements:
             continue
 
-        f_emb = _encode(fact["attrs"]["content"])
+        f_emb = fact_embeddings[fact["element"]]
         similar = await mem_store.knn_search(
             _redis, mem_store.FACT_KEY, f_emb, k=5
         )
@@ -2953,21 +2968,16 @@ async def _do_consolidate(
                 continue
 
             cosine_sim = s.get("score", 0.0)
-            s_ts = 0
-            for f2 in all_facts:
-                if f2["element"] == s["_element"]:
-                    s_ts = f2["attrs"].get("ts", 0)
-                    break
+            # O(1) lookup instead of O(N) scan
+            s_fact = fact_by_element.get(s["_element"])
+            s_ts = s_fact["attrs"].get("ts", 0) if s_fact else 0
 
             days_between = abs(fact_ts - s_ts) / 86_400_000
             temporal_factor = math.exp(-temporal_lambda * days_between)
             affinity = cosine_sim * temporal_factor
 
-            if affinity >= similarity_threshold:
-                for f2 in all_facts:
-                    if f2["element"] == s["_element"]:
-                        cluster.append(f2)
-                        break
+            if affinity >= similarity_threshold and s_fact:
+                cluster.append(s_fact)
 
         if len(cluster) < 2:
             continue
@@ -3042,6 +3052,14 @@ async def _do_consolidate(
             await mem_store.soft_delete_fact(_redis, fact["element"], "pruned", reason=reason)
             superseded_elements.add(fact["element"])
             pruned_count += 1
+
+    # ── Post-consolidation: invalidate BM25 index ─────────────────────────────
+    # Superseded and merged facts changed state; the in-memory BM25 corpus is now
+    # stale. Force a rebuild on next search so superseded facts are excluded and
+    # merged keepers reflect their new content.
+    if superseded_elements:
+        await _bm25_index.reset()
+        _spawn(_populate_bm25_from_redis(_redis), "bm25-rebuild")
 
     ms = int((time.time() - t0) * 1000)
     log.info(
@@ -3130,6 +3148,11 @@ async def _do_hard_prune() -> dict:
 
     removed_facts = await _hard_prune_vset(mem_store.FACT_KEY)
     removed_eps   = await _hard_prune_vset(mem_store.EPISODE_KEY)
+
+    # Invalidate BM25 index after hard-prune (entries physically removed)
+    if removed_facts > 0:
+        await _bm25_index.reset()
+        _spawn(_populate_bm25_from_redis(_redis), "bm25-rebuild")
 
     ms = int((time.time() - t0) * 1000)
     log.info(f"[hard_prune] removed facts={removed_facts} episodes={removed_eps} {ms}ms")

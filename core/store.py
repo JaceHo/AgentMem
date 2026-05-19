@@ -65,6 +65,85 @@ DIMS         = _embed_mod.DIMS
 _pool: aioredis.ConnectionPool | None = None
 _client: aioredis.Redis | None = None
 
+# ── Redis Lua scripts for atomic read-modify-write ────────────────────────────
+# Race condition fix: concurrent reinforce_fact or soft_delete_fact calls could
+# lose updates when two coroutines read the same attrs, modify independently,
+# and overwrite each other. Lua scripts execute atomically in Redis, preventing
+# lost increments and partial overwrites.
+
+_SOFT_DELETE_LUA = """
+local key = KEYS[1]
+local elem = ARGV[1]
+local superseded_by = ARGV[2]
+local reason = ARGV[3]
+local now_ms = ARGV[4]
+
+local raw = redis.call('VGETATTR', key, elem)
+if not raw then return 0 end
+
+local ok, attrs = pcall(cjson.decode, raw)
+if not ok or type(attrs) ~= 'table' then return 0 end
+
+-- Don't re-supersede an already-superseded fact (idempotent)
+if attrs["superseded_by"] and attrs["superseded_by"] ~= "" then
+    return 1
+end
+
+attrs["superseded_by"] = superseded_by
+attrs["superseded_at"] = tonumber(now_ms)
+attrs["superseded_reason"] = reason
+
+local new_json = cjson.encode(attrs)
+redis.call('VSETATTR', key, elem, new_json)
+return 1
+"""
+
+_REINFORCE_LUA = """
+local key = KEYS[1]
+local elem = ARGV[1]
+local now_ms = ARGV[2]
+local new_source = ARGV[3]
+
+local raw = redis.call('VGETATTR', key, elem)
+if not raw then return 0 end
+
+local ok, attrs = pcall(cjson.decode, raw)
+if not ok or type(attrs) ~= 'table' then return 0 end
+
+-- Don't reinforce superseded facts
+if attrs["superseded_by"] and attrs["superseded_by"] ~= "" then
+    return 0
+end
+
+attrs["source_count"] = (attrs["source_count"] or 1) + 1
+attrs["last_confirmed_ts"] = tonumber(now_ms)
+attrs["version"] = (attrs["version"] or 1) + 1
+
+if new_source and new_source ~= "" then
+    local sources = attrs["sources"] or {}
+    local found = false
+    for i, s in ipairs(sources) do
+        if s == new_source then found = true; break end
+    end
+    if not found then
+        table.insert(sources, new_source)
+        if #sources > 10 then
+            -- Keep only last 10 sources
+            local trimmed = {}
+            for i = #sources - 9, #sources do
+                trimmed[#trimmed+1] = sources[i]
+            end
+            sources = trimmed
+        end
+        attrs["sources"] = sources
+    end
+end
+
+local new_json = cjson.encode(attrs)
+redis.call('VSETATTR', key, elem, new_json)
+return 1
+"""
+
 
 # ── LLM Wiki v2: Confidence decay (Ebbinghaus forgetting curve) ───────────────
 # Confidence decays exponentially with time since last confirmation.
@@ -91,7 +170,10 @@ def confidence_decay(attrs: dict) -> float:
     - source_count ≥ 3 → full multiplier (well-supported fact)
     - source_count = 1 → 0.33× (single source, less reliable)
     - Reinforcement resets last_confirmed_ts → R(t) → 1.0 again
+    - Superseded facts return 0.0 (no decay computation needed)
     """
+    if attrs.get("superseded_by"):
+        return 0.0
     base = attrs.get("confidence", 0.8)
     source_count = max(1, attrs.get("source_count", 1))
     last_confirmed = attrs.get("last_confirmed_ts", attrs.get("ts", 0))
@@ -118,25 +200,24 @@ async def reinforce_fact(
     LLM Wiki v2: "Confidence strengthens with reinforcement. Each reinforcement
     (access, confirmation from a new source) resets the [Ebbinghaus] curve."
 
+    Uses atomic Lua script to prevent race conditions during concurrent
+    reinforcements (e.g., two store operations reinforcing the same fact).
+
     Returns True if reinforcement succeeded.
     """
+    now_ms = int(time.time() * 1000)
     try:
-        raw = await r.execute_command("VGETATTR", FACT_KEY, element_id)
-        if not raw:
-            return False
-        attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
-        attrs["source_count"] = attrs.get("source_count", 1) + 1
-        attrs["last_confirmed_ts"] = int(time.time() * 1000)
-        attrs["version"] = attrs.get("version", 1) + 1
-        if new_source:
-            sources = attrs.get("sources", [])
-            if new_source not in sources:
-                sources.append(new_source)
-                attrs["sources"] = sources[:10]  # cap at 10
-        await r.execute_command("VSETATTR", FACT_KEY, element_id, json.dumps(attrs))
-        return True
+        result = await r.eval(
+            _REINFORCE_LUA,
+            1,                    # numkeys
+            FACT_KEY,             # KEYS[1]
+            element_id,           # ARGV[1]
+            str(now_ms),          # ARGV[2]
+            new_source or "",     # ARGV[3]
+        )
+        return int(result) == 1
     except Exception as e:
-        log.warning("reinforce_fact failed for %s: %s", element_id, e)
+        log.warning("reinforce_fact Lua failed for %s: %s", element_id, e)
         return False
 
 
@@ -309,7 +390,9 @@ async def get_last_episode_id(r: aioredis.Redis, session_id: str) -> str:
     if not session_id:
         return ""
     val = await r.get(f"{SESSION_PRE}{session_id}:last_ep")
-    return val.decode() if val else ""
+    if val is None:
+        return ""
+    return val.decode("utf-8", errors="replace") if isinstance(val, bytes) else val
 
 
 async def set_last_episode_id(r: aioredis.Redis, session_id: str, uid: str) -> None:
@@ -440,6 +523,10 @@ async def soft_delete_fact(
       superseded_at:     timestamp when supersession occurred (version chain)
       superseded_reason: "merged" | "contradicted" | "updated" | "pruned"
 
+    Uses atomic Lua script to prevent race conditions during concurrent
+    soft-deletes (e.g., consolidation + contradiction detection running in parallel).
+    The script is idempotent: re-superseding an already-superseded fact is a no-op.
+
     Bug fix v0.9.2: removed the ×0.1 importance decay that was applied here.
     Phase 1 (Decay) already applies ×0.9 per 90 days; Phase 3 (Prune) removes
     entries that fall below 0.05. Applying a second ×0.1 during soft-delete
@@ -448,18 +535,21 @@ async def soft_delete_fact(
     """
     now_ms = int(time.time() * 1000)
     try:
-        raw = await r.execute_command("VGETATTR", FACT_KEY, element_id)
-        if raw:
-            attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
-            attrs["superseded_by"] = superseded_by
-            attrs["superseded_at"] = now_ms
-            attrs["superseded_reason"] = reason
-            await r.execute_command("VSETATTR", FACT_KEY, element_id, json.dumps(attrs))
+        result = await r.eval(
+            _SOFT_DELETE_LUA,
+            1,                    # numkeys
+            FACT_KEY,             # KEYS[1]
+            element_id,           # ARGV[1]
+            superseded_by,        # ARGV[2]
+            reason,               # ARGV[3]
+            str(now_ms),          # ARGV[4]
+        )
+        if int(result) == 1:
             return
     except Exception as e:
-        log.warning("soft_delete_fact VGETATTR failed for %s: %s", element_id, e)
+        log.warning("soft_delete_fact Lua failed for %s: %s", element_id, e)
 
-    # Fallback: VSIM ELE lookup
+    # Fallback: VSIM ELE lookup (for Redis versions without EVAL support)
     try:
         scan = await r.execute_command(
             "VSIM", FACT_KEY, "ELE", element_id,
@@ -468,6 +558,8 @@ async def soft_delete_fact(
         if scan and len(scan) >= 2:
             raw = scan[1]
             attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+            if attrs.get("superseded_by"):
+                return  # already superseded, idempotent
             attrs["superseded_by"] = superseded_by
             attrs["superseded_at"] = now_ms
             attrs["superseded_reason"] = reason
@@ -476,15 +568,20 @@ async def soft_delete_fact(
     except Exception as e:
         log.warning("soft_delete_fact VSIM ELE fallback failed for %s: %s", element_id, e)
 
-    # Last resort: set superseded_by with minimal attrs
+    # Last resort: try VGETATTR + VSETATTR manually (preserves original attrs)
     try:
-        await r.execute_command(
-            "VSETATTR", FACT_KEY, element_id,
-            json.dumps({"superseded_by": superseded_by, "content": "",
-                        "superseded_at": now_ms, "superseded_reason": reason})
-        )
-    except Exception as e:
-        log.error("soft_delete_fact ALL methods failed for %s: %s", element_id, e)
+        raw = await r.execute_command("VGETATTR", FACT_KEY, element_id)
+        if raw:
+            attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+            if attrs.get("superseded_by"):
+                return  # already superseded, idempotent
+            attrs["superseded_by"] = superseded_by
+            attrs["superseded_at"] = now_ms
+            attrs["superseded_reason"] = reason
+            await r.execute_command("VSETATTR", FACT_KEY, element_id, json.dumps(attrs))
+            return
+    except Exception as e2:
+        log.error("soft_delete_fact VGETATTR fallback also failed for %s: %s", element_id, e2)
 
 
 async def link_proc_to_tools(
@@ -586,7 +683,9 @@ async def get_session_context(r: aioredis.Redis, session_id: str) -> str | None:
     if not session_id:
         return None
     val = await r.get(f"{SESSION_PRE}{session_id}:ctx")
-    return val.decode() if val else None
+    if val is None:
+        return None
+    return val.decode("utf-8", errors="replace") if isinstance(val, bytes) else val
 
 
 async def set_session_context(

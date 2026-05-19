@@ -23,6 +23,7 @@ import asyncio
 import json
 import re
 import time
+from collections import deque
 
 import redis.asyncio as aioredis
 
@@ -76,6 +77,9 @@ async def record_entities(
     Stored as Redis Hash: {neighbour_slug: edge_json} where edge_json contains
     {type, confidence, source_count, last_seen, sources}.
 
+    If an edge already exists, increments source_count and updates confidence
+    to max(existing, new) — same merge logic as add_typed_edge().
+
     Args:
         r:                Redis client.
         entities:         Entity names extracted from a fact (e.g. ["Redis", "FastAPI"]).
@@ -100,16 +104,31 @@ async def record_entities(
             slug_b = _slug(b)
             if slug_a == slug_b:
                 continue
-            # Bidirectional typed edges as Hash fields
-            edge_data = json.dumps({
-                "type": relationship_type,
-                "confidence": confidence,
-                "source_count": 1,
-                "last_seen": now_ms,
-                "sources": [source][:5] if source else [],
-            })
-            pipe.hset(_key(a), slug_b, edge_data)
-            pipe.hset(_key(b), slug_a, edge_data)
+            # Read existing edges to merge (not overwrite)
+            # We must read before the pipeline, so do it outside the pipeline
+            for key, field in [(_key(a), slug_b), (_key(b), slug_a)]:
+                existing = await r.hget(key, field)
+                if existing:
+                    try:
+                        edge = json.loads(existing.decode() if isinstance(existing, bytes) else existing)
+                        edge["source_count"] = edge.get("source_count", 1) + 1
+                        edge["confidence"] = max(edge.get("confidence", 0.5), confidence)
+                        edge["last_seen"] = now_ms
+                        if source and source not in edge.get("sources", []):
+                            edge.setdefault("sources", []).append(source)
+                            edge["sources"] = edge["sources"][:5]
+                        pipe.hset(key, field, json.dumps(edge))
+                        continue
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        pass  # corrupt data → overwrite with fresh edge
+                edge_data = json.dumps({
+                    "type": relationship_type,
+                    "confidence": confidence,
+                    "source_count": 1,
+                    "last_seen": now_ms,
+                    "sources": [source][:5] if source else [],
+                })
+                pipe.hset(key, field, edge_data)
     await pipe.execute()
 
 
@@ -206,10 +225,10 @@ async def traverse(
     """
     type_filter = set(relationship_types) if relationship_types else None
     visited: dict[str, dict] = {}  # slug → {depth, edge_type, confidence, path}
-    frontier: list[tuple[str, int, str, float, str]] = [(_slug(entity), 0, "start", 1.0, entity)]
+    frontier: deque[tuple[str, int, str, float, str]] = deque([(_slug(entity), 0, "start", 1.0, entity)])
 
     while frontier and len(visited) < max_nodes:
-        slug, depth, edge_type, conf, path = frontier.pop(0)
+        slug, depth, edge_type, conf, path = frontier.popleft()
         if slug in visited:
             continue
         visited[slug] = {
@@ -341,7 +360,8 @@ async def graph_stats(r: aioredis.Redis) -> dict:
     Count nodes and edges in the knowledge graph.
 
     A node = any mem:graph:* key (one per distinct entity slug).
-    An edge = one set member (each real edge stored as two directed members).
+    An edge = one hash field or set member (each real edge stored as two directed members).
+    Handles both Hash-based typed edges (v1.1) and legacy Set-based edges (v0.9.0).
     """
     node_keys = []
     async for key in r.scan_iter(f"{GRAPH_PREFIX}*"):
@@ -350,7 +370,17 @@ async def graph_stats(r: aioredis.Redis) -> dict:
     node_count = len(node_keys)
     edge_count = 0
     for key in node_keys:
-        card = await r.scard(key)
+        key_str = key.decode() if isinstance(key, bytes) else key
+        # Try Hash-based typed edges first (v1.1)
+        try:
+            hlen = await r.hlen(key_str)
+            if hlen > 0:
+                edge_count += hlen
+                continue
+        except Exception:
+            pass
+        # Fallback: legacy Set-based edges (v0.9.0)
+        card = await r.scard(key_str)
         edge_count += card
 
     # edge_count is sum of directed edges; undirected count = edge_count // 2

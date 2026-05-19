@@ -139,7 +139,6 @@ class OllamaProvider(BaseProvider):
         import httpx
 
         results = []
-        # Ollama /api/embed supports batch
         r = httpx.post(
             f"{self.base_url}/api/embed",
             json={"model": self.model, "input": texts},
