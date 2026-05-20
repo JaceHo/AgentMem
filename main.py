@@ -123,6 +123,7 @@ from utils.text_processing import (
     is_trivial,
     is_injected_system_content,
 )
+from core.utils import decode_bytes as _decode_bytes, decode_attrs as _decode_attrs, decode_json as _decode_json
 
 # Private aliases — used throughout main.py with underscore prefix
 _is_injected = is_injected_system_content
@@ -249,7 +250,7 @@ async def _backfill_crystallized_index(r) -> None:
             if not raw:
                 continue
             try:
-                d = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+                d = _decode_json(raw)
                 session_id = d.get("session_id", "")
                 ts = d.get("crystallized_at", 0)
                 if session_id and ts:
@@ -869,7 +870,7 @@ async def _evolve_similar_fact(element_id: str, new_keywords: list[str], new_top
         raw = await _redis.execute_command("VGETATTR", mem_store.FACT_KEY, element_id)
         if not raw:
             return
-        attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+        attrs = _decode_attrs(raw)
         existing_kws = set(attrs.get("keywords") or [])
         # Merge new keywords (deduplicated, capped at 12)
         merged_kws = list(existing_kws | set(new_keywords))[:12]
@@ -1072,7 +1073,7 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
             try:
                 raw = await _redis.execute_command("VGETATTR", mem_store.EPISODE_KEY, new_ep_uid)
                 if raw:
-                    ep_attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+                    ep_attrs = _decode_attrs(raw)
                     ep_attrs["ep_type"] = ep_type
                     await _redis.execute_command(
                         "VSETATTR", mem_store.EPISODE_KEY, new_ep_uid, json.dumps(ep_attrs)
@@ -1548,11 +1549,11 @@ async def recall(req: RecallRequest):
         while idx + 2 < len(results):
             elem = results[idx]; score = results[idx+1]; raw = results[idx+2]
             idx += 3
-            elem_str = elem.decode() if isinstance(elem, bytes) else elem
+            elem_str = _decode_bytes(elem)
             if elem_str == "__seed__":
                 continue
             try:
-                attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+                attrs = _decode_attrs(raw)
             except Exception:
                 continue
             if attrs.get("_seed") or not attrs.get("task"):
@@ -1598,7 +1599,7 @@ async def recall(req: RecallRequest):
                 if not raw:
                     continue
                 try:
-                    digest = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+                    digest = _decode_json(raw)
                     digests.append(digest)
                 except Exception:
                     continue
@@ -1621,7 +1622,7 @@ async def recall(req: RecallRequest):
     query_struct = results[5] if isinstance(results[5], dict) else {}
     _pinned_raw  = results[6]
     last_session_summary = (
-        _pinned_raw.decode() if isinstance(_pinned_raw, bytes) else _pinned_raw
+        _decode_bytes(_pinned_raw)
     ) if _pinned_raw else None
     tools_raw    = results[7] if isinstance(results[7], list) else []
     procs_raw    = results[8] if isinstance(results[8], list) else []
@@ -1816,7 +1817,7 @@ async def recall(req: RecallRequest):
                 prefix  = f"{top_tool_elem}:"
                 trans: dict[str, int] = {}
                 for k_b, v_b in all_tig.items():
-                    key_s = k_b.decode() if isinstance(k_b, bytes) else k_b
+                    key_s = _decode_bytes(k_b)
                     if key_s.startswith(prefix):
                         target = key_s[len(prefix):]
                         trans[target] = int(v_b)
@@ -1946,7 +1947,7 @@ async def _auto_crystallize() -> None:
             pipe = _redis.pipeline(transaction=False)
             key_map = []  # track (session_key, session_id, crystal_key) for each pipeline pair
             for key in all_session_keys:
-                key_str = key.decode() if isinstance(key, bytes) else key
+                key_str = _decode_bytes(key)
                 session_id = key_str.replace("mem:session:", "")
                 crystal_key = f"mem:crystallized:{session_id}"
                 pipe.exists(crystal_key)
@@ -1965,7 +1966,7 @@ async def _auto_crystallize() -> None:
                 if not session_data:
                     continue
                 try:
-                    session_obj = json.loads(session_data.decode() if isinstance(session_data, bytes) else session_data)
+                    session_obj = _decode_json(session_data)
                 except Exception:
                     continue
 

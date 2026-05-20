@@ -623,7 +623,7 @@ async def compat_profile():
         return {"profile": {}}
     persona_raw = await r.hgetall("mem:persona")
     fields = {
-        (k.decode() if isinstance(k, bytes) else k): (v.decode() if isinstance(v, bytes) else v)
+        decode_bytes(k): decode_bytes(v)
         for k, v in persona_raw.items()
     }
     return {"profile": fields}
