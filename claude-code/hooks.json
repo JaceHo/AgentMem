@@ -23,6 +23,9 @@
     "Stop": [{
       "hooks": [{"type": "command", "command": "/Users/jace/code/agentmem/claude-code/hooks/store.sh", "timeout": 30}]
     }],
+    "SubagentStart": [{
+      "hooks": [{"type": "command", "command": "/Users/jace/code/agentmem/claude-code/hooks/subagent-start.sh", "timeout": 8}]
+    }],
     "SubagentStop": [{
       "hooks": [{"type": "command", "command": "/Users/jace/code/agentmem/claude-code/hooks/store.sh", "timeout": 15}]
     }]

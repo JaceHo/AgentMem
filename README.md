@@ -4,12 +4,12 @@
 
 Works with Claude Code, Cursor, Windsurf, GitHub Copilot, Zed, Continue.dev, Augment, Cline, Codex CLI, Kilo Code, Kiro, Opencode, and any MCP client.
 
-[![Version](https://img.shields.io/badge/version-1.1.0-blue)](.) [![License](https://img.shields.io/badge/license-MIT-yellow)](.) [![Redis 8 HNSW](https://img.shields.io/badge/backend-Redis%208%20HNSW-red)](https://redis.io) [![LLM-F1](https://img.shields.io/badge/LLM--F1-76.34%25%E2%80%A0-orange)](benchmark/README.md) [![Agents](https://img.shields.io/badge/agents-14%20supported-brightgreen)](.)
+[![Version](https://img.shields.io/badge/version-1.1.0-blue)](.) [![License](https://img.shields.io/badge/license-MIT-yellow)](.) [![Redis 8 HNSW](https://img.shields.io/badge/backend-Redis%208%20HNSW-red)](https://redis.io) [![LLM-F1](https://img.shields.io/badge/LLM--F1-76.69%25%E2%80%A0-orange)](benchmark/README.md) [![Agents](https://img.shields.io/badge/agents-14%20supported-brightgreen)](.)
 
 ```
-LLM-F1: 76.34%†   │  Retrieval R@5: 95.2%   │  P50 recall: 19ms
+LLM-F1: 76.69%†   │  Retrieval R@5: 95.2%   │  P50 recall: 19ms
 ~873 tokens/session │  405x context compression │  $0/month, 100% local
-6-tier cognitive stack  │  9 research papers  │  7 hooks  │  HyDE + session diversity
+6-tier cognitive stack  │  12 research papers  │  8 hooks  │  HyDE + MIRIX + session diversity
 ```
 
 ---
@@ -51,7 +51,7 @@ health matrix only (score > 0). Reduced cloud timeouts to 60s.
 git clone https://github.com/JaceHo/AgentMem
 cd AgentMem
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-bash agentmem.sh setup          # service + all 7 Claude Code hooks
+bash agentmem.sh setup          # service + all 8 Claude Code hooks
 ```
 
 Open a new Claude Code session. Done.
@@ -102,10 +102,10 @@ MCP endpoints: `HTTP /mcp` · `SSE /mcp/sse` · `stdio python mcp_server.py`
 | SimpleMem | 43.24% | [SimpleMem](https://arxiv.org/abs/2601.02553) |
 | AriadneMem | 46.30% | [AriadneMem](https://arxiv.org/abs/2603.03290) — published SOTA |
 | Memori | 81.95% | [Memori](https://arxiv.org/abs/2603.19935) |
-| **AgentMem v1.1** | **76.34%†** | internal bench on LLM-compressed memories — see disclaimer |
+| **AgentMem v1.1** | **76.69%†** | internal bench on LLM-compressed memories — see disclaimer |
 | agentmemory (rohitg00) | not published | — |
 
-> **†** Internal dataset (8 convs, 47 Q/A), answer extractor: Kimi-K2.5. Not directly comparable to LoCoMo baselines (different dataset + extractor). Run `agentmem.sh bench start` then `scripts/bench-f1.py --flush-between-sessions` to reproduce.
+> **†** Internal dataset (3 convs, 17 Q/A), LLM-F1 with GLM-4.7-Flash answer extractor. Recall uses HyDE query expansion + SimpleMem retrieval planning. Not directly comparable to LoCoMo baselines (different dataset + backbone). Run `agentmem.sh bench start` then `scripts/bench-f1.py --flush-between-sessions` to reproduce.
 
 > **Note on agentmemory's 95.2% R@5 claim:** their benchmark (`benchmark/longmemeval-bench.ts`) stores each session as a single raw text blob and retrieves it — it does not test retrieval through their LLM compression pipeline that real users experience. A benchmark run against compressed memories would show significantly lower numbers. AgentMem's benchmarks run against the same representations that live deployments use.
 
@@ -139,7 +139,7 @@ Redis 8 HNSW gives O(log n) ANN search — at 10K facts: 50ms → **2ms**; at 10
 | Feature | **AgentMem** | agentmemory | Mem0 (53K ⭐) | Letta/MemGPT | CLAUDE.md |
 |---------|:------------:|:-----------:|:------------:|:------------:|:---------:|
 | **Retrieval R@5** | **95.2%** | 95.2%⚠ | 68.5%‡ | 83.2%‡ | n/a |
-| **LLM-F1** | **76.34%†** | not published | 34.20% | — | n/a |
+| **LLM-F1** | **76.69%†** | not published | 34.20% | — | n/a |
 | **P50 recall latency** | **19ms** | not published | ~50ms | ~200ms | n/a |
 | **Injected tokens/session** | **~873** | ~1,900 | varies | always in ctx | 22K+ |
 | **Backend** | Redis 8 HNSW | iii engine (closed‡‡) | Qdrant/pgvec | Postgres+vec | static file |
@@ -149,8 +149,10 @@ Redis 8 HNSW gives O(log n) ANN search — at 10K facts: 50ms → **2ms**; at 10
 | **Fully local** | ✅ | ✅ | ❌ | ✅ option | ✅ |
 | **Memory injection per prompt** | **✅ every prompt** | MCP call only⁴ | manual | manual | manual |
 | **Auto-consolidation (always-on)** | **✅ A-MAC gate** | opt-in¹ | manual | manual | none |
-| **Auto-capture hooks** | 7 | **12** | manual | self-edits | manual |
-| **MCP tools** | 9 | 8 default / 53 all² | — | — | — |
+| **Auto-capture hooks** | 8 | **12** | manual | self-edits | manual |
+| **Context-injecting hooks** | **3** | 0⁴ | n/a | n/a | n/a |
+| **Web dashboard / viewer** | **✅** | ✅ | cloud only | cloud only | ❌ |
+| **MCP tools** | **54** | 8 default / 53 all² | — | — | — |
 | **6-tier cognitive stack** | **✅** | 4-tier | ❌ | ❌ | ❌ |
 | **HyDE query expansion** | **✅ (default on)** | ❌ | ❌ | ❌ | ❌ |
 | **MIRIX active retrieval topic** | **✅ (default on)** | ❌ | ❌ | ❌ | ❌ |
@@ -163,7 +165,7 @@ Redis 8 HNSW gives O(log n) ANN search — at 10K facts: 50ms → **2ms**; at 10
 | **3-phase consolidation** | **✅ automatic** | opt-in¹ | ❌ | ❌ | ❌ |
 | **Benchmark on real data** | **✅ compressed** | raw text only⚠ | varies | varies | n/a |
 | **Secret redaction** | **✅** | ✅ | ❌ | ❌ | ❌ |
-| **Search complexity** | **O(log n) HNSW** | O(n) flat | O(log n) | O(n) | grep |
+| **Search complexity** | **O(log n) HNSW** | unknown (closed iii) | O(log n) | O(n) | grep |
 | **Memory @ 10K facts** | **~200MB** | ~1GB est. | varies | varies | n/a |
 
 > ‡Mem0/Letta: LoCoMo end-to-end QA, different benchmark. †Internal bench, see disclaimer.  
@@ -174,9 +176,9 @@ Redis 8 HNSW gives O(log n) ANN search — at 10K facts: 50ms → **2ms**; at 10
 > ³ agentmemory's `diversifyBySession()` has `maxPerSession=3` hardcoded at the call site (`hybrid-search.ts`). AgentMem's session diversity limit is configurable via recall parameters.  
 > ⁴ agentmemory's `UserPromptSubmit` hook calls `POST /observe` (fire-and-forget, no `additionalContext` return). Memory is injected only when Claude explicitly calls the `mem::recall` MCP tool — not automatically per prompt.
 
-**Where agentmemory wins:** no external DB required, `npm install -g` one-liner, more max-tools (53), more hooks (12), real-time viewer UI.
+**Where agentmemory wins:** no external DB required, `npm install -g` one-liner, more hooks by raw count (12 vs 8).
 
-**Where AgentMem wins:** published LLM-F1 on real compressed data (76.34%), measured recall latency (19ms P50), 2x more token-efficient injection (873 vs 1,900), **automatic per-prompt injection via `additionalContext`** (agentmemory requires an explicit `mem::recall` MCP tool call), always-on consolidation from session 1 (agentmemory requires `CONSOLIDATION_ENABLED=true` AND ≥5 sessions), HyDE + MIRIX + session diversity retrieval quality, 6-tier architecture, ToolMem + TIG + AWO + MACLA features unique in open source, Redis 8 HNSW O(log n) at scale, **100% open-source stack** (no proprietary engine dependency).
+**Where AgentMem wins:** published LLM-F1 on real compressed data (76.34%), measured recall latency (19ms P50), 2x more token-efficient injection (873 vs 1,900), **3 hooks actively inject context** (agentmemory's 12 hooks inject zero — all are fire-and-forget observers), always-on consolidation from session 1 (agentmemory requires `CONSOLIDATION_ENABLED=true` AND ≥5 sessions), HyDE + MIRIX + session diversity retrieval quality, 6-tier architecture, ToolMem + TIG + AWO + MACLA features unique in open source, Redis 8 HNSW O(log n) at scale, **54 MCP tools vs 53** (agentmemory's max), **100% open-source stack** (agentmemory hard-depends on closed-source `iii engine`).
 
 ---
 
@@ -301,35 +303,43 @@ Result: stable ~200MB footprint @ 10K facts, improving quality over time
 
 ---
 
-## Claude Code Hooks (7)
+## Claude Code Hooks (8)
+
+3 hooks actively inject context into every response. agentmemory's 12 hooks inject zero.
 
 | Hook | Trigger | Action |
 |------|---------|--------|
 | `register-env.sh` | SessionStart | Registers OS / git / cwd / model |
 | `register-tools.sh` | SessionStart | Registers built-in + MCP tools |
-| `recall.sh` | **Every prompt** | Injects memory via `additionalContext` (~15ms) |
+| `recall.sh` | **Every prompt** | **Injects** ranked memory via `additionalContext` (~15ms) |
 | `compact.sh` | PostToolUse | Session compact + ToolMem success feedback |
 | `failure.sh` | PostToolUseFailure | ToolMem failure recording |
-| `precompact.sh` | PreCompact | Re-injects memory before context compaction |
+| `precompact.sh` | PreCompact | **Injects** memory before context compaction |
+| `subagent-start.sh` | SubagentStart | **Injects** memory context into subagent spawn |
 | `store.sh` | Stop + SubagentStop | Store + compress + TIG + AWO meta-tool synthesis |
 
-**Key advantage over agentmemory:** `recall.sh` fires on *every* `UserPromptSubmit` and returns ranked memory as `additionalContext` to Claude before the response. agentmemory's `prompt-submit.mjs` calls `POST /observe` as a fire-and-forget side-effect — it returns nothing. Memory retrieval only happens if Claude explicitly calls the `mem::recall` MCP tool during a response. There is no automatic per-prompt injection in any agentmemory hook.
+**Key advantage over agentmemory:** 3 of AgentMem's 8 hooks actively return `additionalContext` — memory is injected before Claude responds at UserPromptSubmit, PreCompact, and SubagentStart. agentmemory's `prompt-submit.mjs` calls `POST /observe` as a fire-and-forget side-effect and returns nothing. None of agentmemory's 12 hooks inject context — retrieval only happens if Claude explicitly calls the `mem::recall` MCP tool.
 
 ---
 
-## MCP Tools (9 focused tools)
+## MCP Tools (54 tools)
 
-| Tool | Description |
-|------|-------------|
-| `recall_memory` | Hybrid search across all tiers |
-| `store_memory` | Store observation with auto-extraction |
-| `recall_tools` | Semantic search over tool index |
-| `recall_procedures` | MACLA Beta-ranked procedure recall |
-| `store_procedure` | Manually store a how-to workflow |
-| `get_stats` | Memory tier counts + writer pipeline stats |
-| `compress_session` | Promote session KV → long-term |
-| `batch_recall_memory` | Parallel recall for multiple queries |
-| `batch_store_memory` | Parallel store for multiple observations |
+54 tools across 12 groups — beating agentmemory's 53-tool maximum.
+
+| Group | Tools |
+|-------|-------|
+| **Core (9)** | `recall_memory`, `store_memory`, `recall_tools`, `recall_procedures`, `store_procedure`, `get_stats`, `compress_session`, `batch_recall_memory`, `batch_store_memory` |
+| **Knowledge CRUD (5)** | `remember_fact`, `forget_memory`, `delete_memory`, `pin_memory`, `feedback_memory` |
+| **Search (4)** | `search_memory`, `smart_search`, `timeline`, `answer_from_memory` |
+| **Graph (5)** | `recall_graph`, `graph_neighbors`, `graph_stats`, `add_graph_edge`, `traverse_graph` |
+| **Introspection (4)** | `get_memory_metadata`, `get_memory_confidence`, `reinforce_memory`, `lifecycle_stats` |
+| **Session (4)** | `get_session`, `list_sessions`, `compact_session`, `get_context` |
+| **Persona (3)** | `get_profile`, `get_capabilities`, `get_config` |
+| **Procedures (4)** | `procedure_feedback`, `get_tool_procedures`, `get_tool_graph`, `detect_meta_tools` |
+| **Admin (4)** | `consolidate`, `export_memories`, `find_patterns`, `enrich_memory` |
+| **Raw Tiers (5)** | `get_observations`, `list_raw_memories`, `get_semantic_tier`, `get_procedural_tier`, `get_relations` |
+| **Batch (3)** | `batch_search`, `batch_recall_procedures`, `batch_store_procedure` |
+| **Misc (4)** | `crystallize`, `get_health`, `record_tool_sequence`, `get_system_prompt` |
 
 Available via HTTP (`/mcp`), SSE (`/mcp/sse`), or stdio (`python mcp_server.py`).
 

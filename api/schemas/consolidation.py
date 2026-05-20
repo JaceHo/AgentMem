@@ -10,6 +10,7 @@ class CompactRequest(BaseModel):
 
 class AnswerRequest(BaseModel):
     query: str
+    context: str = ""
     session_id: str = ""
 
 
