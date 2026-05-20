@@ -266,7 +266,7 @@ function renderSetup() {
     : '';
 
   $('setup-body').innerHTML = `
-    <div style="padding-top:10px">
+    <div style="padding-top:10px;max-height:60vh;overflow-y:auto;padding-right:4px">
       <!-- Endpoint pills -->
       <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;align-items:center">
         <span style="font-size:9px;color:var(--text3);text-transform:uppercase;letter-spacing:.1em;font-weight:700">MCP endpoints</span>
