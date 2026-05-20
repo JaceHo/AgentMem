@@ -54,14 +54,21 @@ _kill_stale() {
 _wait_ready() {
     local port="${1:-$PORT}"
     local max="${2:-80}"
+    local skip_initial="${3:-0}"  # seconds to skip before first poll
+    local t0; t0=$(date +%s%3N)
     echo -n "  Waiting for service"
+    # Skip initial wait (old process dying / launchd starting new one)
+    if [ "$skip_initial" -gt 0 ]; then
+        sleep "$skip_initial"
+    fi
     for i in $(seq 1 "$max"); do
         if curl -sf "http://127.0.0.1:$port/health" >/dev/null 2>&1; then
-            echo " ready"
+            local t1; t1=$(date +%s%3N)
+            printf " ready (%dms)\n" "$((t1 - t0))"
             return 0
         fi
         printf "."
-        sleep 0.5
+        sleep 0.1
     done
     echo " timeout"
     return 1
@@ -78,34 +85,34 @@ _check_connections() {
 }
 
 _register_capabilities() {
-    for i in $(seq 1 40); do
-        if curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
-            uv run python "$SCRIPT_DIR/scripts/register-skills.py" \
-                && echo "[agentmem] skills+agents registered" \
-                || echo "[agentmem] skills+agents registration failed"
-            return
-        fi
-        sleep 1
-    done
-    echo "[agentmem] skills+agents registration skipped (service not ready)"
+    # Pass --nowait if calling after _wait_ready already confirmed health
+    local nowait=false; [ "${1:-}" = "--nowait" ] && nowait=true
+    if ! $nowait; then
+        for i in $(seq 1 40); do
+            curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
+            sleep 0.5
+        done
+    fi
+    uv run python "$SCRIPT_DIR/scripts/register-skills.py" \
+        && echo "[agentmem] skills+agents registered" \
+        || echo "[agentmem] skills+agents registration failed"
 }
 
 _auto_connect() {
-    # Auto-connect all detected agents (claude-code, codex, cursor, gemini-cli, cline).
-    # Runs in background after service is healthy. Skipped when --no-auto is passed.
-    for i in $(seq 1 40); do
-        if curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
-            echo "[agentmem] auto-connecting detected agents..."
-            uv run python -c "
+    # Auto-connect all detected agents. Pass --nowait if already confirmed healthy.
+    local nowait=false; [ "${1:-}" = "--nowait" ] && nowait=true
+    if ! $nowait; then
+        for i in $(seq 1 40); do
+            curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
+            sleep 0.5
+        done
+    fi
+    echo "[agentmem] auto-connecting detected agents..."
+    uv run python -c "
 import sys; sys.path.insert(0, '$SCRIPT_DIR')
 from connect import run_connect
 run_connect(all_agents=True)
 " 2>&1 | sed 's/^/  /'
-            return
-        fi
-        sleep 1
-    done
-    echo "[agentmem] auto-connect skipped (service not ready in time)"
 }
 
 # ── Commands ──────────────────────────────────────────────────────────────────
@@ -190,9 +197,7 @@ case "${1:-help}" in
         ;;
 
     restart)
-        # Parse --force and --no-auto flags
-        FORCE=false
-        NO_AUTO=false
+        FORCE=false; NO_AUTO=false
         for arg in "$@"; do
             [ "$arg" = "--force" ] && FORCE=true
             [ "$arg" = "--no-auto" ] && NO_AUTO=true
@@ -205,30 +210,74 @@ case "${1:-help}" in
             echo "Use --force to restart anyway."
             exit 1
         fi
-        [ "$FORCE" = true ] && echo "WARNING: proceeding with --force..."
 
-        if launchctl print "gui/$uid/$SERVICE_LABEL" &>/dev/null 2>&1; then
-            echo "Restarting via launchd (kickstart -k)..."
-            launchctl kickstart -k "gui/$uid/$SERVICE_LABEL"
-        else
-            echo "launchd service not installed — use 'enable' first, or 'start-fg' to run manually"
+        t_start=$SECONDS
+
+        # ── 1. Kill existing process directly so port frees immediately ────────
+        OLD_PID=$(lsof -ti "tcp:$PORT" 2>/dev/null | head -1 || true)
+        if [ -n "$OLD_PID" ]; then
+            printf "  Killing pid %s ... " "$OLD_PID"
+            kill "$OLD_PID" 2>/dev/null || true
+            for _i in 1 2 3 4 5 6 7 8 9 10; do
+                lsof -ti "tcp:$PORT" >/dev/null 2>&1 || break
+                sleep 0.1
+            done
+            echo "done"
+        fi
+
+        # ── 2. kickstart -k: launchd owns the lifecycle, start fresh ──────────
+        if ! launchctl print "gui/$uid/$SERVICE_LABEL" &>/dev/null 2>&1; then
+            echo "  ERROR: launchd service not loaded — run 'enable' first"
             exit 1
         fi
+        mkdir -p "$LOG_DIR" && touch "$LOG_STDOUT" "$LOG_STDERR"
+        LOG_POS=$(wc -l < "$LOG_STDOUT" | tr -d ' ')
+        ERR_POS=$(wc -l < "$LOG_STDERR" | tr -d ' ')
+        echo "  Kicking launchd..."
+        launchctl kickstart -k "gui/$uid/$SERVICE_LABEL" || true
 
-        _wait_ready "$PORT" 80
-        echo ""
-        echo "Re-registering skills + agents..."
-        uv run python "$SCRIPT_DIR/scripts/register-skills.py"
-        if ! $NO_AUTO; then
-            echo ""
-            _auto_connect
+        # ── 3. Stream new log lines while polling /health ──────────────────────
+        echo "  Waiting for /health:"
+        READY=false
+        for _i in $(seq 1 100); do
+            # show any new stdout lines from the service
+            NEW=$(awk "NR>$LOG_POS" "$LOG_STDOUT" 2>/dev/null || true)
+            if [ -n "$NEW" ]; then
+                printf '%s\n' "$NEW" | sed 's/^/    /'
+                LOG_POS=$(wc -l < "$LOG_STDOUT" | tr -d ' ')
+            fi
+            if curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
+                READY=true
+                break
+            fi
+            sleep 0.2
+        done
+
+        # flush remaining lines
+        awk "NR>$LOG_POS" "$LOG_STDOUT" 2>/dev/null | sed 's/^/    /' || true
+
+        if [ "$READY" = false ]; then
+            echo "  FAILED after $((SECONDS - t_start))s — stderr:"
+            awk "NR>$ERR_POS" "$LOG_STDERR" 2>/dev/null | tail -20 | sed 's/^/    /' || true
+            exit 1
         fi
-        echo ""
-        echo "--- stdout (last 20 lines) ---"
-        tail -20 "$LOG_STDOUT" 2>/dev/null || true
-        echo ""
-        echo "--- stderr (last 10 lines) ---"
-        tail -10 "$LOG_STDERR" 2>/dev/null || true
+        echo "  ✓ Up in $((SECONDS - t_start))s"
+
+        # ── 4+5. Register skills + auto-connect in background ─────────────────
+        (
+            uv run python "$SCRIPT_DIR/scripts/register-skills.py" \
+                >> "$LOG_DIR/setup.log" 2>&1 || true
+            if ! $NO_AUTO; then
+                uv run python -c "
+import sys; sys.path.insert(0, '$SCRIPT_DIR')
+from connect import run_connect
+run_connect(all_agents=True)
+" >> "$LOG_DIR/setup.log" 2>&1 || true
+            fi
+            echo "[$(date '+%H:%M:%S')] post-restart setup done" >> "$LOG_DIR/setup.log"
+        ) &
+        disown
+        echo "  Post-restart setup running in background (tail $LOG_DIR/setup.log)"
         ;;
 
     status)
@@ -367,16 +416,348 @@ except: pass
         ;;
 
     setup)
-        # Install / refresh AgentMem hooks in Claude Code settings.json
         HOOKS_DIR="$SCRIPT_DIR/claude-code/hooks"
         CLAUDE_SETTINGS="$HOME/.claude/settings.json"
+        MCP_URL="http://localhost:$PORT"
+        MCP_SERVER_PY="$SCRIPT_DIR/mcp_server.py"
 
-        echo "=== AgentMem Claude Code Setup ==="
-        echo "Dir: $SCRIPT_DIR"
+        # ── Parse --agent flag ────────────────────────────────────────────────
+        SETUP_AGENT=""
+        for arg in "${@:2}"; do
+            case "$arg" in
+                --agent=*) SETUP_AGENT="${arg#--agent=}" ;;
+                --agent)   : ;;  # next arg handled below
+            esac
+        done
+        # handle "--agent foo" (two separate args)
+        prev=""
+        for arg in "${@:2}"; do
+            [ "$prev" = "--agent" ] && SETUP_AGENT="$arg"
+            prev="$arg"
+        done
+
+        # ── Helper: write JSON config merging mcpServers key ─────────────────
+        _write_mcp_json() {
+            local cfg_file="$1"
+            local key="$2"       # mcpServers | servers | mcp
+            local entry="$3"     # JSON string for the agentmem entry
+            local dir
+            dir="$(dirname "$cfg_file")"
+            mkdir -p "$dir"
+            python3 - "$cfg_file" "$key" "$entry" << 'PYEOF'
+import json, sys, os
+cfg_path, key, entry_json = sys.argv[1], sys.argv[2], sys.argv[3]
+entry = json.loads(entry_json)
+if os.path.isfile(cfg_path):
+    with open(cfg_path) as f:
+        try:
+            cfg = json.load(f)
+        except Exception:
+            cfg = {}
+else:
+    cfg = {}
+if key not in cfg or not isinstance(cfg[key], dict):
+    cfg[key] = {}
+cfg[key]["agentmem"] = entry
+with open(cfg_path, "w") as f:
+    json.dump(cfg, f, indent=2)
+print(f"      Wrote {cfg_path}")
+PYEOF
+        }
+
+        # ── Helper: write YAML mcpServers entry (Continue.dev) ───────────────
+        _write_continue_yaml() {
+            local cfg_file="$1"
+            local dir
+            dir="$(dirname "$cfg_file")"
+            mkdir -p "$dir"
+            python3 - "$cfg_file" "$MCP_SERVER_PY" << 'PYEOF'
+import sys, os, re
+cfg_path = sys.argv[1]
+server_py = sys.argv[2]
+block = (
+    "\n  - name: agentmem\n"
+    f"    command: python\n"
+    f"    args:\n"
+    f"      - \"{server_py}\"\n"
+)
+if os.path.isfile(cfg_path):
+    with open(cfg_path) as f:
+        content = f.read()
+    if "name: agentmem" in content:
+        print(f"      {cfg_path} already has agentmem entry (skipped)")
+        sys.exit(0)
+    if "mcpServers:" in content:
+        content = content.rstrip() + block
+    else:
+        content = content.rstrip() + "\nmcpServers:" + block
+else:
+    content = "mcpServers:" + block
+with open(cfg_path, "w") as f:
+    f.write(content)
+print(f"      Wrote {cfg_path}")
+PYEOF
+        }
+
+        # ── Helper: write TOML entry (Codex CLI) ─────────────────────────────
+        _write_codex_toml() {
+            local cfg_file="$1"
+            local dir
+            dir="$(dirname "$cfg_file")"
+            mkdir -p "$dir"
+            python3 - "$cfg_file" "$MCP_SERVER_PY" << 'PYEOF'
+import sys, os
+cfg_path = sys.argv[1]
+server_py = sys.argv[2]
+block = (
+    '\n[mcp_servers.agentmem]\n'
+    'command = "python"\n'
+    f'args = ["{server_py}"]\n'
+)
+if os.path.isfile(cfg_path):
+    with open(cfg_path) as f:
+        content = f.read()
+    if "[mcp_servers.agentmem]" in content:
+        print(f"      {cfg_path} already has agentmem entry (skipped)")
+        sys.exit(0)
+    content = content.rstrip() + block
+else:
+    content = block.lstrip()
+with open(cfg_path, "w") as f:
+    f.write(content)
+print(f"      Wrote {cfg_path}")
+PYEOF
+        }
+
+        # ── Per-agent setup functions ─────────────────────────────────────────
+
+        _setup_claude() {
+            echo "  [claude-code] Installing hooks + HTTP MCP config..."
+            # Hooks (full lifecycle: recall, store, compact, register)
+            if [ -f "$CLAUDE_SETTINGS" ]; then
+                python3 - "$CLAUDE_SETTINGS" << 'PYEOF'
+import json, sys
+settings_path = sys.argv[1]
+def _hook(script, timeout):
+    cmd = (
+        f'bash -lc \'d="${{AGENTMEM_HOOKS_DIR:-$HOME/code/agentmem/claude-code/hooks}}"; '
+        f'f="$d/{script}"; if [ -x "$f" ]; then "$f"; else exit 0; fi\''
+    )
+    return {"type": "command", "command": cmd, "timeout": timeout}
+with open(settings_path) as f: settings = json.load(f)
+settings["hooks"] = {
+    "SessionStart": [{"matcher": "startup|clear|compact", "hooks": [
+        _hook("register-env.sh",   10),
+        _hook("register-tools.sh", 10),
+    ]}],
+    "UserPromptSubmit": [{"hooks": [_hook("recall.sh",  10)]}],
+    "PostToolUse":      [{"hooks": [_hook("compact.sh",  5)]}],
+    "Stop":             [{"hooks": [_hook("store.sh",   30)]}],
+}
+with open(settings_path, "w") as f: json.dump(settings, f, indent=2)
+print("      Hooks installed in ~/.claude/settings.json")
+PYEOF
+            else
+                echo "      WARNING: ~/.claude/settings.json not found — skipping hooks"
+            fi
+            # Also write project .mcp.json with HTTP transport
+            _write_mcp_json "$HOME/.claude.json" "mcpServers" \
+                "{\"type\":\"http\",\"url\":\"$MCP_URL/mcp\"}"
+            echo "      → Restart Claude Code to activate."
+        }
+
+        _setup_cursor() {
+            echo "  [cursor] Writing .cursor/mcp.json (HTTP transport)..."
+            _write_mcp_json "$HOME/.cursor/mcp.json" "mcpServers" \
+                "{\"url\":\"$MCP_URL/mcp\"}"
+            echo "      → Reload Cursor MCP settings (Cmd+Shift+P → MCP: Reload)."
+        }
+
+        _setup_windsurf() {
+            echo "  [windsurf] Writing ~/.codeium/windsurf/mcp_config.json (SSE transport)..."
+            _write_mcp_json "$HOME/.codeium/windsurf/mcp_config.json" "mcpServers" \
+                "{\"serverUrl\":\"$MCP_URL/mcp/sse\"}"
+            echo "      → Restart Windsurf to pick up the new server."
+        }
+
+        _setup_copilot() {
+            echo "  [copilot] Writing ~/.config/Code/User/mcp.json (HTTP transport)..."
+            _write_mcp_json "$HOME/.config/Code/User/mcp.json" "servers" \
+                "{\"type\":\"http\",\"url\":\"$MCP_URL/mcp\"}"
+            echo "      → Run 'MCP: Enable Server (agentmem)' in VS Code Command Palette."
+        }
+
+        _setup_zed() {
+            echo "  [zed] Patching ~/.config/zed/settings.json (context_servers key)..."
+            local cfg="$HOME/.config/zed/settings.json"
+            mkdir -p "$(dirname "$cfg")"
+            python3 - "$cfg" "$MCP_URL" << 'PYEOF'
+import json, sys, os
+cfg_path = sys.argv[1]
+mcp_url = sys.argv[2]
+if os.path.isfile(cfg_path):
+    with open(cfg_path) as f:
+        try:
+            cfg = json.load(f)
+        except Exception:
+            cfg = {}
+else:
+    cfg = {}
+if "context_servers" not in cfg:
+    cfg["context_servers"] = {}
+cfg["context_servers"]["agentmem"] = {"url": f"{mcp_url}/mcp/sse"}
+with open(cfg_path, "w") as f:
+    json.dump(cfg, f, indent=2)
+print(f"      Wrote context_servers.agentmem to {cfg_path}")
+PYEOF
+            echo "      → Restart Zed or reload context servers."
+        }
+
+        _setup_continue() {
+            echo "  [continue] Writing ~/.continue/config.yaml (stdio transport)..."
+            _write_continue_yaml "$HOME/.continue/config.yaml"
+            echo "      → Reload Continue.dev extension."
+        }
+
+        _setup_augment() {
+            echo "  [augment] Writing VS Code user settings augment.advanced.mcpServers..."
+            local vscode_settings="$HOME/Library/Application Support/Code/User/settings.json"
+            if [ ! -f "$vscode_settings" ]; then
+                vscode_settings="$HOME/.config/Code/User/settings.json"
+            fi
+            python3 - "$vscode_settings" "$MCP_URL" << 'PYEOF'
+import json, sys, os
+cfg_path = sys.argv[1]
+mcp_url = sys.argv[2]
+if os.path.isfile(cfg_path):
+    with open(cfg_path) as f:
+        try:
+            cfg = json.load(f)
+        except Exception:
+            cfg = {}
+else:
+    cfg = {}
+adv = cfg.setdefault("augment.advanced", {})
+servers = adv.setdefault("mcpServers", {})
+servers["agentmem"] = {"type": "sse", "url": f"{mcp_url}/mcp/sse"}
+cfg["augment.advanced"] = adv
+with open(cfg_path, "w") as f:
+    json.dump(cfg, f, indent=2)
+print(f"      Wrote augment.advanced.mcpServers.agentmem to {cfg_path}")
+PYEOF
+            echo "      → Restart VS Code to pick up Augment MCP config."
+        }
+
+        _setup_codex() {
+            echo "  [codex] Writing ~/.codex/config.toml (stdio transport)..."
+            _write_codex_toml "$HOME/.codex/config.toml"
+            echo "      → Restart Codex CLI to load new MCP server."
+        }
+
+        _setup_cline() {
+            echo "  [cline] Writing ~/.cline/cline_mcp_settings.json (stdio transport)..."
+            _write_mcp_json "$HOME/.cline/cline_mcp_settings.json" "mcpServers" \
+                "{\"command\":\"python\",\"args\":[\"$MCP_SERVER_PY\"]}"
+            echo "      → Reload Cline MCP servers in VS Code settings."
+        }
+
+        _setup_kilo() {
+            echo "  [kilo-code] Writing ~/.config/kilo/kilo.jsonc (stdio transport)..."
+            _write_mcp_json "$HOME/.config/kilo/kilo.jsonc" "mcpServers" \
+                "{\"type\":\"stdio\",\"command\":\"python\",\"args\":[\"$MCP_SERVER_PY\"]}"
+            echo "      → Reload Kilo Code MCP servers."
+        }
+
+        _setup_kiro() {
+            echo "  [kiro] Writing ~/.kiro/settings/mcp.json (stdio transport)..."
+            _write_mcp_json "$HOME/.kiro/settings/mcp.json" "mcpServers" \
+                "{\"command\":\"python\",\"args\":[\"$MCP_SERVER_PY\"]}"
+            echo "      → Restart Kiro to load new MCP server."
+        }
+
+        _setup_antigravity() {
+            echo "  [antigravity] Writing ~/.gemini/antigravity/mcp_config.json (SSE transport)..."
+            _write_mcp_json "$HOME/.gemini/antigravity/mcp_config.json" "mcpServers" \
+                "{\"serverUrl\":\"$MCP_URL/mcp/sse\"}"
+            echo "      → Restart Antigravity to load new MCP server."
+        }
+
+        _setup_opencode() {
+            echo "  [opencode] Writing ~/.config/opencode/opencode.json (SSE transport)..."
+            local cfg="$HOME/.config/opencode/opencode.json"
+            mkdir -p "$(dirname "$cfg")"
+            python3 - "$cfg" "$MCP_URL" << 'PYEOF'
+import json, sys, os
+cfg_path = sys.argv[1]
+mcp_url = sys.argv[2]
+if os.path.isfile(cfg_path):
+    with open(cfg_path) as f:
+        try:
+            cfg = json.load(f)
+        except Exception:
+            cfg = {}
+else:
+    cfg = {}
+if "mcp" not in cfg or not isinstance(cfg["mcp"], dict):
+    cfg["mcp"] = {}
+cfg["mcp"]["agentmem"] = {"type": "sse", "url": f"{mcp_url}/mcp/sse", "enabled": True}
+with open(cfg_path, "w") as f:
+    json.dump(cfg, f, indent=2)
+print(f"      Wrote mcp.agentmem to {cfg_path}")
+PYEOF
+            echo "      → Restart opencode to load new MCP server."
+        }
+
+        _detect_agents() {
+            local detected=()
+            [ -d "$HOME/.cursor" ] || [ -f "$HOME/.cursor/mcp.json" ]   && detected+=(cursor)
+            [ -d "$HOME/.codeium/windsurf" ]                              && detected+=(windsurf)
+            command -v code &>/dev/null                                   && detected+=(copilot)
+            [ -d "$HOME/.config/zed" ] || [ -d "/Applications/Zed.app" ] && detected+=(zed)
+            [ -d "$HOME/.continue" ]                                      && detected+=(continue)
+            [ -d "$HOME/.cline" ]                                         && detected+=(cline)
+            command -v codex &>/dev/null                                  && detected+=(codex)
+            [ -d "$HOME/.config/kilo" ]                                   && detected+=(kilo)
+            [ -d "$HOME/.kiro" ]                                          && detected+=(kiro)
+            [ -d "$HOME/.gemini/antigravity" ]                            && detected+=(antigravity)
+            command -v opencode &>/dev/null                               && detected+=(opencode)
+            echo "${detected[@]}"
+        }
+
+        _run_agent_setup() {
+            local agent="$1"
+            case "$agent" in
+                claude|claude-code)  _setup_claude ;;
+                cursor)              _setup_cursor ;;
+                windsurf)            _setup_windsurf ;;
+                copilot|github-copilot) _setup_copilot ;;
+                zed)                 _setup_zed ;;
+                continue|continue.dev) _setup_continue ;;
+                augment)             _setup_augment ;;
+                codex)               _setup_codex ;;
+                cline)               _setup_cline ;;
+                kilo|kilo-code)      _setup_kilo ;;
+                kiro)                _setup_kiro ;;
+                antigravity)         _setup_antigravity ;;
+                opencode)            _setup_opencode ;;
+                aider)
+                    echo "  [aider] No native MCP support. Use the stdio server from another agent or"
+                    echo "          the community mcpm-aider fork: https://github.com/mcpm/aider-mcp-client"
+                    ;;
+                *)
+                    echo "  Unknown agent: $agent"
+                    echo "  Valid agents: claude, cursor, windsurf, copilot, zed, continue, augment,"
+                    echo "                codex, cline, kilo, kiro, antigravity, opencode, aider"
+                    ;;
+            esac
+        }
+
+        # ── Main setup flow ───────────────────────────────────────────────────
+        print_banner
         echo ""
 
-        # Fix launchd plist paths if stale
-        echo "[1/5] Checking launchd plist..."
+        # Always run Claude Code hooks setup (it's the primary agent)
+        echo "[1/4] Checking launchd plist..."
         if [ -f "$PLIST_DST" ] && grep -q "claw-memory" "$PLIST_DST" 2>/dev/null; then
             echo "      Fixing stale claw-memory paths → agentmem..."
             python3 -c "
@@ -394,72 +775,66 @@ print('      Plist updated.')
             echo "      Plist OK."
         fi
 
-        # Reload service
-        echo "[2/5] Reloading launchd service..."
+        echo "[2/4] Reloading launchd service..."
         launchctl unload "$PLIST_DST" 2>/dev/null || true
         sleep 1
         launchctl load "$PLIST_DST"
         echo "      Service loaded."
 
-        # Wait for health
-        echo "[3/5] Waiting for service health (up to 40s)..."
-        for i in $(seq 1 80); do
-            STATUS=$(curl -sf -m 2 "http://localhost:$PORT/health" 2>/dev/null || echo "")
+        echo "[3/4] Waiting for service health (up to 40s)..."
+        sleep 1
+        for i in $(seq 1 200); do
+            STATUS=$(curl -sf -m 1 "http://localhost:$PORT/health" 2>/dev/null || echo "")
             if echo "$STATUS" | python3 -c "import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get('status')=='ok' else 1)" 2>/dev/null; then
-                echo "      Service healthy after $((i/2))s."
+                echo "      Service healthy (${i}00ms)."
                 break
             fi
             printf "."
-            sleep 0.5
+            sleep 0.1
         done
         echo ""
 
-        # Verify hooks
-        echo "[4/5] Verifying hooks..."
-        MISSING=""
-        for h in recall.sh store.sh register-env.sh register-tools.sh compact.sh; do
-            [ ! -f "$HOOKS_DIR/$h" ] && MISSING="$MISSING $h"
-        done
-        if [ -n "$MISSING" ]; then
-            echo "      ERROR: Missing hooks:$MISSING"
-            exit 1
+        echo "[4/4] Configuring agents..."
+        if [ -z "$SETUP_AGENT" ]; then
+            # Default: Claude Code only (backward compat)
+            MISSING=""
+            for h in recall.sh store.sh register-env.sh register-tools.sh compact.sh; do
+                [ ! -f "$HOOKS_DIR/$h" ] && MISSING="$MISSING $h"
+            done
+            if [ -n "$MISSING" ]; then
+                echo "      ERROR: Missing hooks:$MISSING"
+                exit 1
+            fi
+            chmod +x "$HOOKS_DIR/"*.sh
+            _setup_claude
+        elif [ "$SETUP_AGENT" = "all" ]; then
+            # Claude Code always
+            chmod +x "$HOOKS_DIR/"*.sh 2>/dev/null || true
+            _setup_claude
+            echo ""
+            echo "  Auto-detecting installed agents..."
+            DETECTED=$(_detect_agents)
+            if [ -z "$DETECTED" ]; then
+                echo "  No additional agents detected."
+            else
+                for agent in $DETECTED; do
+                    echo ""
+                    _run_agent_setup "$agent"
+                done
+            fi
+        else
+            _run_agent_setup "$SETUP_AGENT"
         fi
-        chmod +x "$HOOKS_DIR/"*.sh
-        echo "      All hooks present and executable."
-
-        # Patch settings.json
-        echo "[5/5] Patching ~/.claude/settings.json..."
-        python3 - "$CLAUDE_SETTINGS" << 'PYEOF'
-import json, sys, os
-settings_path = sys.argv[1]
-# Use AGENTMEM_HOOKS_DIR env override pattern so the path can be changed
-# without re-running setup. Falls back to ~/code/agentmem/claude-code/hooks.
-def _hook(script, timeout):
-    cmd = (
-        f'bash -lc \'d="${{AGENTMEM_HOOKS_DIR:-$HOME/code/agentmem/claude-code/hooks}}"; '
-        f'f="$d/{script}"; if [ -x "$f" ]; then "$f"; else exit 0; fi\''
-    )
-    return {"type": "command", "command": cmd, "timeout": timeout}
-with open(settings_path) as f: settings = json.load(f)
-settings["hooks"] = {
-    "SessionStart": [{"matcher": "startup|clear|compact", "hooks": [
-        _hook("register-env.sh",   10),
-        _hook("register-tools.sh", 10),
-    ]}],
-    "UserPromptSubmit": [{"hooks": [_hook("recall.sh",  10)]}],
-    "PostToolUse":      [{"hooks": [_hook("compact.sh",  5)]}],
-    "Stop":             [{"hooks": [_hook("store.sh",   30)]}],
-}
-with open(settings_path, 'w') as f: json.dump(settings, f, indent=2)
-for event, configs in settings["hooks"].items():
-    for cfg in configs:
-        for h in cfg.get("hooks", []):
-            script = h["command"].split('"')[-2].split("/")[-1] if '"' in h["command"] else h["command"]
-            print(f"      {event}: {script}")
-PYEOF
 
         echo ""
-        echo "=== Setup complete! Open a new Claude Code session to activate. ==="
+        echo "════════════════════════════════════════"
+        echo "  Setup complete!"
+        echo "  MCP endpoints:"
+        echo "    Streamable HTTP : $MCP_URL/mcp"
+        echo "    SSE (legacy)    : $MCP_URL/mcp/sse"
+        echo "    Stdio           : python $MCP_SERVER_PY"
+        echo "    System prompt   : $MCP_URL/system-prompt"
+        echo "════════════════════════════════════════"
         ;;
 
     clean)
@@ -503,8 +878,13 @@ PYEOF
         echo "  logs           View stdout/stderr logs"
         echo ""
         echo "Maintenance:"
-        echo "  clean          Kill orphan uvicorn processes"
-        echo "  setup          Install/refresh Claude Code hooks"
+        echo "  clean                Kill orphan uvicorn processes"
+        echo "  setup                Install/refresh Claude Code hooks (default)"
+        echo "  setup --agent all    Auto-detect + configure all installed agents"
+        echo "  setup --agent NAME   Configure a specific agent:"
+        echo "                         claude, cursor, windsurf, copilot, zed,"
+        echo "                         continue, augment, codex, cline, kilo,"
+        echo "                         kiro, antigravity, opencode"
         echo ""
         echo "Benchmarking:"
         echo "  bench start    Start isolated benchmark instance (:$BENCH_PORT, redis db=$BENCH_DB)"
@@ -513,9 +893,11 @@ PYEOF
         echo "  bench flush    Wipe Redis db=$BENCH_DB (benchmark data only)"
         echo ""
         echo "Endpoints (port $PORT):"
-        echo "  API:  http://localhost:$PORT"
-        echo "  MCP:  http://localhost:$PORT/mcp"
-        echo "  UI:   http://localhost:$PORT/static/index.html"
+        echo "  API:           http://localhost:$PORT"
+        echo "  MCP (HTTP):    http://localhost:$PORT/mcp"
+        echo "  MCP (SSE):     http://localhost:$PORT/mcp/sse"
+        echo "  System prompt: http://localhost:$PORT/system-prompt"
+        echo "  UI:            http://localhost:$PORT/static/index.html"
         echo ""
         ;;
 

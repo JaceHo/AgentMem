@@ -98,4 +98,220 @@ async function loadDash() {
   } else { $('hero-area').innerHTML = '' }
 }
 
+// ── Setup & Agent Config panel ────────────────────────────────────────────────
+
+const AGENTS = [
+  {
+    id: 'claude',   label: 'Claude Code',    transport: 'hooks + HTTP',  color: 'var(--orange)',
+    setup: 'agentmem.sh setup',
+    note: 'Full lifecycle hooks (auto-recall + auto-store). Best integration.',
+    cfgPath: '~/.claude.json  +  ~/.claude/settings.json',
+    snippet: '{"mcpServers":{"agentmem":{"type":"http","url":"http://localhost:18800/mcp"}}}',
+  },
+  {
+    id: 'cursor',   label: 'Cursor',         transport: 'HTTP',          color: 'var(--accent)',
+    setup: 'agentmem.sh setup --agent cursor',
+    note: 'HTTP MCP. Tools available in Agent mode.',
+    cfgPath: '~/.cursor/mcp.json',
+    snippet: '{"mcpServers":{"agentmem":{"url":"http://localhost:18800/mcp"}}}',
+  },
+  {
+    id: 'windsurf', label: 'Windsurf',       transport: 'SSE',           color: 'var(--cyan)',
+    setup: 'agentmem.sh setup --agent windsurf',
+    note: 'SSE MCP. User-level config only.',
+    cfgPath: '~/.codeium/windsurf/mcp_config.json',
+    snippet: '{"mcpServers":{"agentmem":{"serverUrl":"http://localhost:18800/mcp/sse"}}}',
+  },
+  {
+    id: 'copilot',  label: 'GitHub Copilot', transport: 'HTTP',          color: 'var(--green)',
+    setup: 'agentmem.sh setup --agent copilot',
+    note: 'HTTP MCP via VS Code. Note: key is "servers" not "mcpServers".',
+    cfgPath: '.vscode/mcp.json',
+    snippet: '{"servers":{"agentmem":{"type":"http","url":"http://localhost:18800/mcp"}}}',
+  },
+  {
+    id: 'zed',      label: 'Zed',            transport: 'SSE',           color: 'var(--purple)',
+    setup: 'agentmem.sh setup --agent zed',
+    note: 'SSE MCP. Key is "context_servers" inside settings.json.',
+    cfgPath: '~/.config/zed/settings.json',
+    snippet: '{"context_servers":{"agentmem":{"url":"http://localhost:18800/mcp/sse"}}}',
+  },
+  {
+    id: 'continue', label: 'Continue.dev',   transport: 'stdio',         color: 'var(--yellow)',
+    setup: 'agentmem.sh setup --agent continue',
+    note: 'stdio MCP. YAML format.',
+    cfgPath: '~/.continue/config.yaml',
+    snippet: 'mcpServers:\n  - name: agentmem\n    command: python\n    args: ["/path/to/agentmem/mcp_server.py"]',
+  },
+  {
+    id: 'augment',  label: 'Augment',        transport: 'SSE',           color: 'var(--pink)',
+    setup: 'agentmem.sh setup --agent augment',
+    note: 'SSE MCP via VS Code settings.',
+    cfgPath: 'VS Code User settings.json → augment.advanced.mcpServers',
+    snippet: '{"augment.advanced":{"mcpServers":{"agentmem":{"type":"sse","url":"http://localhost:18800/mcp/sse"}}}}',
+  },
+  {
+    id: 'codex',    label: 'Codex CLI',      transport: 'stdio',         color: 'var(--text2)',
+    setup: 'agentmem.sh setup --agent codex',
+    note: 'stdio MCP. TOML format.',
+    cfgPath: '~/.codex/config.toml',
+    snippet: '[mcp_servers.agentmem]\ncommand = "python"\nargs = ["/path/to/agentmem/mcp_server.py"]',
+  },
+  {
+    id: 'cline',    label: 'Cline',          transport: 'stdio',         color: 'var(--green)',
+    setup: 'agentmem.sh setup --agent cline',
+    note: 'stdio MCP. User-level only.',
+    cfgPath: '~/.cline/cline_mcp_settings.json',
+    snippet: '{"mcpServers":{"agentmem":{"command":"python","args":["/path/to/agentmem/mcp_server.py"]}}}',
+  },
+  {
+    id: 'kilo',     label: 'Kilo Code',      transport: 'stdio',         color: 'var(--orange)',
+    setup: 'agentmem.sh setup --agent kilo',
+    note: 'stdio MCP. JSONC format.',
+    cfgPath: '~/.config/kilo/kilo.jsonc',
+    snippet: '{"mcpServers":{"agentmem":{"type":"stdio","command":"python","args":["/path/to/agentmem/mcp_server.py"]}}}',
+  },
+  {
+    id: 'kiro',     label: 'Kiro',           transport: 'stdio',         color: 'var(--cyan)',
+    setup: 'agentmem.sh setup --agent kiro',
+    note: 'stdio MCP.',
+    cfgPath: '~/.kiro/settings/mcp.json',
+    snippet: '{"mcpServers":{"agentmem":{"command":"python","args":["/path/to/agentmem/mcp_server.py"]}}}',
+  },
+  {
+    id: 'antigravity', label: 'Antigravity', transport: 'SSE',           color: 'var(--yellow)',
+    setup: 'agentmem.sh setup --agent antigravity',
+    note: 'SSE MCP. Google Antigravity IDE.',
+    cfgPath: '~/.gemini/antigravity/mcp_config.json',
+    snippet: '{"mcpServers":{"agentmem":{"serverUrl":"http://localhost:18800/mcp/sse"}}}',
+  },
+  {
+    id: 'opencode', label: 'Opencode',       transport: 'SSE',           color: 'var(--purple)',
+    setup: 'agentmem.sh setup --agent opencode',
+    note: 'SSE MCP. Key is "mcp" (not "mcpServers").',
+    cfgPath: '~/.config/opencode/opencode.json',
+    snippet: '{"mcp":{"agentmem":{"type":"sse","url":"http://localhost:18800/mcp/sse","enabled":true}}}',
+  },
+  {
+    id: 'aider',    label: 'Aider',          transport: '—',             color: 'var(--text3)',
+    setup: null,
+    note: 'No native MCP support. Use community mcpm-aider fork or connect via another agent.',
+    cfgPath: '—',
+    snippet: null,
+  },
+];
+
+let _setupOpen = false;
+let _activeAgent = 'claude';
+
+function toggleSetup() {
+  _setupOpen = !_setupOpen;
+  const body = $('setup-body');
+  const chev = $('setup-chevron');
+  if (_setupOpen) {
+    renderSetup();
+    body.style.display = 'block';
+    chev.style.transform = 'rotate(180deg)';
+  } else {
+    body.style.display = 'none';
+    chev.style.transform = '';
+  }
+}
+
+function renderSetup() {
+  const origin = window.location.origin;
+  const tabs = AGENTS.map(a =>
+    `<button onclick="selectAgent('${a.id}')" id="st-${a.id}" style="
+      padding:4px 10px;font-size:9px;border-radius:var(--radius);cursor:pointer;
+      font-family:var(--font);font-weight:700;letter-spacing:.05em;text-transform:uppercase;
+      border:1px solid ${_activeAgent === a.id ? a.color : 'var(--border)'};
+      background:${_activeAgent === a.id ? a.color + '22' : 'var(--bg3)'};
+      color:${_activeAgent === a.id ? a.color : 'var(--text3)'};
+      transition:all .15s
+    ">${a.label}</button>`
+  ).join('');
+
+  const a = AGENTS.find(x => x.id === _activeAgent) || AGENTS[0];
+  const snippetHtml = a.snippet
+    ? `<div style="position:relative">
+        <pre style="background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);padding:10px 12px;font-family:var(--mono);font-size:10px;color:var(--accent);overflow-x:auto;white-space:pre;margin-top:6px">${esc(a.snippet)}</pre>
+        <button onclick="copySetup('${a.id}')" style="position:absolute;top:6px;right:6px;padding:2px 7px;font-size:8px;background:var(--bg3);border:1px solid var(--border);border-radius:var(--radius);color:var(--text3);cursor:pointer;font-family:var(--font);text-transform:uppercase;letter-spacing:.05em" id="copy-${a.id}">COPY</button>
+       </div>`
+    : `<div style="color:var(--text3);font-size:11px;font-style:italic;margin-top:6px">${esc(a.note)}</div>`;
+
+  const setupCmd = a.setup
+    ? `<div style="margin-top:10px">
+        <div style="font-size:9px;color:var(--text3);text-transform:uppercase;letter-spacing:.1em;font-weight:700;margin-bottom:4px">Auto-configure</div>
+        <div style="position:relative">
+          <pre style="background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);padding:8px 12px;font-family:var(--mono);font-size:11px;color:var(--green);overflow-x:auto">${esc(a.setup)}</pre>
+          <button onclick="copyText('${esc(a.setup)}')" style="position:absolute;top:4px;right:4px;padding:2px 7px;font-size:8px;background:var(--bg3);border:1px solid var(--border);border-radius:var(--radius);color:var(--text3);cursor:pointer;font-family:var(--font);text-transform:uppercase;letter-spacing:.05em">COPY</button>
+        </div>
+       </div>`
+    : '';
+
+  $('setup-body').innerHTML = `
+    <div style="padding-top:10px">
+      <!-- Endpoint pills -->
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;align-items:center">
+        <span style="font-size:9px;color:var(--text3);text-transform:uppercase;letter-spacing:.1em;font-weight:700">MCP endpoints</span>
+        ${endpointPill('HTTP', origin + '/mcp', 'var(--accent)')}
+        ${endpointPill('SSE', origin + '/mcp/sse', 'var(--cyan)')}
+        ${endpointPill('stdio', 'python mcp_server.py', 'var(--orange)')}
+        ${endpointPill('sys-prompt', origin + '/system-prompt', 'var(--purple)')}
+      </div>
+
+      <!-- Agent tabs -->
+      <div style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:12px">${tabs}</div>
+
+      <!-- Agent detail -->
+      <div style="background:var(--bg3);border:1px solid var(--border);border-radius:var(--radius);border-left:3px solid ${a.color};padding:10px 12px">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+          <span style="font-size:13px;font-weight:800;color:${a.color}">${a.label}</span>
+          <span style="font-size:9px;padding:1px 6px;border-radius:4px;background:${a.color}22;color:${a.color};font-weight:700;letter-spacing:.04em;text-transform:uppercase">${a.transport}</span>
+        </div>
+        <div style="font-size:11px;color:var(--text2);margin-bottom:6px">${esc(a.note)}</div>
+        <div style="font-size:9px;color:var(--text3);margin-bottom:2px;text-transform:uppercase;letter-spacing:.1em;font-weight:700">Config file</div>
+        <div style="font-family:var(--mono);font-size:10px;color:var(--text2);margin-bottom:8px">${esc(a.cfgPath)}</div>
+        <div style="font-size:9px;color:var(--text3);text-transform:uppercase;letter-spacing:.1em;font-weight:700">Config snippet</div>
+        ${snippetHtml}
+        ${setupCmd}
+      </div>
+
+      <!-- Batch setup hint -->
+      <div style="margin-top:10px;font-size:10px;color:var(--text3)">
+        Configure all detected agents at once: <code style="font-family:var(--mono);color:var(--green);font-size:10px">agentmem.sh setup --agent all</code>
+      </div>
+    </div>`;
+}
+
+function endpointPill(label, url, color) {
+  return `<span onclick="copyText('${esc(url)}')" title="${esc(url)}" style="
+    display:inline-flex;align-items:center;gap:4px;padding:2px 8px;
+    background:${color}18;border:1px solid ${color}44;border-radius:10px;
+    font-size:9px;font-weight:700;color:${color};cursor:pointer;letter-spacing:.04em;
+    text-transform:uppercase;transition:all .15s
+  " onmouseover="this.style.background='${color}33'" onmouseout="this.style.background='${color}18'">${label}</span>`;
+}
+
+function selectAgent(id) {
+  _activeAgent = id;
+  renderSetup();
+}
+
+function copySetup(id) {
+  const a = AGENTS.find(x => x.id === id);
+  if (!a?.snippet) return;
+  copyText(a.snippet);
+  const btn = document.getElementById('copy-' + id);
+  if (btn) { btn.textContent = 'COPIED'; setTimeout(() => { btn.textContent = 'COPY' }, 1500) }
+}
+
+function copyText(txt) {
+  navigator.clipboard.writeText(txt).catch(() => {});
+}
+
 window.loadDash = loadDash;
+window.toggleSetup = toggleSetup;
+window.selectAgent = selectAgent;
+window.copySetup = copySetup;
+window.copyText = copyText;

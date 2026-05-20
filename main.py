@@ -88,7 +88,6 @@ Endpoints:
 import asyncio
 import json
 import logging
-import math
 import re
 import time
 from contextlib import asynccontextmanager
@@ -101,29 +100,9 @@ from fastapi.staticfiles import StaticFiles
 
 # ── Schemas (extracted to api/schemas/) ──────────────────────────────────────
 from api.schemas.memory import RecallRequest, Message, StoreRequest
-from api.schemas.capability import (
-    ToolDefinition, RegisterToolsRequest, EnvState,
-    RecallToolsRequest, StoreProcedureRequest,
-    ToolFeedbackRequest, ToolSequenceRequest, ProcedureFeedbackRequest,
-)
-from api.schemas.compat import (
-    CompatSessionStartRequest, CompatSessionEndRequest,
-    ObserveRequest, SummarizeRequest, EnrichRequest,
-    ContextRequest, SessionCommitRequest,
-    SearchRequest, RememberRequest, ForgetRequest,
-    FileContextRequest, PatternsRequest, SmartSearchRequest,
-    TimelineRequest, ClaudeBridgeSyncRequest, ImportRequest,
-)
 from api.schemas.consolidation import (
     CompactRequest, AnswerRequest, CompressSessionRequest,
-    FeedbackRequest, CrystallizeRequest,
 )
-from api.schemas.graph import (
-    GraphRecallRequest, TypedEdgeRequest, TraverseRequest, ReinforceRequest,
-)
-
-# ── Compat helpers (extracted to api/compat.py) ──────────────────────────────
-from api.compat import compat_sid as _compat_sid, check_auth as _compat_check_auth
 
 # ── Search utilities (extracted to core/search.py) ───────────────────────────
 from core.search import BM25Index, encode as _encode, vscan as _vscan, BM25_AVAILABLE as _BM25_AVAILABLE
@@ -165,6 +144,12 @@ from core import retrieval_planner
 from core import scene as scene_mod
 from core import store as mem_store
 from core import summarizer
+from services.consolidation_service import (
+    do_consolidate as _do_consolidate,
+    do_hard_prune as _do_hard_prune,
+    crystallize_session_inline as _crystallize_session_inline,
+    _populate_bm25_from_redis,
+)
 
 logging.basicConfig(level=getattr(logging, settings.log_level), format=settings.log_format)
 log = logging.getLogger("mem")
@@ -206,10 +191,24 @@ _store_latency_sum_ms = AtomicFloat()
 # ── BM25 + search utilities now in core/search.py ────────────────────────────
 _bm25_index = BM25Index()
 
+
+async def _encode_batch_async(texts: list[str]) -> list[np.ndarray]:
+    """Batch-encode texts off the event loop using a single model forward pass.
+
+    Uses asyncio.to_thread so the CPU-bound inference doesn't block the event loop.
+    For a single text falls through to _encode() to use the LRU cache.
+    """
+    if not texts:
+        return []
+    if len(texts) == 1:
+        return [_encode(texts[0])]
+    return list(await asyncio.to_thread(embedder.encode_batch, texts))
+
 # ── Session handoff: pinned last-session summary ───────────────────────────────
 # Key stores the most recent session summary so the NEXT session can always
 # retrieve it regardless of query similarity (cross-session continuity bridge).
-_PINNED_SESSION_KEY = "mem:pinned:session_summary"
+_PINNED_SESSION_KEY       = "mem:pinned:session_summary"
+_CRYSTALLIZED_INDEX_KEY   = "mem:crystallized_index"   # sorted set: key → crystallized_at score
 
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
@@ -221,14 +220,14 @@ async def _periodic_consolidate() -> None:
         try:
             card = await _redis.execute_command("VCARD", mem_store.FACT_KEY)
             if int(card or 0) > 5:
-                await _do_consolidate()
+                await _do_consolidate(_redis, _bm25_index, _spawn)
         except Exception as e:
             log.warning(f"[periodic_consolidate] error: {e}")
         prune_count = await _periodic_prune_counter.increment()
         if prune_count >= 24:
             await _periodic_prune_counter.reset()
             try:
-                await _do_hard_prune()
+                await _do_hard_prune(_redis, _bm25_index, _spawn)
             except Exception as e:
                 log.warning(f"[periodic_consolidate] hard-prune error: {e}")
 
@@ -248,6 +247,40 @@ async def _populate_bm25_from_redis(r) -> None:
         log.info(f"[bm25] populated corpus from Redis: {len(items)} facts")
     except Exception as e:
         log.warning(f"[bm25] startup population failed: {e}")
+
+
+async def _backfill_crystallized_index(r) -> None:
+    """One-time startup backfill: add any existing mem:crystallized:* keys to the sorted set index."""
+    try:
+        index_size = await r.zcard(_CRYSTALLIZED_INDEX_KEY)
+        if index_size > 0:
+            return  # index already populated
+        cursor = 0
+        pipe = r.pipeline(transaction=False)
+        while True:
+            cursor, keys = await r.scan(cursor, match="mem:crystallized:*", count=100)
+            for key in keys:
+                pipe.get(key)
+            if cursor == 0:
+                break
+        raw_values = await pipe.execute()
+        zadd_map: dict = {}
+        for raw in raw_values:
+            if not raw:
+                continue
+            try:
+                d = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+                session_id = d.get("session_id", "")
+                ts = d.get("crystallized_at", 0)
+                if session_id and ts:
+                    zadd_map[f"mem:crystallized:{session_id}"] = ts
+            except Exception:
+                continue
+        if zadd_map:
+            await r.zadd(_CRYSTALLIZED_INDEX_KEY, zadd_map)
+            log.info(f"[crystallize] backfilled index with {len(zadd_map)} entries")
+    except Exception as e:
+        log.warning(f"[crystallize] index backfill failed: {e}")
 
 
 @asynccontextmanager
@@ -280,6 +313,8 @@ async def lifespan(app: FastAPI):
     _spawn(_auto_crystallize(), "crystallize")  # Auto-crystallize sessions every 6h
     # Populate BM25 corpus from existing Redis facts (non-blocking, best-effort)
     _spawn(_populate_bm25_from_redis(_redis), "bm25-populate")
+    # Backfill crystallized sorted-set index from existing keys (idempotent, skips if populated)
+    _spawn(_backfill_crystallized_index(_redis), "crystallize-index-backfill")
     log.info("AgentMem v%s ready (session-handoff+hard-prune+auto-graph+batch-MCP+compat+auto-crystallize)", APP_VERSION)
     yield
     # Cancel tracked background tasks before closing Redis
@@ -312,8 +347,27 @@ if _os.path.isdir(_static_dir):
         app.mount("/js", StaticFiles(directory=_js_dir), name="js")
 
 app.include_router(log_sse.log_sse_router)
-from api.routes import memory_router
-app.include_router(memory_router)
+
+# ── Extracted route modules ──────────────────────────────────────────────────
+from api.routes.health import router as health_router
+from api.routes.capability import router as capability_router
+from api.routes.graph import router as graph_router
+from api.routes.compat import router as compat_router
+from api.routes.admin import router as admin_router
+app.include_router(health_router)
+app.include_router(capability_router)
+app.include_router(graph_router)
+app.include_router(compat_router)
+app.include_router(admin_router)
+
+# ── MCP transports: Streamable HTTP (preferred) + SSE (legacy) ───────────────
+try:
+    from mcp_server import build_mcp_app, build_sse_app
+    app.mount("/mcp",     build_mcp_app(), name="mcp_http")
+    app.mount("/mcp/sse", build_sse_app(), name="mcp_sse")
+except Exception as _mcp_err:
+    import logging as _logging
+    _logging.getLogger(__name__).warning("MCP HTTP mount failed: %s", _mcp_err)
 
 # ── WebSocket for real-time dashboard updates ─────────────────────────────────
 _ws_clients: set[WebSocket] = set()
@@ -1093,7 +1147,7 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
         fact_count = await _stores_since_consolidation.increment(fact_saved)
         if fact_count >= settings.auto_consolidate_every:
             await _stores_since_consolidation.reset()
-            _spawn(_do_consolidate(), "consolidate")
+            _spawn(_do_consolidate(_redis, _bm25_index, _spawn), "consolidate")
             log.info("[store] auto-consolidation triggered")
 
         ms = int((time.time() - t0) * 1000)
@@ -1394,54 +1448,31 @@ async def answer(req: AnswerRequest):
     return {"answer": ""}
 
 
-@app.get("/health")
-async def health():
-    try:
-        await _redis.ping()
-        return {"status": "ok", "redis": "ok", "version": APP_VERSION,
-                "embedding": embedder.get_provider_info()}
-    except Exception as e:
-        return {"status": "degraded", "error": str(e)}
+@app.get("/system-prompt")
+async def system_prompt(agent: str = ""):
+    """
+    Return a memory-aware system prompt snippet for agents without lifecycle hooks.
+    Paste this into your agent's system prompt to enable tool-driven memory.
+    ?agent= can be: cursor, windsurf, copilot, zed, continue, cline, kilo, kiro, opencode, codex, augment
+    """
+    base = (
+        "You have access to a persistent memory system via the AgentMem MCP tools.\n\n"
+        "## Memory tools\n"
+        "- **recall_memory(query)** — call this at the START of every conversation with the user's question as the query. "
+        "Inject the returned context into your response naturally.\n"
+        "- **store_memory(messages)** — call this AFTER each meaningful exchange (user turn + your reply). "
+        "Pass [{\"role\": \"user\", \"content\": \"...\"}, {\"role\": \"assistant\", \"content\": \"...\"}].\n"
+        "- **compress_session(session_id)** — call this when the conversation ends to crystallise memory.\n"
+        "- **recall_procedures(query)** — check for known how-to workflows before starting multi-step tasks.\n"
+        "- **store_procedure(task, procedure)** — save successful workflows for future reuse.\n\n"
+        "## Usage rules\n"
+        "1. Always recall before answering — memory context takes precedence over your training.\n"
+        "2. Always store after answering — even short exchanges build useful long-term context.\n"
+        "3. Use the user's name or topic as the session_id for cross-session continuity.\n"
+        "4. Never mention the memory system unless the user asks about it."
+    )
+    return {"markdown": base, "agent": agent or "generic"}
 
-
-@app.get("/stats")
-async def stats():
-    try:
-        counts = await mem_store.vcard(_redis)
-        persona_raw = await _redis.hgetall("mem:persona")
-        counts["persona_fields"] = len(persona_raw)
-
-        # v0.6.0+: capability + procedural stats
-        tool_card = await _redis.execute_command("VCARD", cap_mod.TOOL_KEY)
-        counts["tools"] = max(0, int(tool_card or 0) - 1)
-
-        proc_card = await _redis.execute_command("VCARD", mem_store.PROC_KEY)
-        counts["procedures"] = max(0, int(proc_card or 0) - 1)
-
-        env_raw = await _redis.hgetall(cap_mod.ENV_KEY)
-        counts["env_fields"] = len(env_raw)
-
-        # v0.9.7+: background writer observability (since process start).
-        # Nested under "writer" so the dashboard can render it as its own panel
-        # and the top-level stat list stays focused on memory tier counts.
-        w_attempts = await _store_attempts.get()
-        w_successes = await _store_successes.get()
-        w_skips = await _store_skips.get()
-        w_errors = await _store_errors.get()
-        w_latency = await _store_latency_sum_ms.get()
-        completed = w_successes + w_errors
-        counts["writer"] = {
-            "attempts": w_attempts,
-            "successes": w_successes,
-            "skips": w_skips,
-            "errors": w_errors,
-            "success_rate": round(w_successes / completed, 3) if completed > 0 else None,
-            "avg_ms": round(w_latency / w_attempts) if w_attempts > 0 else None,
-        }
-
-        return counts
-    except Exception as e:
-        return {"error": str(e)}
 
 
 @app.post("/recall")
@@ -1565,26 +1596,18 @@ async def recall(req: RecallRequest):
     else:
         gather_tasks.append(asyncio.sleep(0))
     
-    # Crystallized digests (index 8): fetch recent auto-crystallized session summaries
+    # Crystallized digests (index 8): fetch recent auto-crystallized session summaries.
+    # Uses a sorted set index (mem:crystallized_index, score=crystallized_at) instead of
+    # SCAN so lookup is O(log N) regardless of total key count.
     async def _fetch_crystallized_digests() -> list[dict]:
-        """Fetch top-3 most recent crystallized session digests for lessons learned."""
+        """Fetch top-3 most recent crystallized session digests via sorted-set index."""
         try:
-            pattern = "mem:crystallized:*"
-            cursor = 0
-            all_keys = []
-
-            while True:
-                cursor, keys = await _redis.scan(cursor, match=pattern, count=50)
-                all_keys.extend(keys)
-                if cursor == 0 or len(all_keys) >= 10:
-                    break
-
-            if not all_keys:
+            top_keys = await _redis.zrevrange(_CRYSTALLIZED_INDEX_KEY, 0, 9)
+            if not top_keys:
                 return []
 
-            # Batch fetch all values via pipeline (avoids N+1 round-trips)
             pipe = _redis.pipeline(transaction=False)
-            for key in all_keys:
+            for key in top_keys:
                 pipe.get(key)
             raw_values = await pipe.execute()
 
@@ -1598,10 +1621,9 @@ async def recall(req: RecallRequest):
                 except Exception:
                     continue
 
-            # Sort by crystallized_at (most recent first), return top 3
             digests.sort(key=lambda d: d.get("crystallized_at", 0), reverse=True)
             return digests[:3]
-        
+
         except Exception as e:
             log.warning(f"[recall] failed to fetch crystallized digests: {e}")
             return []
@@ -1630,12 +1652,12 @@ async def recall(req: RecallRequest):
     sym_facts: list[dict] = []
     sym_entities = (query_struct.get("persons") or []) + (query_struct.get("entities") or [])
     if sym_entities:
-        sym_tasks = []
-        for ent in sym_entities[:3]:   # cap at 3 to bound latency
-            sym_tasks.append(
-                mem_store.knn_search(_redis, mem_store.FACT_KEY, _encode(ent), k=3,
-                                     filter_expr=lang_filter_sym or None)
-            )
+        ent_vecs = await _encode_batch_async(sym_entities[:3])
+        sym_tasks = [
+            mem_store.knn_search(_redis, mem_store.FACT_KEY, vec, k=3,
+                                 filter_expr=lang_filter_sym or None)
+            for vec in ent_vecs
+        ]
         sym_batches = await asyncio.gather(*sym_tasks)
         seen_sym = {f["content"] for f in facts_scene}
         for batch in sym_batches:
@@ -1670,7 +1692,9 @@ async def recall(req: RecallRequest):
             log.info(f"[recall] planning: {len(targeted_queries)} queries, "
                      f"total facts after planning: {len(facts_scene)}")
 
-    # Supplement with global search if scene results are sparse
+    # Supplement with global search if scene results are sparse.
+    # BM25 is pure in-memory (no I/O) but async — fold it into this gather so it
+    # runs concurrently with the Redis supplement fetches at zero extra latency cost.
     supplement_tasks = []
     if len(facts_scene) < n_facts:
         supplement_tasks.append(_fetch(mem_store.FACT_KEY, n_facts - len(facts_scene)))
@@ -1684,9 +1708,14 @@ async def recall(req: RecallRequest):
     else:
         supplement_tasks.append(asyncio.sleep(0))
 
+    supplement_tasks.append(_bm25_index.search(req.query, k=n_facts))
+
     supp_results = await asyncio.gather(*supplement_tasks)
     facts_global = supp_results[0] if isinstance(supp_results[0], list) else []
     eps_global   = supp_results[1] if isinstance(supp_results[1], list) else []
+    bm25_facts   = supp_results[2] if isinstance(supp_results[2], list) else []
+    if bm25_facts:
+        log.debug(f"[bm25] {len(bm25_facts)} hits for: {req.query[:60]!r}")
 
     # Dynamic Weighted RRF (arXiv:2511.18194 wRRF):
     # Adjust per-source weights based on what the query structure reveals.
@@ -1703,13 +1732,6 @@ async def recall(req: RecallRequest):
         _rrf_weights = [0.9, 0.9, 1.2, 0.8]   # symbolic boost, light BM25
     else:
         _rrf_weights = [1.0, 1.0, 0.6, 0.9]   # semantic: moderate BM25, low symbolic
-
-    # Memori BM25 pass (arXiv:2603.19935): exact-term matching over fact corpus.
-    # Runs in O(1) (no I/O) — BM25 corpus is maintained in-memory and searched locally.
-    # Particularly effective for entity names, dates, tool names, specific terms.
-    bm25_facts = await _bm25_index.search(req.query, k=n_facts)
-    if bm25_facts:
-        log.debug(f"[bm25] {len(bm25_facts)} hits for: {req.query[:60]!r}")
 
     def _merge(primary, supplement, symbolic, limit):
         p_ranked   = heat_mod.heat_rerank(primary)
@@ -1898,1488 +1920,7 @@ async def get_session(session_id: str):
     }
 
 
-# ── Capability endpoints (v0.6.0) ─────────────────────────────────────────────
-
-@app.post("/register-tools")
-async def register_tools(req: RegisterToolsRequest, background_tasks: BackgroundTasks):
-    """
-    Register the agent's available tools/skills into mem:tools vectorset.
-    Tools are embedded for semantic recall ("find tools that can X").
-    Call this from before_agent_start with the full tool list.
-    """
-    if not req.tools:
-        return {"status": "ok", "registered": 0}
-
-    async def _do_register():
-        count = 0
-        for tool in req.tools:
-            emb = _encode(f"{tool.name}: {tool.description}")
-            await cap_mod.register_tool(
-                _redis,
-                name=tool.name,
-                description=tool.description,
-                embedding=emb,
-                category=tool.category,
-                source=tool.source,
-                parameters=tool.parameters or [],
-                agent_id=req.agent_id,
-            )
-            count += 1
-        log.info(f"[tools] registered {count} tools (agent={req.agent_id})")
-
-    background_tasks.add_task(_do_register)
-    return {"status": "queued", "tool_count": len(req.tools)}
-
-
-@app.post("/register-env")
-async def register_env(req: EnvState):
-    """
-    Store current environment state in mem:env hash.
-    Call this from before_agent_start with OS/shell/cwd/git/MCP info.
-    """
-    env_data: dict = {}
-    if req.os:           env_data["os"]            = req.os
-    if req.os_version:   env_data["os_version"]    = req.os_version
-    if req.shell:        env_data["shell"]          = req.shell
-    if req.cwd:          env_data["cwd"]            = req.cwd
-    if req.git_repo:     env_data["git_repo"]       = req.git_repo
-    if req.git_branch:   env_data["git_branch"]     = req.git_branch
-    if req.runtime:      env_data["runtime"]        = req.runtime
-    if req.agent_model:  env_data["agent_model"]    = req.agent_model
-    if req.agent_version:env_data["agent_version"]  = req.agent_version
-    if req.session_id:   env_data["session_id"]     = req.session_id
-    if req.active_mcps:  env_data["active_mcps"]    = req.active_mcps
-    if req.active_plugins: env_data["active_plugins"] = req.active_plugins
-    if req.active_skills:  env_data["active_skills"]  = req.active_skills
-    if req.extra:
-        for k, v in req.extra.items():
-            env_data[k] = str(v)
-
-    await cap_mod.set_env(_redis, env_data)
-
-    # Also populate the Agent Self-Model (mem:agent) with identity fields so the
-    # dashboard's "Agent Self-Model" panel isn't perpetually empty. set_agent()
-    # stamps last_seen automatically; we only forward what was actually provided.
-    agent_data: dict = {}
-    if req.agent_model:   agent_data["model"]      = req.agent_model
-    if req.agent_version: agent_data["version"]    = req.agent_version
-    if req.session_id:    agent_data["session_id"] = req.session_id
-    if req.runtime:       agent_data["runtime"]    = req.runtime
-    if agent_data:
-        await cap_mod.set_agent(_redis, agent_data)
-
-    log.info(f"[env] registered env: {list(env_data.keys())}")
-    return {"status": "ok", "fields": list(env_data.keys()), "agent_fields": list(agent_data.keys())}
-
-
-@app.post("/recall-tools")
-async def recall_tools_endpoint(req: RecallToolsRequest):
-    """
-    Semantic search over registered tools.
-    Query: natural language description of needed capability.
-    Returns: ranked list of matching tools with scores.
-
-    Example: {"query": "search the filesystem for files"} →
-             [{"name": "Glob", "description": "...", "score": 0.92}]
-    """
-    t0 = time.time()
-    emb = _encode(req.query)
-    tools = await cap_mod.recall_tools(
-        _redis, emb,
-        k=req.k,
-        category_filter=req.category or None,
-        source_filter=req.source or None,
-    )
-    ms = int((time.time() - t0) * 1000)
-    return {"tools": tools, "count": len(tools), "latency_ms": ms}
-
-
-@app.get("/capabilities")
-async def get_capabilities():
-    """
-    Return the full agent capability manifest:
-    - tools: all registered tools with metadata
-    - env: current environment state
-    - agent: agent self-model
-    - stats: summary counts by category
-    """
-    return await cap_mod.get_capability_summary(_redis)
-
-
-@app.post("/recall-procedures")
-async def recall_procedures(req: RecallToolsRequest):
-    """
-    Semantic search over procedural memory (4th cognitive tier).
-    Query with a task description → get back how-to procedures.
-
-    Example: {"query": "how to search files by pattern", "k": 3}
-    → [{"task": "find Python files recursively", "procedure": "Use Glob with **/*.py pattern"}]
-    """
-    t0 = time.time()
-    emb = _encode(req.query)
-    blob = emb.astype("float32").tobytes()
-    cmd = ["VSIM", mem_store.PROC_KEY, "FP32", blob,
-           "COUNT", req.k + 1, "WITHSCORES", "WITHATTRIBS"]
-    try:
-        results = await _redis.execute_command(*cmd)
-    except Exception:
-        return {"procedures": [], "latency_ms": 0}
-
-    procs = []
-    i = 0
-    while i + 2 < len(results):
-        elem  = results[i]
-        score = results[i+1]
-        raw   = results[i+2]
-        i += 3
-        elem_str = elem.decode() if isinstance(elem, bytes) else elem
-        if elem_str == "__seed__":
-            continue
-        try:
-            attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
-        except Exception:
-            continue
-        if attrs.get("_seed") or not attrs.get("task"):
-            continue
-        procs.append({
-            "task":          attrs.get("task", ""),
-            "procedure":     attrs.get("procedure", ""),
-            "tools_used":    attrs.get("tools_used", []),
-            "domain":        attrs.get("domain", ""),
-            "success_count": attrs.get("success_count", 1),
-            "score":         float(score) if score else 0.0,
-        })
-
-    ms = int((time.time() - t0) * 1000)
-    return {"procedures": procs, "count": len(procs), "latency_ms": ms}
-
-
-@app.post("/store-procedure")
-async def store_procedure(req: StoreProcedureRequest, background_tasks: BackgroundTasks):
-    """
-    Explicitly store a procedural memory (agent workflow / how-to pattern).
-    The task description is embedded for semantic retrieval.
-    Agents or the JS plugin can call this after completing a successful task.
-    """
-    async def _do_store_proc():
-        emb = _encode(req.task)
-        sc = scene_mod.detect(req.task)
-        existing = await mem_store.knn_search(_redis, mem_store.PROC_KEY, emb, k=1)
-        if existing and existing[0].get("score", 0.0) > 0.90:
-            # Bump success count on near-duplicate
-            elem = existing[0].get("_element")
-            if elem:
-                attrs = dict(existing[0].get("attrs", {}))
-                attrs["success_count"] = attrs.get("success_count", 1) + 1
-                try:
-                    await _redis.execute_command(
-                        "VSETATTR", mem_store.PROC_KEY, elem, json.dumps(attrs)
-                    )
-                except Exception:
-                    pass
-            return
-        await mem_store.save_procedure(
-            _redis,
-            task=req.task,
-            procedure=req.procedure,
-            embedding=emb,
-            tools_used=req.tools_used,
-            domain=req.domain or sc["domain"],
-            language=sc["language"],
-        )
-        log.info(f"[proc] stored procedure: {req.task[:60]}")
-
-    background_tasks.add_task(_do_store_proc)
-    return {"status": "queued"}
-
-
-# ── ToolMem feedback endpoint (v0.9.5) ────────────────────────────────────────
-
-@app.post("/tool-feedback")
-async def tool_feedback(req: ToolFeedbackRequest):
-    """
-    Record success/failure for a tool invocation (ToolMem arXiv:2510.06664).
-
-    Called from PostToolUse hook after each tool use. Updates success_count /
-    fail_count on the tool's mem:tools entry and refreshes capability_summary
-    once enough data is available (≥5 uses).
-
-    Example: {"tool_name": "web_search_prime", "success": true}
-    """
-    elem_key = req.tool_name.lower().replace(" ", "_").replace("/", "_")[:64]
-    try:
-        raw = await _redis.execute_command("VGETATTR", cap_mod.TOOL_KEY, elem_key)
-    except Exception:
-        return {"ok": False, "reason": "redis error"}
-    if not raw:
-        return {"ok": False, "reason": "tool not found"}
-
-    try:
-        attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
-    except Exception:
-        return {"ok": False, "reason": "parse error"}
-
-    if req.success:
-        attrs["success_count"] = attrs.get("success_count", 0) + 1
-    else:
-        attrs["fail_count"]    = attrs.get("fail_count", 0) + 1
-    attrs["use_count"] = attrs.get("use_count", 0) + 1
-
-    # Refresh capability_summary once ≥5 feedback data points exist
-    total = attrs.get("success_count", 0) + attrs.get("fail_count", 0)
-    if total >= 5:
-        rate = attrs.get("success_count", 0) / total
-        if   rate >= 0.85: quality = "reliable"
-        elif rate >= 0.60: quality = "mostly reliable"
-        elif rate >= 0.40: quality = "mixed"
-        else:              quality = "often fails"
-        attrs["capability_summary"] = f"{quality} ({attrs.get('success_count',0)}/{total}✓)"
-
-    try:
-        await _redis.execute_command("VSETATTR", cap_mod.TOOL_KEY, elem_key, json.dumps(attrs))
-    except Exception as e:
-        return {"ok": False, "reason": str(e)}
-
-    log.debug(f"[tool-feedback] {elem_key} success={req.success} "
-              f"s={attrs.get('success_count',0)} f={attrs.get('fail_count',0)}")
-    return {
-        "ok":           True,
-        "tool":         elem_key,
-        "success_count": attrs.get("success_count", 0),
-        "fail_count":    attrs.get("fail_count", 0),
-        "capability_summary": attrs.get("capability_summary", ""),
-    }
-
-
-# ── AutoTool TIG endpoints (v0.9.5) ───────────────────────────────────────────
-
-@app.post("/record-tool-sequence")
-async def record_tool_sequence(req: ToolSequenceRequest):
-    """
-    Record an ordered tool-use sequence into the Tool Inertia Graph (AutoTool arXiv:2511.14650).
-
-    Called from Stop hook after each session. For each consecutive pair (A→B),
-    increments HINCRBY on mem:tool_graph key "A:B". These transition counts
-    are used at recall time to suggest likely-next tools.
-
-    Example: {"sequence": ["Glob", "Read", "Edit", "Bash"]}
-    → increments Glob:Read, Read:Edit, Edit:Bash
-    """
-    seq = [t.strip() for t in req.sequence if t.strip()]
-    if len(seq) < 2:
-        return {"ok": False, "transitions": 0}
-    count = 0
-    for i in range(len(seq) - 1):
-        a = seq[i].lower().replace(" ", "_")[:64]
-        b = seq[i + 1].lower().replace(" ", "_")[:64]
-        if a == b:
-            continue
-        await _redis.hincrby(mem_store.TOOL_GRAPH_KEY, f"{a}:{b}", 1)
-        count += 1
-    log.debug(f"[tig] recorded {count} transitions for session={req.session_id}")
-    return {"ok": True, "transitions": count}
-
-
-@app.get("/tool-graph/{tool_name}")
-async def tool_graph(tool_name: str, k: int = 5):
-    """
-    Return the top-k outgoing transitions from tool_name in the Tool Inertia Graph.
-
-    Example: GET /tool-graph/glob → [{"next": "read", "count": 42, "prob": 0.72}]
-    """
-    elem_key = tool_name.lower().replace(" ", "_")[:64]
-    try:
-        all_entries = await _redis.hgetall(mem_store.TOOL_GRAPH_KEY)
-    except Exception:
-        return {"tool": tool_name, "transitions": []}
-    prefix = f"{elem_key}:"
-    trans: dict[str, int] = {}
-    for k_b, v_b in all_entries.items():
-        key_s = k_b.decode() if isinstance(k_b, bytes) else k_b
-        if key_s.startswith(prefix):
-            target = key_s[len(prefix):]
-            trans[target] = int(v_b)
-    total = sum(trans.values())
-    sorted_t = sorted(trans.items(), key=lambda x: x[1], reverse=True)[:k]
-    return {
-        "tool":        tool_name,
-        "transitions": [
-            {"next": t, "count": c, "prob": round(c / total, 2) if total else 0}
-            for t, c in sorted_t
-        ],
-        "total_transitions": total,
-    }
-
-
-# ── AWO meta-tool detection (v0.9.6) ──────────────────────────────────────────
-
-@app.post("/tool-graph/detect-meta-tools")
-async def detect_meta_tools(threshold: int = 5, background_tasks: BackgroundTasks = None):
-    """
-    AWO meta-tool detection (Autonomous Workflow Optimization arXiv:2601.22037).
-
-    Scans the Tool Inertia Graph for high-frequency 2-hop chains A→B→C
-    where both A:B and B:C have count ≥ threshold. Each discovered chain is
-    auto-synthesized into a composite procedure in mem:procedures so future
-    recall surfaces it as a recommended workflow pattern.
-
-    Example: Glob→Read (28) + Read→Edit (23) → synthesize "Glob-Read-Edit pattern"
-    Returns: {"detected": N, "chains": [...], "new_procedures": M}
-    """
-    try:
-        all_entries = await _redis.hgetall(mem_store.TOOL_GRAPH_KEY)
-    except Exception:
-        return {"detected": 0, "chains": [], "new_procedures": 0}
-
-    if not all_entries:
-        return {"detected": 0, "chains": [], "new_procedures": 0}
-
-    # Build adjacency: from_tool → {to_tool: count}
-    adj: dict[str, dict[str, int]] = {}
-    for k_b, v_b in all_entries.items():
-        key_s = k_b.decode() if isinstance(k_b, bytes) else k_b
-        val   = int(v_b) if v_b else 0
-        if ":" not in key_s:
-            continue
-        a, b = key_s.split(":", 1)
-        adj.setdefault(a, {})[b] = val
-
-    # Find 2-hop chains: A→B (≥ threshold) + B→C (≥ threshold), A≠C
-    chains: list[dict] = []
-    for a, a_neighbors in adj.items():
-        for b, ab_count in a_neighbors.items():
-            if ab_count < threshold:
-                continue
-            b_neighbors = adj.get(b, {})
-            for c, bc_count in b_neighbors.items():
-                if bc_count < threshold or c == a:
-                    continue
-                chains.append({
-                    "chain":    [a, b, c],
-                    "ab_count": ab_count,
-                    "bc_count": bc_count,
-                    "strength": min(ab_count, bc_count),  # bottleneck strength
-                })
-
-    # Sort by bottleneck strength descending
-    chains.sort(key=lambda x: x["strength"], reverse=True)
-
-    if not chains:
-        return {"detected": 0, "chains": [], "new_procedures": 0}
-
-    async def _synthesize_chains(chains_to_add: list[dict]):
-        new_count = 0
-        for ch in chains_to_add[:20]:   # cap at 20 new meta-tools per run
-            a, b, c = ch["chain"]
-            task = f"[meta-tool] {a} → {b} → {c} workflow"
-            procedure = (
-                f"High-frequency tool chain discovered by AWO analysis "
-                f"(TIG count: {a}→{b}={ch['ab_count']}, {b}→{c}={ch['bc_count']}).\n"
-                f"1. Use {a}\n2. Use {b}\n3. Use {c}"
-            )
-            emb = _encode(task)
-            # Check for near-duplicate before storing
-            existing = await mem_store.knn_search(_redis, mem_store.PROC_KEY, emb, k=1)
-            if existing and existing[0].get("score", 0.0) > 0.90:
-                continue
-            await mem_store.save_procedure(
-                _redis,
-                task=task,
-                procedure=procedure,
-                embedding=emb,
-                tools_used=[a, b, c],
-                domain="meta",
-                language="en",
-            )
-            new_count += 1
-        log.info(f"[awo] synthesized {new_count} meta-tool procedures from {len(chains_to_add)} chains")
-
-    if background_tasks is not None:
-        background_tasks.add_task(_synthesize_chains, chains)
-        synthesis_status = "queued"
-        new_procs = None
-    else:
-        await _synthesize_chains(chains)
-        synthesis_status = "done"
-        new_procs = min(len(chains), 20)
-
-    return {
-        "detected":       len(chains),
-        "chains":         chains[:10],   # return top-10 for inspection
-        "new_procedures": new_procs,
-        "synthesis":      synthesis_status,
-        "threshold":      threshold,
-    }
-
-
-# ── MACLA procedure feedback endpoint (v0.9.5) ────────────────────────────────
-
-@app.post("/procedure-feedback")
-async def procedure_feedback(req: ProcedureFeedbackRequest):
-    """
-    Record success/failure for a procedure retrieval (MACLA arXiv:2512.18950).
-
-    Finds the best matching procedure by semantic similarity to task_prefix,
-    then updates its fail_count. (success_count is already bumped by /store-procedure.)
-    Used by agents after a recalled procedure was followed and succeeded/failed.
-
-    Example: {"task_prefix": "how to search files by pattern", "success": false}
-    """
-    emb = _encode(req.task_prefix[:80])
-    blob = emb.astype("float32").tobytes()
-    try:
-        results = await _redis.execute_command(
-            "VSIM", mem_store.PROC_KEY, "FP32", blob,
-            "COUNT", 3, "WITHSCORES", "WITHATTRIBS"
-        )
-    except Exception:
-        return {"ok": False, "reason": "redis error"}
-
-    best_elem = None
-    best_score = 0.0
-    best_attrs: dict = {}
-    idx = 0
-    while idx + 2 < len(results):
-        elem  = results[idx]; score = results[idx+1]; raw = results[idx+2]
-        idx += 3
-        elem_str = elem.decode() if isinstance(elem, bytes) else elem
-        if elem_str == "__seed__":
-            continue
-        try:
-            attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
-        except Exception:
-            continue
-        if attrs.get("_seed") or not attrs.get("task"):
-            continue
-        s = float(score) if score else 0.0
-        if s > best_score:
-            best_score = s; best_elem = elem_str; best_attrs = attrs
-
-    if not best_elem or best_score < 0.50:
-        return {"ok": False, "reason": "no matching procedure found", "best_score": best_score}
-
-    if req.success:
-        best_attrs["success_count"] = best_attrs.get("success_count", 0) + 1
-    else:
-        best_attrs["fail_count"]    = best_attrs.get("fail_count", 0) + 1
-
-    try:
-        await _redis.execute_command("VSETATTR", mem_store.PROC_KEY, best_elem, json.dumps(best_attrs))
-    except Exception as e:
-        return {"ok": False, "reason": str(e)}
-
-    log.debug(f"[proc-feedback] {best_elem[:40]} success={req.success} score={best_score:.2f}")
-    return {
-        "ok":           True,
-        "matched_task": best_attrs.get("task", "")[:60],
-        "score":        best_score,
-        "success_count": best_attrs.get("success_count", 0),
-        "fail_count":    best_attrs.get("fail_count", 0),
-    }
-
-
-@app.get("/tool-procedures/{tool_name}")
-async def tool_procedures(tool_name: str):
-    """
-    Return all procedures that use a given tool (reverse index lookup).
-
-    Uses mem:proc_by_tool:<tool> Redis Sets populated by save_procedure()
-    and the /proc-backfill-index endpoint.
-
-    Example: GET /tool-procedures/bash
-    → [{"uid": "...", "task": "...", "tools_used": [...], "success_count": N}]
-    """
-    uids = await mem_store.get_procs_for_tool(_redis, tool_name)
-    if not uids:
-        return {"tool": tool_name, "procedures": [], "count": 0}
-
-    procs = []
-    for uid in uids:
-        try:
-            raw = await _redis.execute_command("VGETATTR", mem_store.PROC_KEY, uid)
-        except Exception:
-            continue
-        if not raw:
-            continue
-        try:
-            attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
-        except Exception:
-            continue
-        if not attrs.get("task"):
-            continue
-        procs.append({
-            "uid":           uid,
-            "task":          attrs.get("task", ""),
-            "procedure":     attrs.get("procedure", "")[:200],
-            "tools_used":    attrs.get("tools_used", []),
-            "domain":        attrs.get("domain", ""),
-            "success_count": attrs.get("success_count", 1),
-            "fail_count":    attrs.get("fail_count", 0),
-        })
-
-    return {"tool": tool_name, "procedures": procs, "count": len(procs)}
-
-
-@app.post("/proc-backfill-index")
-async def proc_backfill_index(background_tasks: BackgroundTasks):
-    """
-    Backfill mem:proc_by_tool reverse index for all existing procedures.
-
-    Run once after upgrading to v0.9.6 to populate the reverse index for
-    procedures that were stored before link_proc_to_tools() was added.
-    Idempotent — SADD is a no-op for already-present members.
-    """
-    async def _do_backfill():
-        procs = await mem_store.scan_all_procedures(_redis)
-        count = 0
-        for p in procs:
-            uid   = p.get("uid", "")
-            tools = p.get("tools_used", [])
-            if uid and tools:
-                await mem_store.link_proc_to_tools(_redis, uid, tools)
-                count += len(tools)
-        log.info(f"[backfill] reverse-indexed {len(procs)} procedures, {count} tool→proc links")
-        return len(procs), count
-
-    background_tasks.add_task(_do_backfill)
-    return {"status": "queued", "message": "backfilling proc_by_tool reverse index in background"}
-
-
-@app.get("/capabilities/context")
-async def get_capability_context():
-    """
-    Return environment context as formatted string (same as what /recall injects).
-    Useful for debugging what an agent sees about its environment.
-    """
-    env_ctx   = await cap_mod.get_env_context(_redis)
-    persona   = await persona_mod.get_context(_redis)
-    agent     = await cap_mod.get_agent(_redis)
-    all_tools = await cap_mod.list_all_tools(_redis)
-
-    # Format tools by category
-    by_cat: dict[str, list] = {}
-    for t in all_tools:
-        cat = t.get("category", "general")
-        by_cat.setdefault(cat, []).append(t["name"])
-
-    tool_lines = []
-    for cat, names in sorted(by_cat.items()):
-        tool_lines.append(f"  [{cat}]: {', '.join(names)}")
-
-    return {
-        "persona_context":     persona,
-        "env_context":         env_ctx,
-        "agent_self_model":    agent,
-        "tool_index_by_category": by_cat,
-        "tool_count":          len(all_tools),
-    }
-
-
-# ── Consolidation (SimpleMem-inspired recursive merging) ─────────────────────
-
-async def _do_consolidate(
-    similarity_threshold: float = 0.85,
-    temporal_lambda: float = 0.03,      # temporal decay: λ=0.03 → 23-day half-life
-) -> dict:
-    """
-    SimpleMem 3-phase consolidation (Section 3.2) + LLM Wiki v2 Ebbinghaus decay:
-      Phase 1 — Decay:  Ebbinghaus forgetting curve — effective confidence decays
-                        based on category stability and time since last confirmation.
-                        importance × 0.9 for entries older than 90 days (legacy).
-      Phase 2 — Merge:  cluster near-duplicates (cosine×temporal ≥ threshold),
-                        LLM-merge into keeper, soft-delete losers via superseded_by
-                        (reason="merged"). Merged keeper inherits source_count sum.
-      Phase 3 — Prune:  soft-delete any active entry with importance < 0.05
-                        (reason="pruned") or effective confidence < 0.1.
-    """
-    t0 = time.time()
-    now_ms = int(time.time() * 1000)
-    NINETY_DAYS_MS = 90 * 86_400_000
-
-    scanned = await _vscan(_redis, mem_store.FACT_KEY, max_count=500)
-    if not scanned:
-        return {"merged": 0, "decayed": 0, "pruned": 0, "ms": 0}
-
-    # Filter only active (non-superseded) facts with content
-    all_facts = [
-        {"element": item["element"], "attrs": item["attrs"]}
-        for item in scanned
-        if item["attrs"].get("content") and not item["attrs"].get("superseded_by")
-    ]
-
-    if len(all_facts) < 2:
-        return {"merged": 0, "decayed": 0, "pruned": 0, "total": len(all_facts), "ms": 0}
-
-    # ── Phase 1: Decay (Ebbinghaus + legacy importance) ─────────────────────────
-    # LLM Wiki v2: Ebbinghaus forgetting curve — confidence decays based on
-    # category stability and time since last confirmation.
-    # Legacy: entries older than 90 days lose 10% importance each run.
-    decayed_count = 0
-    for fact in all_facts:
-        changed = False
-        ts = fact["attrs"].get("ts", now_ms)
-        # Legacy importance decay
-        if (now_ms - ts) > NINETY_DAYS_MS:
-            old_imp = fact["attrs"].get("importance", 0.5)
-            new_imp = round(old_imp * 0.9, 4)
-            fact["attrs"]["importance"] = new_imp
-            changed = True
-        # LLM Wiki v2: compute effective confidence and store it
-        eff_conf = mem_store.confidence_decay(fact["attrs"])
-        if eff_conf != fact["attrs"].get("effective_confidence", -1):
-            fact["attrs"]["effective_confidence"] = eff_conf
-            changed = True
-        if changed:
-            try:
-                await _redis.execute_command(
-                    "VSETATTR", mem_store.FACT_KEY, fact["element"],
-                    json.dumps(fact["attrs"])
-                )
-                decayed_count += 1
-            except Exception as e:
-                log.debug(f"[consolidate] decay VSETATTR failed: {e}")
-
-    # ── Phase 2: Merge ─────────────────────────────────────────────────────────
-    # affinity = cosine_similarity × exp(−λ × |days_between|)
-    # Cluster losers are soft-deleted (superseded_by = keeper_element), never VREM'd.
-    merged_count = 0
-    superseded_elements: set[str] = set()
-
-    # Precompute all fact embeddings in batch to avoid re-encoding inside the loop.
-    # This reduces Phase 2 from O(N²) encoding cost to O(N) — each fact's embedding
-    # is computed once and reused for both knn_search and keeper re-embedding.
-    fact_embeddings: dict[str, np.ndarray] = {}
-    for fact in all_facts:
-        fact_embeddings[fact["element"]] = _encode(fact["attrs"]["content"])
-
-    # Build a lookup dict for O(1) element → fact mapping (replaces O(N) scan)
-    fact_by_element: dict[str, dict] = {f["element"]: f for f in all_facts}
-
-    for fact in all_facts:
-        if fact["element"] in superseded_elements:
-            continue
-
-        f_emb = fact_embeddings[fact["element"]]
-        similar = await mem_store.knn_search(
-            _redis, mem_store.FACT_KEY, f_emb, k=5
-        )
-
-        cluster = [fact]
-        fact_ts = fact["attrs"].get("ts", 0)
-
-        for s in similar:
-            if s["_element"] == fact["element"]:
-                continue
-            if s["_element"] in superseded_elements:
-                continue
-
-            cosine_sim = s.get("score", 0.0)
-            # O(1) lookup instead of O(N) scan
-            s_fact = fact_by_element.get(s["_element"])
-            s_ts = s_fact["attrs"].get("ts", 0) if s_fact else 0
-
-            days_between = abs(fact_ts - s_ts) / 86_400_000
-            temporal_factor = math.exp(-temporal_lambda * days_between)
-            affinity = cosine_sim * temporal_factor
-
-            if affinity >= similarity_threshold and s_fact:
-                cluster.append(s_fact)
-
-        if len(cluster) < 2:
-            continue
-
-        contents = [c["attrs"]["content"] for c in cluster]
-        merged_content = await _llm_merge_facts(contents)
-        if not merged_content:
-            continue
-
-        # Keeper = highest importance in cluster (aligned with SimpleMem's winner
-        # selection policy: importance beats recency). Ties broken by newer timestamp.
-        cluster.sort(
-            key=lambda c: (c["attrs"].get("importance", 0.5), c["attrs"].get("ts", 0)),
-            reverse=True
-        )
-        keeper = cluster[0]
-        keeper_element = keeper["element"]
-
-        new_attrs = dict(keeper["attrs"])
-        new_attrs["content"] = merged_content[:500]
-        new_attrs["access_count"] = max(c["attrs"].get("access_count", 0) for c in cluster)
-        new_attrs["importance"] = max(c["attrs"].get("importance", 0.5) for c in cluster)
-        new_attrs["consolidated_from"] = len(cluster)
-        # LLM Wiki v2: inherit source_count sum and reset last_confirmed_ts
-        new_attrs["source_count"] = sum(c["attrs"].get("source_count", 1) for c in cluster)
-        new_attrs["last_confirmed_ts"] = int(time.time() * 1000)
-        new_attrs["version"] = keeper["attrs"].get("version", 1) + 1
-
-        all_kw: set[str] = set()
-        all_persons: set[str] = set()
-        all_entities: set[str] = set()
-        for c in cluster:
-            all_kw.update(c["attrs"].get("keywords", []))
-            all_persons.update(c["attrs"].get("persons", []))
-            all_entities.update(c["attrs"].get("entities", []))
-        if all_kw:
-            new_attrs["keywords"] = list(all_kw)[:10]
-        if all_persons:
-            new_attrs["persons"] = list(all_persons)[:5]
-        if all_entities:
-            new_attrs["entities"] = list(all_entities)[:5]
-
-        m_emb = _encode(merged_content)
-        try:
-            await _redis.execute_command(
-                "VADD", mem_store.FACT_KEY, "FP32", m_emb.tobytes(),
-                keeper_element, "SETATTR", json.dumps(new_attrs)
-            )
-        except Exception as e:
-            log.warning(f"[consolidate] failed to update keeper: {e}")
-            continue
-
-        # Soft-delete losers: mark superseded_by = keeper_element (never VREM)
-        for c in cluster[1:]:
-            if c["element"] not in superseded_elements:
-                await mem_store.soft_delete_fact(_redis, c["element"], keeper_element, reason="merged")
-                superseded_elements.add(c["element"])
-
-        merged_count += 1
-
-    # ── Phase 3: Prune ─────────────────────────────────────────────────────────
-    # Soft-delete any remaining active entry whose importance has decayed below 0.05
-    # or whose effective confidence (Ebbinghaus) has fallen below 0.1.
-    pruned_count = 0
-    for fact in all_facts:
-        if fact["element"] in superseded_elements:
-            continue
-        imp = fact["attrs"].get("importance", 1.0)
-        eff_conf = fact["attrs"].get("effective_confidence", 1.0)
-        if imp < 0.05 or eff_conf < 0.1:
-            reason = "pruned" if imp < 0.05 else "confidence_expired"
-            await mem_store.soft_delete_fact(_redis, fact["element"], "pruned", reason=reason)
-            superseded_elements.add(fact["element"])
-            pruned_count += 1
-
-    # ── Post-consolidation: invalidate BM25 index ─────────────────────────────
-    # Superseded and merged facts changed state; the in-memory BM25 corpus is now
-    # stale. Force a rebuild on next search so superseded facts are excluded and
-    # merged keepers reflect their new content.
-    if superseded_elements:
-        await _bm25_index.reset()
-        _spawn(_populate_bm25_from_redis(_redis), "bm25-rebuild")
-
-    ms = int((time.time() - t0) * 1000)
-    log.info(
-        f"[consolidate] decayed={decayed_count} merged={merged_count} "
-        f"pruned={pruned_count} {ms}ms"
-    )
-    return {
-        "decayed": decayed_count,
-        "merged": merged_count,
-        "pruned": pruned_count,
-        "total_before": len(all_facts),
-        "total_after": len(all_facts) - len(superseded_elements),
-        "ms": ms,
-    }
-
-
-async def _do_hard_prune() -> dict:
-    """
-    Physically VREM entries that have been soft-deleted for > 7 days,
-    and stale episodes (>180 days old, never accessed).
-
-    Soft-delete (superseded_by != "") is the SimpleMem audit trail.
-    Hard-delete (VREM) is the capacity management pass that actually
-    reduces vectorset size and keeps HNSW index fresh.
-
-    Returns counts of entries removed from each vectorset.
-    """
-    t0 = time.time()
-    now_ms = int(time.time() * 1000)
-    SEVEN_DAYS_MS   = 7  * 86_400_000
-    SIX_MONTHS_MS   = 180 * 86_400_000
-
-    removed_facts = 0
-    removed_eps   = 0
-
-    async def _hard_prune_vset(vset_key: str, max_scan: int = 2000) -> int:
-        items = await _vscan(_redis, vset_key, max_count=max_scan)
-        if not items:
-            return 0
-
-        to_remove: list[str] = []
-        for item in items:
-            attrs = item["attrs"]
-            ts = attrs.get("ts", now_ms)
-            age_ms = now_ms - ts
-
-            # Hard-delete soft-deleted entries older than 7 days
-            superseded = attrs.get("superseded_by", "")
-            if superseded and age_ms > SEVEN_DAYS_MS:
-                to_remove.append(item["element"])
-                continue
-
-            # Hard-delete stale episodes: 180+ days old, never recalled
-            if vset_key == mem_store.EPISODE_KEY:
-                if age_ms > SIX_MONTHS_MS and attrs.get("access_count", 0) == 0:
-                    to_remove.append(item["element"])
-
-        removed = 0
-        for elem_str in to_remove:
-            try:
-                await _redis.execute_command("VREM", vset_key, elem_str)
-                removed += 1
-            except Exception:
-                pass
-        return removed
-
-    removed_facts = await _hard_prune_vset(mem_store.FACT_KEY)
-    removed_eps   = await _hard_prune_vset(mem_store.EPISODE_KEY)
-
-    # Invalidate BM25 index after hard-prune (entries physically removed)
-    if removed_facts > 0:
-        await _bm25_index.reset()
-        _spawn(_populate_bm25_from_redis(_redis), "bm25-rebuild")
-
-    ms = int((time.time() - t0) * 1000)
-    log.info(f"[hard_prune] removed facts={removed_facts} episodes={removed_eps} {ms}ms")
-    return {"removed_facts": removed_facts, "removed_episodes": removed_eps, "ms": ms}
-
-
-async def _llm_merge_facts(contents: list[str]) -> str | None:
-    """Use role-based routing to merge multiple similar facts into one consolidated fact."""
-    _AISERV_OAI = "http://127.0.0.1:4000/v1/chat/completions"
-    _AISERV_KEY = "sk-aiserv-local-dev"
-
-    # Use live health matrix — no hardcoded dead models.
-    model, _ = await extractor._resolve_nlp_model()
-
-    facts_text = "\n".join(f"- {c}" for c in contents)
-    prompt = (
-        f"以下是关于同一主题的多条记忆，请合并为一条完整、准确的事实陈述。"
-        f"保留所有不同的细节，去除重复。输出仅包含合并后的一句话，不要解释。\n\n{facts_text}"
-    )
-
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.post(
-                _AISERV_OAI,
-                json={
-                    "model": model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 150,
-                    "temperature": 0.1,
-                },
-                headers={"Authorization": f"Bearer {_AISERV_KEY}"},
-            )
-            if resp.status_code == 200:
-                _spawn(extractor._report_quality(model, +1), "quality")
-                return resp.json()["choices"][0]["message"]["content"].strip()
-    except httpx.TimeoutException:
-        log.warning("[consolidate] %s timed out", model)
-        _spawn(extractor._report_quality(model, -1, reason="timeout"), "quality")
-    except Exception as e:
-        log.warning(f"[consolidate] LLM merge failed: {e}")
-        _spawn(extractor._report_quality(model, -1, reason="other"), "quality")
-
-    return max(contents, key=len)
-
-
-@app.post("/consolidate")
-async def consolidate(background_tasks: BackgroundTasks):
-    """Trigger memory consolidation — merges similar facts to reduce redundancy."""
-    background_tasks.add_task(_do_consolidate)
-    await _ws_broadcast("consolidate", {"status": "queued"})
-    return {"status": "consolidation_queued"}
-
-
-@app.post("/consolidate/sync")
-async def consolidate_sync():
-    """Synchronous consolidation — returns results immediately."""
-    result = await _do_consolidate()
-    return result
-
-
-@app.post("/consolidate/hard-prune")
-async def hard_prune(background_tasks: BackgroundTasks):
-    """
-    Physical VREM of soft-deleted entries (>7 days) and stale episodes (>180 days).
-    Runs automatically every 24h; use this to trigger on demand.
-    """
-    background_tasks.add_task(_do_hard_prune)
-    return {"status": "hard_prune_queued"}
-
-
-@app.post("/admin/delete-facts-by-content")
-async def admin_delete_facts_by_content(pattern: str = "Always send a report"):
-    """Delete facts whose content contains the given pattern (admin only)."""
-    card = await _redis.execute_command("VCARD", mem_store.FACT_KEY)
-    if not card or int(card) <= 1:
-        return {"deleted": 0, "message": "no facts to scan"}
-
-    seed = np.zeros(embedder.DIMS, dtype=np.float32)
-    results = await _redis.execute_command(
-        "VSIM", mem_store.FACT_KEY, "FP32", seed.tobytes(),
-        "COUNT", min(int(card), 500), "WITHSCORES", "WITHATTRIBS"
-    )
-    deleted = 0
-    i = 0
-    while i + 2 < len(results):
-        elem = results[i]
-        raw = results[i + 2]
-        i += 3
-        elem_str = elem.decode() if isinstance(elem, bytes) else elem
-        if elem_str == "__seed__":
-            continue
-        try:
-            attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
-        except Exception:
-            continue
-        content = attrs.get("content", "")
-        if pattern.lower() in content.lower():
-            await _redis.execute_command("VREM", mem_store.FACT_KEY, elem_str)
-            deleted += 1
-    return {"deleted": deleted, "pattern": pattern}
-
-
-# ── User Feedback Endpoints (v1.2.0) ──────────────────────────────────────────
-# Enable users to rate, pin, and delete memories for continuous quality improvement
-
-
-@app.post("/feedback")
-async def provide_feedback(req: FeedbackRequest):
-    """
-    User rates memory relevance (1-5 stars). Adjusts importance and confidence.
-    
-    - Rating 4-5: boost importance × 1.2, reinforce fact (increment source_count)
-    - Rating 1-2: reduce importance × 0.7, flag for review
-    - Rating 3: no change
-    
-    This creates a reinforcement learning loop where the system learns from
-    user preferences over time.
-    """
-    if req.rating < 1 or req.rating > 5:
-        return {"error": "rating must be 1-5"}
-    
-    try:
-        raw = await _redis.execute_command("VGETATTR", mem_store.FACT_KEY, req.element_id)
-        if not raw:
-            return {"status": "not_found", "element_id": req.element_id}
-        
-        attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
-        
-        # Apply feedback-based adjustments
-        if req.rating >= 4:
-            # Positive feedback: boost importance and reinforce
-            old_importance = attrs.get("importance", 0.5)
-            attrs["importance"] = min(1.0, old_importance * 1.2)
-            attrs["user_rating"] = req.rating
-            attrs["user_rating_ts"] = int(time.time() * 1000)
-            if req.comment:
-                attrs["user_comment"] = req.comment[:500]
-            
-            # Reinforce fact (increment source_count, reset decay)
-            await mem_store.reinforce_fact(_redis, req.element_id, source=f"user_feedback_{req.rating}")
-            
-            # Update Redis attrs
-            await _redis.execute_command(
-                "VSETATTR", mem_store.FACT_KEY, req.element_id,
-                json.dumps(attrs, ensure_ascii=False)
-            )
-            
-            log.info(f"[feedback] positive rating {req.rating}/5 for {req.element_id}, "
-                    f"importance {old_importance:.2f} → {attrs['importance']:.2f}")
-            
-            return {
-                "status": "ok",
-                "element_id": req.element_id,
-                "new_importance": attrs["importance"],
-                "action": "boosted_and_reinforced"
-            }
-        
-        elif req.rating <= 2:
-            # Negative feedback: reduce importance, flag for review
-            old_importance = attrs.get("importance", 0.5)
-            attrs["importance"] = max(0.05, old_importance * 0.7)
-            attrs["user_rating"] = req.rating
-            attrs["user_rating_ts"] = int(time.time() * 1000)
-            attrs["needs_review"] = True
-            if req.comment:
-                attrs["user_comment"] = req.comment[:500]
-            
-            # Update Redis attrs
-            await _redis.execute_command(
-                "VSETATTR", mem_store.FACT_KEY, req.element_id,
-                json.dumps(attrs, ensure_ascii=False)
-            )
-            
-            log.info(f"[feedback] negative rating {req.rating}/5 for {req.element_id}, "
-                    f"importance {old_importance:.2f} → {attrs['importance']:.2f}")
-            
-            return {
-                "status": "ok",
-                "element_id": req.element_id,
-                "new_importance": attrs["importance"],
-                "action": "reduced_and_flagged_for_review"
-            }
-        
-        else:
-            # Neutral rating (3): just record it
-            attrs["user_rating"] = req.rating
-            attrs["user_rating_ts"] = int(time.time() * 1000)
-            if req.comment:
-                attrs["user_comment"] = req.comment[:500]
-            
-            await _redis.execute_command(
-                "VSETATTR", mem_store.FACT_KEY, req.element_id,
-                json.dumps(attrs, ensure_ascii=False)
-            )
-            
-            return {
-                "status": "ok",
-                "element_id": req.element_id,
-                "action": "recorded_neutral_rating"
-            }
-    
-    except Exception as e:
-        log.error(f"[feedback] error processing feedback: {e}")
-        return {"error": str(e)}
-
-
-@app.post("/facts/{element_id}/pin")
-async def pin_fact(element_id: str):
-    """
-    Pin fact permanently (importance = 1.0, never pruned).
-    
-    Pinned facts are excluded from consolidation pruning phase.
-    Use for critical rules, identity facts, or essential procedures.
-    """
-    try:
-        raw = await _redis.execute_command("VGETATTR", mem_store.FACT_KEY, element_id)
-        if not raw:
-            return {"status": "not_found", "element_id": element_id}
-        
-        attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
-        attrs["pinned"] = True
-        attrs["pinned_at"] = int(time.time() * 1000)
-        attrs["importance"] = 1.0  # maximum importance
-        
-        await _redis.execute_command(
-            "VSETATTR", mem_store.FACT_KEY, element_id,
-            json.dumps(attrs, ensure_ascii=False)
-        )
-        
-        log.info(f"[pin] pinned fact {element_id}: {attrs.get('content', '')[:80]}")
-        
-        return {
-            "status": "ok",
-            "element_id": element_id,
-            "action": "pinned_permanently"
-        }
-    
-    except Exception as e:
-        log.error(f"[pin] error pinning fact: {e}")
-        return {"error": str(e)}
-
-
-@app.delete("/facts/{element_id}")
-async def delete_fact(element_id: str):
-    """
-    User-initiated hard delete (immediate VREM).
-    
-    Unlike soft-delete (superseded_by), this physically removes the fact
-    from the vectorset. Use with caution — no undo.
-    """
-    try:
-        # Verify fact exists
-        raw = await _redis.execute_command("VGETATTR", mem_store.FACT_KEY, element_id)
-        if not raw:
-            return {"status": "not_found", "element_id": element_id}
-        
-        attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
-        content_preview = attrs.get("content", "")[:80]
-        
-        # Physical removal
-        await _redis.execute_command("VREM", mem_store.FACT_KEY, element_id)
-        
-        # Invalidate BM25 index
-        await _bm25_index.reset()
-        _spawn(_populate_bm25_from_redis(_redis), "bm25-rebuild-after-delete")
-        
-        log.info(f"[delete] user-deleted fact {element_id}: {content_preview}")
-        
-        return {
-            "status": "ok",
-            "element_id": element_id,
-            "action": "hard_deleted"
-        }
-    
-    except Exception as e:
-        log.error(f"[delete] error deleting fact: {e}")
-        return {"error": str(e)}
-
-
-@app.get("/facts/{element_id}/metadata")
-async def get_fact_metadata(element_id: str):
-    """
-    Get full metadata for a fact including user ratings, pins, lifecycle info.
-    
-    Useful for debugging and understanding why a fact was stored/retrieved.
-    """
-    try:
-        raw = await _redis.execute_command("VGETATTR", mem_store.FACT_KEY, element_id)
-        if not raw:
-            return {"status": "not_found", "element_id": element_id}
-        
-        attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
-        eff_conf = mem_store.confidence_decay(attrs)
-        
-        return {
-            "element_id": element_id,
-            "content": attrs.get("content", "")[:500],
-            "category": attrs.get("category", ""),
-            "importance": attrs.get("importance", 0.5),
-            "confidence": attrs.get("confidence", 0.8),
-            "effective_confidence": eff_conf,
-            "source_count": attrs.get("source_count", 1),
-            "access_count": attrs.get("access_count", 0),
-            "created_at": attrs.get("ts", 0),
-            "last_confirmed_ts": attrs.get("last_confirmed_ts", 0),
-            "version": attrs.get("version", 1),
-            "pinned": attrs.get("pinned", False),
-            "user_rating": attrs.get("user_rating"),
-            "user_comment": attrs.get("user_comment"),
-            "needs_review": attrs.get("needs_review", False),
-            "superseded_by": attrs.get("superseded_by", ""),
-            "superseded_reason": attrs.get("superseded_reason", ""),
-        }
-    
-    except Exception as e:
-        return {"error": str(e), "element_id": element_id}
-
-
-# ── Knowledge Graph endpoints (v0.9.0) ────────────────────────────────────────
-
-@app.get("/graph/stats")
-async def graph_stats_endpoint():
-    """Return knowledge graph statistics: node count and edge count."""
-    try:
-        return await graph_mod.graph_stats(_redis)
-    except Exception as e:
-        log.error(f"[graph/stats] {e}")
-        return {"nodes": 0, "edges": 0, "total_nodes": 0, "total_edges": 0, "error": str(e)}
-
-
-@app.get("/graph/nodes")
-async def graph_nodes_endpoint(limit: int = 60):
-    """
-    Return top N most-connected entities with their edges for graph visualization.
-    Scans mem:graph:* keys, ranks by connection count, returns nodes + edges.
-    """
-    try:
-        prefix = graph_mod.GRAPH_PREFIX
-        # Collect all entity keys
-        all_keys = []
-        async for key in _redis.scan_iter(f"{prefix}*", count=500):
-            all_keys.append(key.decode() if isinstance(key, bytes) else key)
-
-        if not all_keys:
-            return {"nodes": [], "edges": []}
-
-        # Batch get connection counts — try scard (Set keys), fall back handled per-key
-        pipe = _redis.pipeline(transaction=False)
-        for k in all_keys:
-            pipe.scard(k)
-        scards = await pipe.execute(raise_on_error=False)
-
-        # Sort by connection count descending, take top limit
-        ranked = sorted(
-            [(k, int(sc) if isinstance(sc, int) else 0) for k, sc in zip(all_keys, scards)],
-            key=lambda x: x[1], reverse=True
-        )[:limit]
-
-        # Fetch neighbors for top entities
-        top_keys = [k for k, _ in ranked]
-        pipe = _redis.pipeline(transaction=False)
-        for k in top_keys:
-            pipe.smembers(k)  # legacy Set edges (slug strings)
-        members_list = await pipe.execute(raise_on_error=False)
-
-        nodes_out = []
-        edges_out = []
-        seen_edges: set[tuple] = set()
-
-        for (k, conn_count), members in zip(ranked, members_list):
-            slug = k[len(prefix):]
-            label = slug.replace("_", " ")
-            nodes_out.append({"id": slug, "label": label, "connections": conn_count})
-
-            if not isinstance(members, (set, list)):
-                continue
-            for m in members:
-                nb = m.decode() if isinstance(m, bytes) else m
-                pair = (min(slug, nb), max(slug, nb))
-                if pair not in seen_edges:
-                    seen_edges.add(pair)
-                    edges_out.append({"source": slug, "target": nb, "type": "related_to"})
-
-        return {"nodes": nodes_out, "edges": edges_out}
-    except Exception as e:
-        log.error(f"[graph/nodes] {e}")
-        return {"nodes": [], "edges": [], "error": str(e)}
-
-
-@app.get("/graph/{entity}")
-async def graph_neighbors(entity: str):
-    """
-    Return entities related to *entity* in the knowledge graph, with connection counts.
-
-    Example: GET /graph/bob  →  related entities Bob co-occurs with in stored facts.
-    """
-    neighbors = await graph_mod.get_entity_neighbors_with_counts(_redis, entity)
-    return {
-        "entity":    entity,
-        "neighbors": neighbors,
-        "count":     len(neighbors),
-    }
-
-
-@app.post("/graph/recall")
-async def graph_recall(req: GraphRecallRequest):
-    """
-    Retrieve facts from the knowledge graph neighbourhood of an entity.
-
-    Example: {"entity": "Bob", "k": 5}
-    → facts that mention Bob's related entities.
-    """
-    emb = _encode(req.entity)
-    facts = await graph_mod.entity_recall(_redis, req.entity, emb, k=req.k)
-    return {
-        "entity": req.entity,
-        "facts":  [{"content": f["content"], "score": f.get("score", 0.0)} for f in facts],
-        "count":  len(facts),
-    }
-
-
-# ── LLM Wiki v2 endpoints (v1.1) ─────────────────────────────────────────────
-
-@app.post("/graph/edge")
-async def add_graph_edge(req: TypedEdgeRequest):
-    """
-    Add a typed relationship edge between two entities.
-
-    LLM Wiki v2: typed relationships carry semantic weight.
-    Types: uses, depends_on, contradicts, caused, fixed, supersedes, related_to.
-    """
-    await graph_mod.add_typed_edge(
-        _redis, req.source_entity, req.target_entity,
-        req.relationship_type, req.confidence, req.source, req.bidirectional,
-    )
-    await _ws_broadcast("graph_edge", {
-        "source": req.source_entity, "target": req.target_entity,
-        "type": req.relationship_type, "confidence": req.confidence,
-    })
-    return {"status": "ok", "source": req.source_entity, "target": req.target_entity,
-            "type": req.relationship_type}
-
-
-@app.post("/graph/traverse")
-async def graph_traverse(req: TraverseRequest):
-    """
-    Walk outward through typed edges for impact analysis.
-
-    LLM Wiki v2: "Start at a node, walk outward through 'depends on' and 'uses'
-    edges, and find everything downstream."
-    """
-    results = await graph_mod.traverse(
-        _redis, req.entity, req.relationship_types,
-        req.max_depth, req.max_nodes,
-    )
-    return {"entity": req.entity, "nodes": results, "count": len(results)}
-
-
-@app.post("/facts/{element_id}/reinforce")
-async def reinforce_fact_endpoint(element_id: str, req: ReinforceRequest):
-    """
-    Reinforce a fact — increment source_count, reset Ebbinghaus decay.
-
-    LLM Wiki v2: "Confidence strengthens with reinforcement. Each reinforcement
-    resets the forgetting curve."
-    """
-    ok = await mem_store.reinforce_fact(_redis, element_id, req.source or None)
-    if not ok:
-        return {"status": "not_found", "element_id": element_id}
-    await _ws_broadcast("reinforce", {"element_id": element_id, "source": req.source})
-    return {"status": "ok", "element_id": element_id}
-
-
-@app.get("/facts/{element_id}/confidence")
-async def get_fact_confidence(element_id: str):
-    """
-    Get effective confidence for a fact (Ebbinghaus decay applied).
-
-    Returns both base confidence and effective confidence after decay.
-    """
-    try:
-        raw = await _redis.execute_command("VGETATTR", mem_store.FACT_KEY, element_id)
-        if not raw:
-            return {"error": "not_found", "element_id": element_id}
-        attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
-        eff = mem_store.confidence_decay(attrs)
-        return {
-            "element_id": element_id,
-            "base_confidence": attrs.get("confidence", 0.8),
-            "effective_confidence": eff,
-            "source_count": attrs.get("source_count", 1),
-            "last_confirmed_ts": attrs.get("last_confirmed_ts", 0),
-            "category": attrs.get("category", ""),
-            "version": attrs.get("version", 1),
-            "superseded_by": attrs.get("superseded_by", ""),
-            "superseded_reason": attrs.get("superseded_reason", ""),
-        }
-    except Exception as e:
-        return {"error": str(e), "element_id": element_id}
-
-
-@app.get("/lifecycle/stats")
-async def lifecycle_stats():
-    """
-    Return lifecycle statistics: confidence distribution, supersession counts,
-    version distribution, and category-level health.
-    """
-    card = await _redis.execute_command("VCARD", mem_store.FACT_KEY)
-    if not card or int(card) <= 1:
-        return {"total": 0}
-
-    seed = np.zeros(embedder.DIMS, dtype=np.float32)
-    results = await _redis.execute_command(
-        "VSIM", mem_store.FACT_KEY, "FP32", seed.tobytes(),
-        "COUNT", min(int(card), 500), "WITHSCORES", "WITHATTRIBS"
-    )
-
-    active = 0
-    superseded = 0
-    conf_buckets = {"high": 0, "medium": 0, "low": 0, "expired": 0}
-    reason_counts: dict[str, int] = {}
-    category_health: dict[str, dict] = {}
-
-    i = 0
-    while i + 2 < len(results):
-        raw = results[i + 2]
-        i += 3
-        try:
-            attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
-        except Exception:
-            continue
-        if attrs.get("_seed") or not attrs.get("content"):
-            continue
-
-        if attrs.get("superseded_by"):
-            superseded += 1
-            reason = attrs.get("superseded_reason", "unknown")
-            reason_counts[reason] = reason_counts.get(reason, 0) + 1
-            continue
-
-        active += 1
-        eff = mem_store.confidence_decay(attrs)
-        if eff >= 0.7:
-            conf_buckets["high"] += 1
-        elif eff >= 0.4:
-            conf_buckets["medium"] += 1
-        elif eff >= 0.1:
-            conf_buckets["low"] += 1
-        else:
-            conf_buckets["expired"] += 1
-
-        cat = attrs.get("category", "general")
-        if cat not in category_health:
-            category_health[cat] = {"count": 0, "avg_confidence": 0.0, "total_conf": 0.0}
-        category_health[cat]["count"] += 1
-        category_health[cat]["total_conf"] += eff
-
-    for cat in category_health:
-        c = category_health[cat]
-        c["avg_confidence"] = round(c["total_conf"] / max(1, c["count"]), 4)
-        del c["total_conf"]
-
-    return {
-        "total": active + superseded,
-        "active": active,
-        "superseded": superseded,
-        "confidence_distribution": conf_buckets,
-        "supersession_reasons": reason_counts,
-        "category_health": category_health,
-    }
-
-
-@app.post("/crystallize")
-async def crystallize(req: CrystallizeRequest):
-    """
-    Crystallize a session — distill it into a structured digest.
-
-    LLM Wiki v2: "Crystallization is the process of taking a completed chain of
-    work and automatically distilling it into a structured digest. What was the
-    question? What did we find? What entities were involved? What lessons emerged?"
-    """
-    scanned = await _vscan(_redis, mem_store.FACT_KEY, max_count=200)
-
-    facts = []
-    all_entities: set[str] = set()
-    for item in scanned:
-        attrs = item["attrs"]
-        if not attrs.get("content") or attrs.get("superseded_by"):
-            continue
-        facts.append(attrs)
-        for e in attrs.get("entities", []):
-            all_entities.add(e)
-        for p in attrs.get("persons", []):
-            all_entities.add(p)
-
-    # Sort by importance, take top N
-    facts.sort(key=lambda a: a.get("importance", 0.5), reverse=True)
-    top_facts = facts[:req.max_facts]
-
-    # Build digest
-    digest = {
-        "session_id": req.session_id,
-        "fact_count": len(top_facts),
-        "total_facts_available": len(facts),
-        "facts": [
-            {
-                "content": f.get("content", ""),
-                "category": f.get("category", ""),
-                "confidence": f.get("confidence", 0.8),
-                "effective_confidence": mem_store.confidence_decay(f),
-                "importance": f.get("importance", 0.5),
-                "source_count": f.get("source_count", 1),
-            }
-            for f in top_facts
-        ],
-        "entities": sorted(all_entities),
-        "categories": sorted(set(f.get("category", "") for f in top_facts)),
-        "crystallized_at": int(time.time() * 1000),
-    }
-
-    await _ws_broadcast("crystallize", {"session_id": req.session_id, "fact_count": len(top_facts)})
-    return digest
-
-
-# ── Config endpoint (v0.9.0) ──────────────────────────────────────────────────
-
-@app.get("/config")
-async def get_config():
-    """Return current service configuration including auto-consolidation settings."""
-    return {
-        "version":                 APP_VERSION,
-        "auto_consolidate_every":  _AUTO_CONSOLIDATE_EVERY,
-        "stores_since_last":       _stores_since_consolidation,
-        "periodic_interval_s":     3600,
-        "entropy_gate_threshold":  0.35,
-        "dedup_threshold":         0.95,
-        "consolidate_threshold":   0.85,
-        "session_ttl_s":           14400,
-    }
-
-
+# ── Consolidation logic now in services/consolidation_service.py ──────────────
 # ═══════════════════════════════════════════════════════════════════════════════
 # Absorbed agentmemory scaffold endpoints (no /agentmemory prefix)
 # These provide full compatibility with rohitg00/agentmemory hooks & MCP tools.
@@ -3463,87 +2004,7 @@ async def config_flags():
 
 
 # ── Automatic Crystallization Background Task ────────────────────────────────
-
-async def _crystallize_session_inline(session_id: str, session_obj: dict, max_facts: int = 20) -> dict | None:
-    """
-    Inline crystallization logic (same as /crystallize endpoint but without HTTP overhead).
-
-    Returns digest dict or None if crystallization fails.
-    """
-    try:
-        scanned = await _vscan(_redis, mem_store.FACT_KEY, max_count=200)
-
-        facts = []
-        all_entities: set[str] = set()
-        session_ts = session_obj.get("ts", 0)
-
-        for item in scanned:
-            attrs = item["attrs"]
-            if not attrs.get("content") or attrs.get("superseded_by"):
-                continue
-            fact_ts = attrs.get("ts", 0)
-            if abs(fact_ts - session_ts) < 3600000:  # within 1 hour
-                facts.append(attrs)
-                for e in attrs.get("entities", []):
-                    all_entities.add(e)
-                for p in attrs.get("persons", []):
-                    all_entities.add(p)
-        
-        if not facts:
-            return None
-        
-        # Sort by importance, take top N
-        facts.sort(key=lambda a: a.get("importance", 0.5), reverse=True)
-        top_facts = facts[:max_facts]
-        
-        # Generate summary using LLM (reuse existing summarizer)
-        # Note: Ensure 'summarizer' is imported or available in scope
-        fact_texts = [f.get("content", "") for f in top_facts[:10]]  # top 10 for summary
-        summary_prompt = (
-            "Summarize these key findings from a completed work session in 2-3 sentences. "
-            "Focus on what was accomplished, what was learned, and any important decisions made.\n\n"
-            + "\n".join(f"- {t}" for t in fact_texts)
-        )
-        
-        summary = ""
-        try:
-            from core import summarizer
-            summary = await summarizer.summarize(summary_prompt)
-        except ImportError:
-            summary = "Auto-crystallized session summary (summarizer unavailable)."
-        except Exception as e:
-            log.warning(f"[crystallize] summarization failed: {e}")
-            summary = "Auto-crystallized session summary (summarization error)."
-        
-        # Build digest
-        digest = {
-            "session_id": session_id,
-            "summary": summary[:500],
-            "fact_count": len(top_facts),
-            "total_facts_available": len(facts),
-            "facts": [
-                {
-                    "content": f.get("content", ""),
-                    "category": f.get("category", ""),
-                    "confidence": f.get("confidence", 0.8),
-                    "effective_confidence": mem_store.confidence_decay(f),
-                    "importance": f.get("importance", 0.5),
-                    "source_count": f.get("source_count", 1),
-                }
-                for f in top_facts
-            ],
-            "entities": sorted(all_entities)[:20],  # top 20 entities
-            "categories": sorted(set(f.get("category", "") for f in top_facts)),
-            "crystallized_at": int(time.time() * 1000),
-            "auto_crystallized": True,
-        }
-        
-        return digest
-    
-    except Exception as e:
-        log.warning(f"[crystallize] inline crystallization failed for {session_id}: {e}")
-        return None
-
+# _crystallize_session_inline now in services/consolidation_service.py
 
 async def _auto_crystallize() -> None:
     """
@@ -3645,6 +2106,11 @@ async def _auto_crystallize() -> None:
                         90 * 86400,
                         json.dumps(digest, ensure_ascii=False)
                     )
+                    # Maintain sorted-set index so /recall can use ZREVRANGE instead of SCAN
+                    await _redis.zadd(
+                        _CRYSTALLIZED_INDEX_KEY,
+                        {crystal_key: digest["crystallized_at"]},
+                    )
                     crystallized_count += 1
                     await _ws_broadcast("crystallize_auto", {
                         "session_id": session_id,
@@ -3657,831 +2123,6 @@ async def _auto_crystallize() -> None:
 
         except Exception as e:
             log.warning(f"[crystallize] auto-crystallization error: {e}", exc_info=True)
-
-
-# ── Session lifecycle (agentmemory hooks) ─────────────────────────────────────
-
-@app.post("/session/start")
-async def compat_session_start(req: CompatSessionStartRequest, request: Request):
-    auth_err = _compat_check_auth(request)
-    if auth_err:
-        return auth_err
-
-    sid = _compat_sid(req)
-    project = req.project or req.cwd or _os.getcwd()
-
-    session_key = f"mem:session:{sid}"
-    await _redis.set(session_key, json.dumps({
-        "session_id": sid,
-        "project": project,
-        "started_at": time.time(),
-        "observations": 0,
-    }), ex=14400)
-
-    persona_ctx = await persona_mod.get_context(_redis)
-
-    pinned_raw = await _redis.get("mem:pinned:session_summary")
-    last_summary = pinned_raw.decode() if pinned_raw else None
-
-    context_parts = []
-    if persona_ctx:
-        context_parts.append(persona_ctx)
-    if last_summary:
-        context_parts.append(f"## Last Session Summary\n{last_summary[:600]}")
-
-    context = "\n\n".join(context_parts) if context_parts else None
-
-    return {"status": "ok", "sessionId": sid, "context": context}
-
-
-@app.post("/session/end")
-async def compat_session_end(req: CompatSessionEndRequest, request: Request,
-                              background_tasks: BackgroundTasks):
-    auth_err = _compat_check_auth(request)
-    if auth_err:
-        return auth_err
-
-    sid = _compat_sid(req)
-
-    async def _do_end():
-        try:
-            await _do_compress_session(sid)
-        except Exception as e:
-            log.warning("[session/end] compress failed: %s", e)
-
-    background_tasks.add_task(_do_end)
-    return {"status": "ok", "sessionId": sid}
-
-
-# ── Observe (post-tool-use, prompt-submit, subagent hooks) ────────────────────
-
-@app.post("/observe")
-async def observe(req: ObserveRequest, request: Request, background_tasks: BackgroundTasks):
-    auth_err = _compat_check_auth(request)
-    if auth_err:
-        return auth_err
-
-    sid = _compat_sid(req)
-    project = req.project or req.cwd or ""
-    hook_type = req.hookType or "observe"
-    data = req.data or {}
-
-    async def _do_observe():
-        try:
-            await _observe_internal(sid, project, req.cwd or "", hook_type, data)
-        except Exception as e:
-            log.warning("[observe] background error: %s", e)
-
-    background_tasks.add_task(_do_observe)
-    return {"status": "ok"}
-
-
-# ── Summarize (stop hook) ─────────────────────────────────────────────────────
-
-@app.post("/summarize")
-async def compat_summarize(req: SummarizeRequest, request: Request,
-                            background_tasks: BackgroundTasks):
-    auth_err = _compat_check_auth(request)
-    if auth_err:
-        return auth_err
-
-    sid = _compat_sid(req)
-
-    async def _do_summarize():
-        try:
-            await _do_compress_session(sid)
-        except Exception as e:
-            log.warning("[summarize] compress failed: %s", e)
-
-    background_tasks.add_task(_do_summarize)
-    return {"status": "ok", "sessionId": sid}
-
-
-# ── Enrich (pre-tool-use hook) ────────────────────────────────────────────────
-
-@app.post("/enrich")
-async def enrich(req: EnrichRequest, request: Request):
-    auth_err = _compat_check_auth(request)
-    if auth_err:
-        return auth_err
-
-    files = req.files or []
-    query = req.query or ""
-
-    file_contexts = []
-    for f in files[:5]:
-        fname = _os.path.basename(f)
-        emb = _encode(fname)
-        results = await mem_store.knn_search(_redis, mem_store.FACT_KEY, emb, k=3)
-        for r in results:
-            attrs = r.get("attrs", {})
-            if attrs.get("content"):
-                file_contexts.append(attrs["content"][:200])
-
-    if query:
-        emb = _encode(query)
-        results = await mem_store.knn_search(_redis, mem_store.FACT_KEY, emb, k=5)
-        for r in results:
-            attrs = r.get("attrs", {})
-            if attrs.get("content"):
-                file_contexts.append(attrs["content"][:200])
-
-    context = "\n".join(file_contexts[:10]) if file_contexts else None
-    return {"status": "ok", "context": context}
-
-
-# ── Context (pre-compact hook) ────────────────────────────────────────────────
-
-@app.post("/context")
-async def compat_context(req: ContextRequest, request: Request):
-    auth_err = _compat_check_auth(request)
-    if auth_err:
-        return auth_err
-
-    sid = _compat_sid(req)
-    query = req.query or ""
-    budget = req.token_budget or 1500
-
-    persona_ctx = await persona_mod.get_context(_redis)
-    session_ctx = await mem_store.get_session_context(_redis, sid)
-
-    pinned_raw = await _redis.get("mem:pinned:session_summary")
-    last_summary = pinned_raw.decode() if pinned_raw else None
-
-    facts = []
-    episodes = []
-    if query:
-        emb = _encode(query)
-        facts = await mem_store.knn_search(_redis, mem_store.FACT_KEY, emb, k=8)
-        episodes = await mem_store.knn_search(_redis, mem_store.EPISODE_KEY, emb, k=6)
-
-    prepend = _format_prepend(
-        facts=facts,
-        episodes=episodes,
-        session_ctx=session_ctx,
-        persona_ctx=persona_ctx or "",
-        token_budget=budget,
-        last_session_summary=last_summary,
-    )
-
-    return {"status": "ok", "context": prepend}
-
-
-# ── Session commit (post-commit hook) ─────────────────────────────────────────
-
-@app.post("/session/commit")
-async def compat_session_commit(req: SessionCommitRequest, request: Request):
-    auth_err = _compat_check_auth(request)
-    if auth_err:
-        return auth_err
-
-    sid = _compat_sid(req)
-    commit_key = f"mem:commit:{req.sha}"
-    await _redis.hset(commit_key, mapping={
-        "sha": req.sha,
-        "message": req.message,
-        "branch": req.branch,
-        "repo": req.repo,
-        "session_id": sid,
-        "timestamp": str(int(time.time() * 1000)),
-    })
-
-    return {"status": "ok", "sha": req.sha}
-
-
-@app.get("/session/by-commit")
-async def session_by_commit(sha: str = ""):
-    if not sha:
-        return {"error": "sha parameter required"}
-
-    commit_key = f"mem:commit:{sha}"
-    data = await _redis.hgetall(commit_key)
-    if not data:
-        return {"error": "commit not found", "sha": sha}
-
-    result = {k.decode() if isinstance(k, bytes) else k:
-              v.decode() if isinstance(v, bytes) else v
-              for k, v in data.items()}
-    return result
-
-
-@app.get("/commits")
-async def commits(branch: str = "", repo: str = "", limit: int = 20):
-    _, keys = await _redis.scan(match="mem:commit:*", count=limit)
-    if not keys:
-        return {"commits": []}
-
-    # Batch fetch all commit data via pipeline (avoids N+1 round-trips)
-    pipe = _redis.pipeline(transaction=False)
-    for key in keys:
-        k = key.decode() if isinstance(key, bytes) else key
-        pipe.hgetall(k)
-    pipe_results = await pipe.execute()
-
-    results = []
-    for data in pipe_results:
-        if not data:
-            continue
-        entry = {dk.decode() if isinstance(dk, bytes) else dk:
-                 dv.decode() if isinstance(dv, bytes) else dv
-                 for dk, dv in data.items()}
-        if branch and entry.get("branch") != branch:
-            continue
-        if repo and entry.get("repo") != repo:
-            continue
-        results.append(entry)
-    results.sort(key=lambda x: x.get("timestamp", "0"), reverse=True)
-    return {"commits": results[:limit]}
-
-
-# ── Claude bridge sync ────────────────────────────────────────────────────────
-
-@app.post("/claude-bridge/sync")
-async def claude_bridge_sync(req: ClaudeBridgeSyncRequest, request: Request):
-    auth_err = _compat_check_auth(request)
-    if auth_err:
-        return auth_err
-
-    sid = _compat_sid(req)
-    project = req.project or req.cwd or ""
-
-    persona_ctx = await persona_mod.get_context(_redis)
-    session_ctx = await mem_store.get_session_context(_redis, sid)
-
-    pinned_raw = await _redis.get("mem:pinned:session_summary")
-    last_summary = pinned_raw.decode() if pinned_raw else None
-
-    emb = _encode(project or "project context")
-    facts = await mem_store.knn_search(_redis, mem_store.FACT_KEY, emb, k=10)
-    episodes = await mem_store.knn_search(_redis, mem_store.EPISODE_KEY, emb, k=6)
-
-    prepend = _format_prepend(
-        facts=facts,
-        episodes=episodes,
-        session_ctx=session_ctx,
-        persona_ctx=persona_ctx or "",
-        token_budget=2000,
-        last_session_summary=last_summary,
-    )
-
-    memory_md_path = _os.path.expanduser("~/.claude/AGENTMEM_MEMORY.md")
-    if prepend:
-        try:
-            _os.makedirs(_os.path.dirname(memory_md_path), exist_ok=True)
-            with open(memory_md_path, "w") as f:
-                f.write(prepend)
-        except Exception as e:
-            log.warning("[claude-bridge] write failed: %s", e)
-
-    return {"status": "ok", "memoryPath": memory_md_path if prepend else None}
-
-
-# ── Consolidate pipeline (session-end hook) ───────────────────────────────────
-
-@app.post("/consolidate-pipeline")
-async def compat_consolidate_pipeline(request: Request, background_tasks: BackgroundTasks):
-    auth_err = _compat_check_auth(request)
-    if auth_err:
-        return auth_err
-
-    async def _do_consolidate_compat():
-        try:
-            await _do_consolidate()
-        except Exception as e:
-            log.warning("[consolidate-pipeline] error: %s", e)
-
-    background_tasks.add_task(_do_consolidate_compat)
-    return {"status": "ok"}
-
-
-# ── Crystals auto (session-end hook) ──────────────────────────────────────────
-
-@app.post("/crystals/auto")
-async def crystals_auto(request: Request):
-    auth_err = _compat_check_auth(request)
-    if auth_err:
-        return auth_err
-    return {"status": "ok", "crystals": []}
-
-
-# ── Search (MCP memory_recall) ────────────────────────────────────────────────
-
-@app.post("/search")
-async def compat_search(req: SearchRequest, request: Request):
-    auth_err = _compat_check_auth(request)
-    if auth_err:
-        return auth_err
-
-    sid = _compat_sid(req)
-    emb = _encode(req.query)
-
-    facts = await mem_store.knn_search(_redis, mem_store.FACT_KEY, emb, k=req.limit)
-    episodes = await mem_store.knn_search(_redis, mem_store.EPISODE_KEY, emb, k=req.limit)
-
-    persona_ctx = await persona_mod.get_context(_redis)
-    session_ctx = await mem_store.get_session_context(_redis, sid)
-
-    pinned_raw = await _redis.get("mem:pinned:session_summary")
-    last_summary = pinned_raw.decode() if pinned_raw else None
-
-    budget = req.token_budget or 1500
-
-    if req.format == "compact":
-        results = []
-        for f in facts:
-            attrs = f.get("attrs", {})
-            results.append({
-                "content": f.get("content", "")[:200],
-                "category": attrs.get("category", ""),
-                "score": round(f.get("score", 0), 3),
-            })
-        for e in episodes:
-            attrs = e.get("attrs", {})
-            results.append({
-                "content": e.get("content", "")[:200],
-                "category": attrs.get("category", ""),
-                "score": round(e.get("score", 0), 3),
-            })
-        return {"results": results}
-
-    prepend = _format_prepend(
-        facts=facts, episodes=episodes,
-        session_ctx=session_ctx, persona_ctx=persona_ctx or "",
-        token_budget=budget, last_session_summary=last_summary,
-    )
-    return {"context": prepend, "facts": len(facts), "episodes": len(episodes)}
-
-
-# ── Remember (MCP memory_save) ────────────────────────────────────────────────
-
-@app.post("/remember")
-async def compat_remember(req: RememberRequest, request: Request):
-    auth_err = _compat_check_auth(request)
-    if auth_err:
-        return auth_err
-
-    content = req.content
-    emb = _encode(content)
-
-    uid = await mem_store.save_fact(
-        _redis,
-        content=content,
-        category=req.type or "fact",
-        confidence=0.8,
-        embedding=emb,
-        keywords=[c.strip() for c in req.concepts.split(",") if c.strip()] if req.concepts else None,
-        importance=0.8,
-    )
-
-    await _ws_broadcast("remember", {"id": uid, "type": req.type or "fact"})
-    return {"status": "ok", "id": uid}
-
-
-# ── Forget (MCP memory_forget) ────────────────────────────────────────────────
-
-@app.post("/forget")
-async def compat_forget(req: ForgetRequest, request: Request):
-    auth_err = _compat_check_auth(request)
-    if auth_err:
-        return auth_err
-
-    emb = _encode(req.query)
-    facts = await mem_store.knn_search(_redis, mem_store.FACT_KEY, emb, k=req.limit)
-
-    if req.dry_run:
-        return {
-            "status": "dry_run",
-            "would_delete": len(facts),
-            "memories": [f.get("content", "")[:100] for f in facts],
-        }
-
-    deleted = 0
-    for f in facts:
-        elem = f.get("_element", "")
-        if elem:
-            await _redis.execute_command("VREM", mem_store.FACT_KEY, elem)
-            deleted += 1
-
-    await _ws_broadcast("forget", {"deleted": deleted})
-    return {"status": "ok", "deleted": deleted}
-
-
-# ── Compress file ─────────────────────────────────────────────────────────────
-
-@app.post("/compress-file")
-async def compress_file(filePath: str = ""):
-    if not filePath or not _os.path.isfile(filePath):
-        return {"error": "file not found", "path": filePath}
-
-    try:
-        with open(filePath, "r") as f:
-            content = f.read()
-
-        backup_path = filePath.replace(".md", ".original.md")
-        if not _os.path.exists(backup_path):
-            with open(backup_path, "w") as f:
-                f.write(content)
-
-        lines = content.split("\n")
-        compressed = []
-        for line in lines:
-            stripped = line.strip()
-            if stripped.startswith("#") or stripped.startswith("http") or stripped.startswith("```"):
-                compressed.append(line)
-            elif stripped and len(stripped) > 20:
-                compressed.append(stripped[:120] + "…")
-            elif stripped:
-                compressed.append(line)
-
-        with open(filePath, "w") as f:
-            f.write("\n".join(compressed))
-
-        return {"status": "ok", "original_lines": len(lines), "compressed_lines": len(compressed)}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-# ── Sessions list ─────────────────────────────────────────────────────────────
-
-@app.get("/sessions")
-async def compat_sessions(limit: int = 20):
-    # Sessions are stored as mem:session:{id}:ctx (plain-text string, not JSON).
-    # Scan for :ctx keys to enumerate known session IDs.
-    _, ctx_keys = await _redis.scan(match="mem:session:*:ctx", count=500)
-    if not ctx_keys:
-        return {"sessions": []}
-
-    pipe = _redis.pipeline(transaction=False)
-    for key in ctx_keys:
-        pipe.get(key)
-    raw_values = await pipe.execute()
-
-    results = []
-    for key, raw in zip(ctx_keys, raw_values):
-        k = key.decode() if isinstance(key, bytes) else key
-        # Extract session ID from "mem:session:{id}:ctx"
-        parts = k.split(":")
-        sid = parts[2] if len(parts) >= 4 else k
-        ctx_str = (raw.decode() if isinstance(raw, bytes) else raw) or ""
-        results.append({
-            "session_id": sid,
-            "status": "ended",
-            "observation_count": 0,
-            "summary": ctx_str[:300] if ctx_str else None,
-        })
-
-    return {"sessions": results[:limit]}
-
-
-# ── Observations list ─────────────────────────────────────────────────────────
-
-@app.get("/observations")
-async def compat_observations(sessionId: str = "", limit: int = 20):
-    seed = np.zeros(embedder.DIMS, dtype=np.float32)
-    card = await _redis.execute_command("VCARD", mem_store.EPISODE_KEY)
-    if not card or int(card) <= 1:
-        return {"observations": []}
-
-    results_raw = await _redis.execute_command(
-        "VSIM", mem_store.EPISODE_KEY, "FP32", seed.astype("float32").tobytes(),
-        "COUNT", min(int(card), limit + 1), "WITHSCORES", "WITHATTRIBS"
-    )
-
-    items = []
-    i = 0
-    while i + 2 < len(results_raw):
-        elem = results_raw[i]
-        raw = results_raw[i + 2]
-        i += 3
-        elem_str = elem.decode() if isinstance(elem, bytes) else elem
-        if elem_str == "__seed__":
-            continue
-        try:
-            attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
-        except Exception:
-            continue
-        if sessionId and attrs.get("session_id") != sessionId:
-            continue
-        items.append({
-            "id": elem_str,
-            "content": attrs.get("content", "")[:300],
-            "session_id": attrs.get("session_id", ""),
-            "tool_name": attrs.get("tool_name", ""),
-            "timestamp": attrs.get("ts", 0),
-        })
-
-    return {"observations": items[:limit]}
-
-
-# ── File context ──────────────────────────────────────────────────────────────
-
-@app.post("/file-context")
-async def file_context(req: FileContextRequest, request: Request):
-    auth_err = _compat_check_auth(request)
-    if auth_err:
-        return auth_err
-
-    files = [f.strip() for f in req.files.split(",") if f.strip()]
-    sid = _compat_sid(req)
-
-    all_results = []
-    for f in files[:10]:
-        fname = _os.path.basename(f)
-        emb = _encode(fname)
-        results = await mem_store.knn_search(_redis, mem_store.EPISODE_KEY, emb, k=5,
-                                              filter_expr=f'.session_id != "{sid}"')
-        for r in results:
-            attrs = r.get("attrs", {})
-            all_results.append({
-                "file": f,
-                "content": attrs.get("content", "")[:300],
-                "session_id": attrs.get("session_id", ""),
-                "score": round(r.get("score", 0), 3),
-            })
-
-    return {"results": all_results}
-
-
-# ── Patterns ──────────────────────────────────────────────────────────────────
-
-@app.post("/patterns")
-async def compat_patterns(req: PatternsRequest, request: Request):
-    auth_err = _compat_check_auth(request)
-    if auth_err:
-        return auth_err
-
-    query = req.query or "recurring patterns"
-    emb = _encode(query)
-    facts = await mem_store.knn_search(_redis, mem_store.FACT_KEY, emb, k=req.limit)
-
-    categories = {}
-    for f in facts:
-        cat = f.get("attrs", {}).get("category", "unknown")
-        categories[cat] = categories.get(cat, 0) + 1
-
-    return {
-        "patterns": [{"category": k, "count": v} for k, v in
-                     sorted(categories.items(), key=lambda x: x[1], reverse=True)],
-        "memories": [{"content": f.get("content", "")[:200],
-                       "category": f.get("attrs", {}).get("category", "")}
-                      for f in facts[:req.limit]],
-    }
-
-
-# ── Smart search ──────────────────────────────────────────────────────────────
-
-@app.post("/smart-search")
-async def smart_search(req: SmartSearchRequest, request: Request):
-    auth_err = _compat_check_auth(request)
-    if auth_err:
-        return auth_err
-
-    emb = _encode(req.query)
-
-    facts = await mem_store.knn_search(_redis, mem_store.FACT_KEY, emb, k=req.limit)
-    episodes = await mem_store.knn_search(_redis, mem_store.EPISODE_KEY, emb, k=req.limit)
-
-    merged = _rrf_merge([facts, episodes], weights=[1.0, 0.8], limit=req.limit)
-
-    return {
-        "results": [{
-            "content": m.get("content", "")[:300],
-            "category": m.get("attrs", {}).get("category", ""),
-            "score": round(m.get("score", 0), 4),
-        } for m in merged],
-    }
-
-
-# ── Timeline ──────────────────────────────────────────────────────────────────
-
-@app.post("/timeline")
-async def compat_timeline(req: TimelineRequest, request: Request):
-    auth_err = _compat_check_auth(request)
-    if auth_err:
-        return auth_err
-
-    seed = np.zeros(embedder.DIMS, dtype=np.float32)
-    card = await _redis.execute_command("VCARD", mem_store.EPISODE_KEY)
-    if not card or int(card) <= 1:
-        return {"timeline": []}
-
-    results_raw = await _redis.execute_command(
-        "VSIM", mem_store.EPISODE_KEY, "FP32", seed.astype("float32").tobytes(),
-        "COUNT", min(int(card), req.limit + 1), "WITHSCORES", "WITHATTRIBS"
-    )
-
-    items = []
-    i = 0
-    while i + 2 < len(results_raw):
-        elem = results_raw[i]
-        raw = results_raw[i + 2]
-        i += 3
-        elem_str = elem.decode() if isinstance(elem, bytes) else elem
-        if elem_str == "__seed__":
-            continue
-        try:
-            attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
-        except Exception:
-            continue
-        sid = req.sessionId or req.session_id
-        if sid and attrs.get("session_id") != sid:
-            continue
-        items.append({
-            "id": elem_str,
-            "content": attrs.get("content", "")[:200],
-            "timestamp": attrs.get("ts", 0),
-            "session_id": attrs.get("session_id", ""),
-            "category": attrs.get("category", ""),
-        })
-
-    items.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
-    return {"timeline": items[:req.limit]}
-
-
-# ── Profile ───────────────────────────────────────────────────────────────────
-
-@app.get("/profile")
-async def compat_profile():
-    # Return raw persona hash fields (not the formatted markdown string)
-    persona_raw = await _redis.hgetall("mem:persona")
-    fields = {
-        (k.decode() if isinstance(k, bytes) else k): (v.decode() if isinstance(v, bytes) else v)
-        for k, v in persona_raw.items()
-    }
-    return {"profile": fields}
-
-
-# ── Export / Import ───────────────────────────────────────────────────────────
-
-@app.get("/export")
-async def compat_export():
-    export = {"version": "1.2.0", "exported_at": time.time(), "facts": [], "episodes": []}
-
-    for key, label in [(mem_store.FACT_KEY, "facts"), (mem_store.EPISODE_KEY, "episodes")]:
-        card = await _redis.execute_command("VCARD", key)
-        if not card or int(card) <= 1:
-            continue
-        seed = np.zeros(embedder.DIMS, dtype=np.float32)
-        results = await _redis.execute_command(
-            "VSIM", key, "FP32", seed.astype("float32").tobytes(),
-            "COUNT", min(int(card), 5000), "WITHSCORES", "WITHATTRIBS"
-        )
-        i = 0
-        while i + 2 < len(results):
-            elem = results[i]; raw = results[i + 2]; i += 3
-            elem_str = elem.decode() if isinstance(elem, bytes) else elem
-            if elem_str == "__seed__":
-                continue
-            try:
-                attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
-            except Exception:
-                continue
-            export[label].append({"id": elem_str, **attrs})
-
-    return export
-
-
-@app.post("/import")
-async def compat_import(req: ImportRequest, request: Request):
-    auth_err = _compat_check_auth(request)
-    if auth_err:
-        return auth_err
-
-    data = req.data
-    imported = 0
-
-    for item in data.get("episodes", []):
-        content = item.get("content", "")
-        if not content:
-            continue
-        emb = _encode(content)
-        await mem_store.save_episode(
-            _redis,
-            session_id=item.get("session_id", ""),
-            content=content,
-            embedding=emb,
-            ep_type=item.get("ep_type", item.get("category", "general")),
-        )
-        imported += 1
-
-    for item in data.get("facts", []):
-        content = item.get("content", "")
-        if not content:
-            continue
-        emb = _encode(content)
-        await mem_store.save_fact(
-            _redis,
-            content=content,
-            category=item.get("category", "fact"),
-            confidence=item.get("confidence", 0.7),
-            embedding=emb,
-            language=item.get("language", "en"),
-            domain=item.get("domain", "general"),
-            keywords=item.get("keywords"),
-            importance=item.get("importance", 0.5),
-        )
-        imported += 1
-
-    return {"status": "ok", "imported": imported}
-
-
-# ── Memories list ─────────────────────────────────────────────────────────────
-
-async def _list_memories(limit: int = 50, category: str = "") -> dict:
-    """Shared logic for listing memories (used by /memories and /semantic)."""
-    seed = np.zeros(embedder.DIMS, dtype=np.float32)
-    card = await _redis.execute_command("VCARD", mem_store.FACT_KEY)
-    if not card or int(card) <= 1:
-        return {"memories": []}
-
-    results_raw = await _redis.execute_command(
-        "VSIM", mem_store.FACT_KEY, "FP32", seed.astype("float32").tobytes(),
-        "COUNT", min(int(card), limit + 1), "WITHSCORES", "WITHATTRIBS"
-    )
-
-    items = []
-    i = 0
-    while i + 2 < len(results_raw):
-        elem = results_raw[i]; raw = results_raw[i + 2]; i += 3
-        elem_str = elem.decode() if isinstance(elem, bytes) else elem
-        if elem_str == "__seed__":
-            continue
-        try:
-            attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
-        except Exception:
-            continue
-        if category and attrs.get("category") != category:
-            continue
-        items.append({"id": elem_str, **attrs})
-
-    return {"memories": items[:limit]}
-
-
-@app.get("/memories")
-async def compat_memories(limit: int = 50, category: str = ""):
-    return await _list_memories(limit=limit, category=category)
-
-
-@app.get("/memories/{memory_id}")
-async def memory_detail(memory_id: str):
-    try:
-        raw = await _redis.execute_command("VGETATTR", mem_store.FACT_KEY, memory_id)
-        if raw:
-            attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
-            return {"id": memory_id, **attrs}
-    except Exception:
-        pass
-
-    try:
-        raw = await _redis.execute_command("VGETATTR", mem_store.EPISODE_KEY, memory_id)
-        if raw:
-            attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
-            return {"id": memory_id, **attrs}
-    except Exception:
-        pass
-
-    return {"error": "memory not found", "id": memory_id}
-
-
-# ── Semantic / Procedural / Relations (read-only list views) ──────────────────
-
-@app.get("/semantic")
-async def compat_semantic(limit: int = 50):
-    return await _list_memories(limit=limit)
-
-
-@app.get("/procedural")
-async def compat_procedural(limit: int = 50):
-    seed = np.zeros(embedder.DIMS, dtype=np.float32)
-    card = await _redis.execute_command("VCARD", mem_store.PROC_KEY)
-    if not card or int(card) <= 1:
-        return {"procedures": []}
-
-    results_raw = await _redis.execute_command(
-        "VSIM", mem_store.PROC_KEY, "FP32", seed.astype("float32").tobytes(),
-        "COUNT", min(int(card), limit + 1), "WITHSCORES", "WITHATTRIBS"
-    )
-
-    items = []
-    i = 0
-    while i + 2 < len(results_raw):
-        elem = results_raw[i]; raw = results_raw[i + 2]; i += 3
-        elem_str = elem.decode() if isinstance(elem, bytes) else elem
-        if elem_str == "__seed__":
-            continue
-        try:
-            attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
-        except Exception:
-            continue
-        items.append({"id": elem_str, **attrs})
-
-    return {"procedures": items[:limit]}
-
-
-@app.get("/relations")
-async def compat_relations():
-    stats = await graph_mod.graph_stats(_redis)
-    return {"relations": stats}
 
 
 # ── Viewer ────────────────────────────────────────────────────────────────────

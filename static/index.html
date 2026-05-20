@@ -58,6 +58,13 @@
       <div class="card"><div class="ch">Gauges</div><div id="gauge-area" class="cb"></div></div>
       <div class="card"><div class="ch">Recent Observations</div><div id="dash-obs" class="cb"></div></div>
     </div>
+    <div class="card" id="setup-card" style="margin-top:10px">
+      <div class="ch" style="cursor:pointer;user-select:none" onclick="toggleSetup()">
+        Setup &amp; Agent Config
+        <span id="setup-chevron" style="float:right;font-size:10px;color:var(--text3);transition:transform .2s">▼</span>
+      </div>
+      <div id="setup-body"></div>
+    </div>
   </section>
 
   <!-- GRAPH -->

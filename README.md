@@ -54,23 +54,23 @@ Comprehensive performance analysis available in [`benchmark/README.md`](benchmar
 |---------|:------------:|:-----------:|:-------------:|:---------------------:|:--------------------:|
 | **Type** | Memory engine + MCP server | Memory engine + MCP server | Memory layer API | Full agent runtime | Static file |
 | **Backend** | **Redis 8 HNSW + 6-tier** | SQLite + iii-engine | Qdrant / pgvector | Postgres + vector DB | None |
-| **Retrieval R@5** | **95.2%** | 95.2% | 68.5% (LoCoMo) | 83.2% (LoCoMo) | N/A (grep) |
+| **Retrieval R@5** | **95.2%**† | 95.2%† | 68.5%‡ (LoCoMo) | 83.2%‡ (LoCoMo) | N/A (grep) |
 | **Recall Latency P50** | **15ms** | ~50ms | ~50ms | ~200ms | 0ms (static) |
 | **Search Strategy** | **BM25 + Vector + Graph (wRRF)** | BM25 + Vector + Graph | Vector + Graph | Vector (archival) | Loads everything |
 | **Token Efficiency** | **~1,900 tokens/session** | ~1,900 tokens | Varies by integration | Core memory in context | 22K+ tokens @ 240 obs |
-| **External Dependencies** | **None** (self-contained) | None | Qdrant/pgvector required | Postgres + vector DB | None |
+| **External Dependencies** | **Redis** (local, embedded via launchd) | None | Qdrant/pgvector required | Postgres + vector DB | None |
 | **Self-hosted** | **Yes (default)** | Yes (default) | Optional | Optional | Yes |
 
 ### Intelligence & Automation
 
 | Feature | **AgentMem** | agentmemory | mem0 | Letta/MemGPT | CLAUDE.md |
 |---------|:------------:|:-----------:|:----:|:------------:|:---------:|
-| **Auto-capture** | **12 hooks (zero effort)** | 12 hooks | Manual `add()` calls | Agent self-edits | Manual editing |
+| **Auto-capture** | **5 hooks (zero effort)** | 5 hooks | Manual `add()` calls | Agent self-edits | Manual editing |
 | **Memory Lifecycle** | **4-tier consolidation + decay + auto-forget** | 4-tier consolidation | Passive extraction | Agent-managed | Manual pruning |
 | **Deduplication** | **A-MAC 5-factor gate** | A-MAC 5-factor gate | Basic hash check | None | None |
 | **Semantic Triples** | **✅ (subject, predicate, object)** | ✅ | ❌ | ❌ | ❌ |
 | **Knowledge Graph** | **✅ Auto-expansion** | ✅ | ✅ | ❌ | ❌ |
-| **Multi-agent Support** | **MCP + REST + leases + signals** | MCP + REST | API (no coordination) | Within Letta only | Per-agent files |
+| **Multi-agent Support** | **MCP + REST** | MCP + REST | API (no coordination) | Within Letta only | Per-agent files |
 | **Cross-session Continuity** | **✅ Pinned handoff bridge** | ✅ | Basic | Basic | ❌ |
 | **Tool Reliability Tracking** | **✅ ToolMem + TIG hints** | ✅ | ❌ | ❌ | ❌ |
 | **Procedural Memory** | **✅ How-to workflows** | ✅ | ❌ | ❌ | ❌ |
@@ -85,7 +85,7 @@ Comprehensive performance analysis available in [`benchmark/README.md`](benchmar
 | **LangChain/LangGraph** | **✅ Native adapter** | ✅ | Partial | ❌ | ❌ |
 | **CrewAI/AutoGen** | **✅ Native adapter** | ✅ | ❌ | ❌ | ❌ |
 | **MCP Server** | **✅ Full support** | ✅ | ❌ | ❌ | ❌ |
-| **Real-time Viewer** | **✅ Web UI (port 3113)** | ✅ Web UI | Cloud dashboard | Cloud dashboard | No |
+| **Real-time Viewer** | **✅ Web UI (port 18800)** | ✅ Web UI | Cloud dashboard | Cloud dashboard | No |
 | **Batch Operations** | **✅ batch_recall/store** | ✅ | ❌ | ❌ | ❌ |
 | **CJK/Chinese Support** | **✅ Full Unicode** | ✅ | Limited | Limited | Depends on model |
 
@@ -188,7 +188,9 @@ Query → Embed (MiniLM-L12) →
 → Token-budget greedy packing → <cross_session_memory>
 ```
 
-**Result:** 95.2% R@5 retrieval accuracy vs 68.5% for vector-only systems.
+**Result:** 95.2% R@5 retrieval recall on LongMemEval-S vs 86.2% BM25-only baseline.
+
+> †95.2% is **retrieval recall** on LongMemEval-S (no LLM reader). ‡Mem0/Letta figures are **end-to-end QA** on LoCoMo — a different benchmark and task type; not directly comparable.
 
 ### ♻️ Intelligent Lifecycle Management
 

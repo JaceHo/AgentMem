@@ -203,23 +203,23 @@ AgentMem top-10 results:
 |---------|:------------:|:-----------:|:-------------:|:-------------------:|:---------:|
 | **Type** | Memory engine + MCP | Memory engine + MCP | Memory layer API | Full agent runtime | Static file |
 | **Backend** | **Redis 8 HNSW + 6-tier** | SQLite + iii-engine | Qdrant / pgvector | Postgres + vector DB | None |
-| **Retrieval R@5** | **95.2%** | 95.2% | 68.5% (LoCoMo) | 83.2% (LoCoMo) | N/A (grep) |
+| **Retrieval R@5** | **95.2%**† | 95.2%† | 68.5%‡ (LoCoMo) | 83.2%‡ (LoCoMo) | N/A (grep) |
 | **Recall P50** | **15ms** | ~50ms | ~50ms | ~200ms | 0ms (static) |
 | **Search Strategy** | **BM25+Vector+Graph** | BM25+Vector+Graph | Vector+Graph | Vector (archival) | Loads all |
 | **Token Efficiency** | **~1,900/session** | ~1,900/session | Varies | Core in context | 22K+ @ 240 obs |
-| **External Deps** | **None** | None | Qdrant/pgvector req | Postgres + vector | None |
+| **External Deps** | **Redis** (local) | None | Qdrant/pgvector req | Postgres + vector | None |
 | **Self-hosted** | **Yes (default)** | Yes (default) | Optional | Optional | Yes |
 
 ### Intelligence & Automation
 
 | Feature | **AgentMem** | agentmemory | mem0 | Letta | CLAUDE.md |
 |---------|:------------:|:-----------:|:----:|:-----:|:---------:|
-| **Auto-capture** | **12 hooks (zero effort)** | 12 hooks | Manual add() | Agent self-edits | Manual editing |
+| **Auto-capture** | **5 hooks (zero effort)** | 5 hooks | Manual add() | Agent self-edits | Manual editing |
 | **Memory Lifecycle** | **4-tier consolidation** | 4-tier consolidation | Passive extraction | Agent-managed | Manual pruning |
 | **Deduplication** | **A-MAC 5-factor gate** | A-MAC 5-factor gate | Basic hash check | None | None |
 | **Semantic Triples** | **✅ (s,p,o)** | ✅ | ❌ | ❌ | ❌ |
 | **Knowledge Graph** | **✅ Auto-expansion** | ✅ | ✅ | ❌ | ❌ |
-| **Multi-agent** | **MCP+REST+leases** | MCP+REST | API (no coord) | Runtime only | Per-agent files |
+| **Multi-agent** | **MCP+REST** | MCP+REST | API (no coord) | Runtime only | Per-agent files |
 | **Cross-session** | **✅ Pinned handoff** | ✅ | Basic | Basic | ❌ |
 | **Tool Tracking** | **✅ ToolMem+TIG** | ✅ | ❌ | ❌ | ❌ |
 | **Procedural Mem** | **✅ How-to workflows** | ✅ | ❌ | ❌ | ❌ |
@@ -234,7 +234,7 @@ AgentMem top-10 results:
 | **LangChain/LangGraph** | **✅ Native** | ✅ | Partial | ❌ | ❌ |
 | **CrewAI/AutoGen** | **✅ Native** | ✅ | ❌ | ❌ | ❌ |
 | **MCP Server** | **✅ Full support** | ✅ | ❌ | ❌ | ❌ |
-| **Real-time Viewer** | **✅ Web UI :3113** | ✅ Web UI | Cloud dashboard | Cloud dashboard | No |
+| **Real-time Viewer** | **✅ Web UI :18800** | ✅ Web UI | Cloud dashboard | Cloud dashboard | No |
 | **Batch Operations** | **✅ batch_recall/store** | ✅ | ❌ | ❌ | ❌ |
 | **CJK/Chinese** | **✅ Full Unicode** | ✅ | Limited | Limited | Model-dependent |
 
@@ -246,6 +246,9 @@ AgentMem top-10 results:
 | **Data Privacy** | **✅ Fully local** | ✅ Fully local | ❌ Cloud | ✅ Local option | ✅ Local |
 | **Works Offline** | **✅ Yes** | ✅ Yes | ❌ No | ✅ Yes | ✅ Yes |
 | **Annual Cost** | **~$10 (electricity)** | ~$10 | $200–$1,200+ | $0 | $0 |
+
+> †AgentMem and agentmemory R@5 measured on **LongMemEval-S** (retrieval recall only, no LLM reader).
+> ‡Mem0 and Letta figures are **end-to-end QA accuracy** on **LoCoMo** — a different benchmark and task type. Not directly comparable.
 
 ---
 
