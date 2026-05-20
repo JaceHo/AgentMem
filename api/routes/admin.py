@@ -1,6 +1,5 @@
 """Admin routes — consolidation, crystallization, feedback, fact management, lifecycle."""
 
-import json
 import logging
 import time
 
@@ -9,8 +8,9 @@ from fastapi import APIRouter, BackgroundTasks
 
 from api import state
 from api.schemas.consolidation import CrystallizeRequest, FeedbackRequest
+from core import embedder
 from core import store as mem_store
-from core.search import BM25Index, encode
+from core.utils import decode_bytes, decode_attrs
 
 log = logging.getLogger("mem")
 router = APIRouter(tags=["admin"])
@@ -19,24 +19,24 @@ router = APIRouter(tags=["admin"])
 @router.post("/consolidate")
 async def consolidate(background_tasks: BackgroundTasks):
     """Trigger memory consolidation — merges similar facts to reduce redundancy."""
-    from main import _do_consolidate, _redis, _bm25_index, _spawn
-    background_tasks.add_task(_do_consolidate, _redis, _bm25_index, _spawn)
+    from services.consolidation_service import do_consolidate
+    background_tasks.add_task(do_consolidate, state.redis, state.bm25_index, state.spawn)
     return {"status": "consolidation_queued"}
 
 
 @router.post("/consolidate/sync")
 async def consolidate_sync():
     """Synchronous consolidation — returns results immediately."""
-    from main import _do_consolidate, _redis, _bm25_index, _spawn
-    result = await _do_consolidate(_redis, _bm25_index, _spawn)
+    from services.consolidation_service import do_consolidate
+    result = await do_consolidate(state.redis, state.bm25_index, state.spawn)
     return result
 
 
 @router.post("/consolidate/hard-prune")
 async def hard_prune(background_tasks: BackgroundTasks):
     """Physical VREM of soft-deleted entries (>7 days) and stale episodes (>180 days)."""
-    from main import _do_hard_prune, _redis, _bm25_index, _spawn
-    background_tasks.add_task(_do_hard_prune, _redis, _bm25_index, _spawn)
+    from services.consolidation_service import do_hard_prune
+    background_tasks.add_task(do_hard_prune, state.redis, state.bm25_index, state.spawn)
     return {"status": "hard_prune_queued"}
 
 
@@ -44,7 +44,6 @@ async def hard_prune(background_tasks: BackgroundTasks):
 async def admin_delete_facts_by_content(pattern: str = "Always send a report"):
     """Delete facts whose content contains the given pattern (admin only)."""
     r = state.redis
-    from main import embedder
     card = await r.execute_command("VCARD", mem_store.FACT_KEY)
     if not card or int(card) <= 1:
         return {"deleted": 0, "message": "no facts to scan"}
@@ -58,11 +57,11 @@ async def admin_delete_facts_by_content(pattern: str = "Always send a report"):
     i = 0
     while i + 2 < len(results):
         elem = results[i]; raw = results[i + 2]; i += 3
-        elem_str = elem.decode() if isinstance(elem, bytes) else elem
+        elem_str = decode_bytes(elem)
         if elem_str == "__seed__":
             continue
         try:
-            attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+            attrs = decode_attrs(raw)
         except Exception:
             continue
         content = attrs.get("content", "")
@@ -80,11 +79,9 @@ async def provide_feedback(req: FeedbackRequest):
         return {"error": "rating must be 1-5"}
 
     try:
-        raw = await r.execute_command("VGETATTR", mem_store.FACT_KEY, req.element_id)
-        if not raw:
+        attrs = await mem_store.get_attrs(r, mem_store.FACT_KEY, req.element_id)
+        if not attrs:
             return {"status": "not_found", "element_id": req.element_id}
-
-        attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
 
         if req.rating >= 4:
             old_importance = attrs.get("importance", 0.5)
@@ -94,10 +91,7 @@ async def provide_feedback(req: FeedbackRequest):
             if req.comment:
                 attrs["user_comment"] = req.comment[:500]
             await mem_store.reinforce_fact(r, req.element_id, source=f"user_feedback_{req.rating}")
-            await r.execute_command(
-                "VSETATTR", mem_store.FACT_KEY, req.element_id,
-                json.dumps(attrs, ensure_ascii=False)
-            )
+            await mem_store.set_attrs(r, mem_store.FACT_KEY, req.element_id, attrs)
             log.info(f"[feedback] positive rating {req.rating}/5 for {req.element_id}, "
                     f"importance {old_importance:.2f} → {attrs['importance']:.2f}")
             return {
@@ -113,10 +107,7 @@ async def provide_feedback(req: FeedbackRequest):
             attrs["needs_review"] = True
             if req.comment:
                 attrs["user_comment"] = req.comment[:500]
-            await r.execute_command(
-                "VSETATTR", mem_store.FACT_KEY, req.element_id,
-                json.dumps(attrs, ensure_ascii=False)
-            )
+            await mem_store.set_attrs(r, mem_store.FACT_KEY, req.element_id, attrs)
             log.info(f"[feedback] negative rating {req.rating}/5 for {req.element_id}, "
                     f"importance {old_importance:.2f} → {attrs['importance']:.2f}")
             return {
@@ -129,10 +120,7 @@ async def provide_feedback(req: FeedbackRequest):
             attrs["user_rating_ts"] = int(time.time() * 1000)
             if req.comment:
                 attrs["user_comment"] = req.comment[:500]
-            await r.execute_command(
-                "VSETATTR", mem_store.FACT_KEY, req.element_id,
-                json.dumps(attrs, ensure_ascii=False)
-            )
+            await mem_store.set_attrs(r, mem_store.FACT_KEY, req.element_id, attrs)
             return {
                 "status": "ok", "element_id": req.element_id,
                 "action": "recorded_neutral_rating"
@@ -148,19 +136,15 @@ async def pin_fact(element_id: str):
     """Pin fact permanently (importance = 1.0, never pruned)."""
     r = state.redis
     try:
-        raw = await r.execute_command("VGETATTR", mem_store.FACT_KEY, element_id)
-        if not raw:
+        attrs = await mem_store.get_attrs(r, mem_store.FACT_KEY, element_id)
+        if not attrs:
             return {"status": "not_found", "element_id": element_id}
 
-        attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
         attrs["pinned"] = True
         attrs["pinned_at"] = int(time.time() * 1000)
         attrs["importance"] = 1.0
 
-        await r.execute_command(
-            "VSETATTR", mem_store.FACT_KEY, element_id,
-            json.dumps(attrs, ensure_ascii=False)
-        )
+        await mem_store.set_attrs(r, mem_store.FACT_KEY, element_id, attrs)
         log.info(f"[pin] pinned fact {element_id}: {attrs.get('content', '')[:80]}")
         return {"status": "ok", "element_id": element_id, "action": "pinned_permanently"}
 
@@ -174,18 +158,17 @@ async def delete_fact(element_id: str):
     """User-initiated hard delete (immediate VREM)."""
     r = state.redis
     try:
-        raw = await r.execute_command("VGETATTR", mem_store.FACT_KEY, element_id)
-        if not raw:
+        attrs = await mem_store.get_attrs(r, mem_store.FACT_KEY, element_id)
+        if not attrs:
             return {"status": "not_found", "element_id": element_id}
 
-        attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
         content_preview = attrs.get("content", "")[:80]
 
         await r.execute_command("VREM", mem_store.FACT_KEY, element_id)
 
-        from main import _bm25_index, _populate_bm25_from_redis, _spawn
-        await _bm25_index.reset()
-        _spawn(_populate_bm25_from_redis(r), "bm25-rebuild-after-delete")
+        await state.bm25_index.reset()
+        from core.search import populate_bm25_from_redis
+        state.spawn(populate_bm25_from_redis(r, state.bm25_index), "bm25-rebuild-after-delete")
 
         log.info(f"[delete] user-deleted fact {element_id}: {content_preview}")
         return {"status": "ok", "element_id": element_id, "action": "hard_deleted"}
@@ -200,11 +183,10 @@ async def get_fact_metadata(element_id: str):
     """Get full metadata for a fact including user ratings, pins, lifecycle info."""
     r = state.redis
     try:
-        raw = await r.execute_command("VGETATTR", mem_store.FACT_KEY, element_id)
-        if not raw:
+        attrs = await mem_store.get_attrs(r, mem_store.FACT_KEY, element_id)
+        if not attrs:
             return {"status": "not_found", "element_id": element_id}
 
-        attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
         eff_conf = mem_store.confidence_decay(attrs)
 
         return {
@@ -235,7 +217,6 @@ async def get_fact_metadata(element_id: str):
 async def lifecycle_stats():
     """Return lifecycle statistics: confidence distribution, supersession counts, etc."""
     r = state.redis
-    from main import embedder
     card = await r.execute_command("VCARD", mem_store.FACT_KEY)
     if not card or int(card) <= 1:
         return {"total": 0}
@@ -256,7 +237,7 @@ async def lifecycle_stats():
     while i + 2 < len(results):
         raw = results[i + 2]; i += 3
         try:
-            attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+            attrs = decode_attrs(raw)
         except Exception:
             continue
         if attrs.get("_seed") or not attrs.get("content"):

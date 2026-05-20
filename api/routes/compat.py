@@ -18,17 +18,17 @@ from api.schemas.compat import (
     FileContextRequest, PatternsRequest, SmartSearchRequest,
     TimelineRequest, ClaudeBridgeSyncRequest, ImportRequest,
 )
+from core import embedder
 from core import persona as persona_mod
 from core import store as mem_store
 from core.search import encode
+from core.utils import decode_bytes, decode_attrs
+from services.store_service import (
+    format_prepend, do_compress_session, observe_internal, rrf_merge,
+)
 
 log = logging.getLogger("mem")
 router = APIRouter(tags=["compat"])
-
-
-# ── Internal helpers (referenced from main.py) ───────────────────────────────
-# _observe_internal and _format_prepend are still in main.py; these routes
-# call back into main.py via import. To avoid circular imports, we use lazy imports.
 
 
 @router.post("/session/start")
@@ -52,7 +52,7 @@ async def compat_session_start(req: CompatSessionStartRequest, request: Request)
     persona_ctx = await persona_mod.get_context(r)
 
     pinned_raw = await r.get("mem:pinned:session_summary")
-    last_summary = pinned_raw.decode() if pinned_raw else None
+    last_summary = decode_bytes(pinned_raw)
 
     context_parts = []
     if persona_ctx:
@@ -75,8 +75,7 @@ async def compat_session_end(req: CompatSessionEndRequest, request: Request,
 
     async def _do_end():
         try:
-            from main import _do_compress_session
-            await _do_compress_session(sid)
+            await do_compress_session(sid)
         except Exception as e:
             log.warning("[session/end] compress failed: %s", e)
 
@@ -97,8 +96,7 @@ async def observe(req: ObserveRequest, request: Request, background_tasks: Backg
 
     async def _do_observe():
         try:
-            from main import _observe_internal
-            await _observe_internal(sid, project, req.cwd or "", hook_type, data)
+            await observe_internal(sid, project, req.cwd or "", hook_type, data)
         except Exception as e:
             log.warning("[observe] background error: %s", e)
 
@@ -117,8 +115,7 @@ async def compat_summarize(req: SummarizeRequest, request: Request,
 
     async def _do_summarize():
         try:
-            from main import _do_compress_session
-            await _do_compress_session(sid)
+            await do_compress_session(sid)
         except Exception as e:
             log.warning("[summarize] compress failed: %s", e)
 
@@ -173,7 +170,7 @@ async def compat_context(req: ContextRequest, request: Request):
     session_ctx = await mem_store.get_session_context(r, sid)
 
     pinned_raw = await r.get("mem:pinned:session_summary")
-    last_summary = pinned_raw.decode() if pinned_raw else None
+    last_summary = decode_bytes(pinned_raw)
 
     facts = []
     episodes = []
@@ -182,8 +179,7 @@ async def compat_context(req: ContextRequest, request: Request):
         facts = await mem_store.knn_search(r, mem_store.FACT_KEY, emb, k=8)
         episodes = await mem_store.knn_search(r, mem_store.EPISODE_KEY, emb, k=6)
 
-    from main import _format_prepend
-    prepend = _format_prepend(
+    prepend = format_prepend(
         facts=facts, episodes=episodes,
         session_ctx=session_ctx, persona_ctx=persona_ctx or "",
         token_budget=budget, last_session_summary=last_summary,
@@ -220,8 +216,7 @@ async def session_by_commit(sha: str = ""):
     data = await r.hgetall(commit_key)
     if not data:
         return {"error": "commit not found", "sha": sha}
-    result = {k.decode() if isinstance(k, bytes) else k:
-              v.decode() if isinstance(v, bytes) else v
+    result = {decode_bytes(k): decode_bytes(v)
               for k, v in data.items()}
     return result
 
@@ -235,7 +230,7 @@ async def commits(branch: str = "", repo: str = "", limit: int = 20):
 
     pipe = r.pipeline(transaction=False)
     for key in keys:
-        k = key.decode() if isinstance(key, bytes) else key
+        k = decode_bytes(key)
         pipe.hgetall(k)
     pipe_results = await pipe.execute()
 
@@ -243,8 +238,7 @@ async def commits(branch: str = "", repo: str = "", limit: int = 20):
     for data in pipe_results:
         if not data:
             continue
-        entry = {dk.decode() if isinstance(dk, bytes) else dk:
-                 dv.decode() if isinstance(dv, bytes) else dv
+        entry = {decode_bytes(dk): decode_bytes(dv)
                  for dk, dv in data.items()}
         if branch and entry.get("branch") != branch:
             continue
@@ -269,14 +263,13 @@ async def claude_bridge_sync(req: ClaudeBridgeSyncRequest, request: Request):
     session_ctx = await mem_store.get_session_context(r, sid)
 
     pinned_raw = await r.get("mem:pinned:session_summary")
-    last_summary = pinned_raw.decode() if pinned_raw else None
+    last_summary = decode_bytes(pinned_raw)
 
     emb = encode(project or "project context")
     facts = await mem_store.knn_search(r, mem_store.FACT_KEY, emb, k=10)
     episodes = await mem_store.knn_search(r, mem_store.EPISODE_KEY, emb, k=6)
 
-    from main import _format_prepend, embedder
-    prepend = _format_prepend(
+    prepend = format_prepend(
         facts=facts, episodes=episodes,
         session_ctx=session_ctx, persona_ctx=persona_ctx or "",
         token_budget=2000, last_session_summary=last_summary,
@@ -302,8 +295,8 @@ async def compat_consolidate_pipeline(request: Request, background_tasks: Backgr
 
     async def _do_consolidate_compat():
         try:
-            from main import _do_consolidate, _redis, _bm25_index, _spawn
-            await _do_consolidate(_redis, _bm25_index, _spawn)
+            from services.consolidation_service import do_consolidate
+            await do_consolidate(state.redis, state.bm25_index, state.spawn)
         except Exception as e:
             log.warning("[consolidate-pipeline] error: %s", e)
 
@@ -336,7 +329,7 @@ async def compat_search(req: SearchRequest, request: Request):
     session_ctx = await mem_store.get_session_context(r, sid)
 
     pinned_raw = await r.get("mem:pinned:session_summary")
-    last_summary = pinned_raw.decode() if pinned_raw else None
+    last_summary = decode_bytes(pinned_raw)
 
     budget = req.token_budget or 1500
 
@@ -358,8 +351,7 @@ async def compat_search(req: SearchRequest, request: Request):
             })
         return {"results": results}
 
-    from main import _format_prepend
-    prepend = _format_prepend(
+    prepend = format_prepend(
         facts=facts, episodes=episodes,
         session_ctx=session_ctx, persona_ctx=persona_ctx or "",
         token_budget=budget, last_session_summary=last_summary,
@@ -458,10 +450,10 @@ async def compat_sessions(limit: int = 20):
 
     results = []
     for key, raw in zip(ctx_keys, raw_values):
-        k = key.decode() if isinstance(key, bytes) else key
+        k = decode_bytes(key)
         parts = k.split(":")
         sid = parts[2] if len(parts) >= 4 else k
-        ctx_str = (raw.decode() if isinstance(raw, bytes) else raw) or ""
+        ctx_str = decode_bytes(raw) or ""
         results.append({
             "session_id": sid,
             "status": "ended",
@@ -474,7 +466,6 @@ async def compat_sessions(limit: int = 20):
 @router.get("/observations")
 async def compat_observations(sessionId: str = "", limit: int = 20):
     r = state.redis
-    from main import embedder
     seed = np.zeros(embedder.DIMS, dtype=np.float32)
     card = await r.execute_command("VCARD", mem_store.EPISODE_KEY)
     if not card or int(card) <= 1:
@@ -489,11 +480,11 @@ async def compat_observations(sessionId: str = "", limit: int = 20):
     i = 0
     while i + 2 < len(results_raw):
         elem = results_raw[i]; raw = results_raw[i + 2]; i += 3
-        elem_str = elem.decode() if isinstance(elem, bytes) else elem
+        elem_str = decode_bytes(elem)
         if elem_str == "__seed__":
             continue
         try:
-            attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+            attrs = decode_attrs(raw)
         except Exception:
             continue
         if sessionId and attrs.get("session_id") != sessionId:
@@ -571,8 +562,7 @@ async def smart_search(req: SmartSearchRequest, request: Request):
     facts = await mem_store.knn_search(r, mem_store.FACT_KEY, emb, k=req.limit)
     episodes = await mem_store.knn_search(r, mem_store.EPISODE_KEY, emb, k=req.limit)
 
-    from main import _rrf_merge
-    merged = _rrf_merge([facts, episodes], weights=[1.0, 0.8], limit=req.limit)
+    merged = rrf_merge([facts, episodes], weights=[1.0, 0.8], limit=req.limit)
 
     return {
         "results": [{
@@ -590,7 +580,6 @@ async def compat_timeline(req: TimelineRequest, request: Request):
         return auth_err
 
     r = state.redis
-    from main import embedder
     seed = np.zeros(embedder.DIMS, dtype=np.float32)
     card = await r.execute_command("VCARD", mem_store.EPISODE_KEY)
     if not card or int(card) <= 1:
@@ -605,11 +594,11 @@ async def compat_timeline(req: TimelineRequest, request: Request):
     i = 0
     while i + 2 < len(results_raw):
         elem = results_raw[i]; raw = results_raw[i + 2]; i += 3
-        elem_str = elem.decode() if isinstance(elem, bytes) else elem
+        elem_str = decode_bytes(elem)
         if elem_str == "__seed__":
             continue
         try:
-            attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+            attrs = decode_attrs(raw)
         except Exception:
             continue
         sid = req.sessionId or req.session_id
@@ -630,6 +619,8 @@ async def compat_timeline(req: TimelineRequest, request: Request):
 @router.get("/profile")
 async def compat_profile():
     r = state.redis
+    if r is None:
+        return {"profile": {}}
     persona_raw = await r.hgetall("mem:persona")
     fields = {
         (k.decode() if isinstance(k, bytes) else k): (v.decode() if isinstance(v, bytes) else v)
@@ -641,7 +632,6 @@ async def compat_profile():
 @router.get("/export")
 async def compat_export():
     r = state.redis
-    from main import embedder
     export = {"version": "1.2.0", "exported_at": time.time(), "facts": [], "episodes": []}
 
     for key, label in [(mem_store.FACT_KEY, "facts"), (mem_store.EPISODE_KEY, "episodes")]:
@@ -656,11 +646,11 @@ async def compat_export():
         i = 0
         while i + 2 < len(results):
             elem = results[i]; raw = results[i + 2]; i += 3
-            elem_str = elem.decode() if isinstance(elem, bytes) else elem
+            elem_str = decode_bytes(elem)
             if elem_str == "__seed__":
                 continue
             try:
-                attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+                attrs = decode_attrs(raw)
             except Exception:
                 continue
             export[label].append({"id": elem_str, **attrs})
@@ -716,7 +706,6 @@ async def compat_import(req: ImportRequest, request: Request):
 async def _list_memories(limit: int = 50, category: str = "") -> dict:
     """Shared logic for listing memories."""
     r = state.redis
-    from main import embedder
     seed = np.zeros(embedder.DIMS, dtype=np.float32)
     card = await r.execute_command("VCARD", mem_store.FACT_KEY)
     if not card or int(card) <= 1:
@@ -731,11 +720,11 @@ async def _list_memories(limit: int = 50, category: str = "") -> dict:
     i = 0
     while i + 2 < len(results_raw):
         elem = results_raw[i]; raw = results_raw[i + 2]; i += 3
-        elem_str = elem.decode() if isinstance(elem, bytes) else elem
+        elem_str = decode_bytes(elem)
         if elem_str == "__seed__":
             continue
         try:
-            attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+            attrs = decode_attrs(raw)
         except Exception:
             continue
         if category and attrs.get("category") != category:
@@ -756,7 +745,7 @@ async def memory_detail(memory_id: str):
     try:
         raw = await r.execute_command("VGETATTR", mem_store.FACT_KEY, memory_id)
         if raw:
-            attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+            attrs = decode_attrs(raw)
             return {"id": memory_id, **attrs}
     except Exception:
         pass
@@ -764,7 +753,7 @@ async def memory_detail(memory_id: str):
     try:
         raw = await r.execute_command("VGETATTR", mem_store.EPISODE_KEY, memory_id)
         if raw:
-            attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+            attrs = decode_attrs(raw)
             return {"id": memory_id, **attrs}
     except Exception:
         pass
@@ -780,7 +769,6 @@ async def compat_semantic(limit: int = 50):
 @router.get("/procedural")
 async def compat_procedural(limit: int = 50):
     r = state.redis
-    from main import embedder
     seed = np.zeros(embedder.DIMS, dtype=np.float32)
     card = await r.execute_command("VCARD", mem_store.PROC_KEY)
     if not card or int(card) <= 1:
@@ -795,11 +783,11 @@ async def compat_procedural(limit: int = 50):
     i = 0
     while i + 2 < len(results_raw):
         elem = results_raw[i]; raw = results_raw[i + 2]; i += 3
-        elem_str = elem.decode() if isinstance(elem, bytes) else elem
+        elem_str = decode_bytes(elem)
         if elem_str == "__seed__":
             continue
         try:
-            attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+            attrs = decode_attrs(raw)
         except Exception:
             continue
         items.append({"id": elem_str, **attrs})

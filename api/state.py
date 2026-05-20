@@ -1,17 +1,19 @@
 """
-Application state singletons — shared across all route modules.
+Application state singletons — single source of truth for all runtime state.
 
 This module owns the runtime singletons (Redis client, embedder, store, etc.)
-that are initialized during lifespan startup and accessed by route handlers.
+that are initialized during lifespan startup and accessed by route handlers
+and service modules.
 
-Route modules import from here instead of from main.py, breaking the
-circular-import problem that occurs when routes import from the app module
+Route modules and services import from here instead of from main.py, breaking
+the circular-import problem that occurs when routes import from the app module
 that also registers them.
 """
 
 import logging
 
 from concurrency import AtomicCounter, AtomicFloat, TaskManager
+from config.settings import settings
 from core import embedder
 from core import store as mem_store
 from core import graph as graph_mod
@@ -32,9 +34,9 @@ log = logging.getLogger("mem")
 redis = None                          # aioredis.Redis — set during lifespan
 
 # ── Task manager for fire-and-forget background work ──────────────────────────
-task_manager = TaskManager(max_concurrent=10)
+task_manager = TaskManager(max_concurrent=settings.bg_task_limit)
 
-AUTO_CONSOLIDATE_EVERY = 50           # override from settings in lifespan
+AUTO_CONSOLIDATE_EVERY = settings.auto_consolidate_every
 
 
 def spawn(coro, name: str = "bg") -> None:
@@ -53,3 +55,7 @@ store_latency_sum_ms = AtomicFloat()
 
 # ── BM25 in-memory index ──────────────────────────────────────────────────────
 bm25_index = BM25Index()
+
+# ── Redis key constants (shared across services and routes) ───────────────────
+PINNED_SESSION_KEY = "mem:pinned:session_summary"
+CRYSTALLIZED_INDEX_KEY = "mem:crystallized_index"

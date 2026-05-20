@@ -1,6 +1,5 @@
 """Graph routes — knowledge graph, typed edges, traversal, confidence."""
 
-import json
 import logging
 
 from fastapi import APIRouter
@@ -12,6 +11,7 @@ from api.schemas.graph import (
 from core import graph as graph_mod
 from core import store as mem_store
 from core.search import encode
+from core.utils import decode_bytes, decode_attrs
 
 log = logging.getLogger("mem")
 router = APIRouter(tags=["graph"])
@@ -35,7 +35,7 @@ async def graph_nodes_endpoint(limit: int = 60):
         prefix = graph_mod.GRAPH_PREFIX
         all_keys = []
         async for key in r.scan_iter(f"{prefix}*", count=500):
-            all_keys.append(key.decode() if isinstance(key, bytes) else key)
+            all_keys.append(decode_bytes(key))
 
         if not all_keys:
             return {"nodes": [], "edges": []}
@@ -68,7 +68,7 @@ async def graph_nodes_endpoint(limit: int = 60):
             if not isinstance(members, (set, list)):
                 continue
             for m in members:
-                nb = m.decode() if isinstance(m, bytes) else m
+                nb = decode_bytes(m)
                 pair = (min(slug, nb), max(slug, nb))
                 if pair not in seen_edges:
                     seen_edges.add(pair)
@@ -139,7 +139,7 @@ async def get_fact_confidence(element_id: str):
         raw = await r.execute_command("VGETATTR", mem_store.FACT_KEY, element_id)
         if not raw:
             return {"error": "not_found", "element_id": element_id}
-        attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+        attrs = decode_attrs(raw)
         eff = mem_store.confidence_decay(attrs)
         return {
             "element_id": element_id,

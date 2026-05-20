@@ -703,3 +703,21 @@ async def vcard(r: aioredis.Redis) -> dict:
     fact = await r.execute_command("VCARD", FACT_KEY)
     return {"episodes": max(0, int(ep or 0) - 1),
             "facts":    max(0, int(fact or 0) - 1)}
+
+
+async def get_attrs(r: aioredis.Redis, vset: str, element_id: str) -> dict | None:
+    """Fetch and decode VGETATTR for an element. Returns dict or None if not found.
+
+    Replaces the 13+ copy-paste VGETATTR+decode patterns across route modules.
+    """
+    from .utils import decode_attrs
+    raw = await r.execute_command("VGETATTR", vset, element_id)
+    if not raw:
+        return None
+    attrs = decode_attrs(raw)
+    return attrs if attrs else None
+
+
+async def set_attrs(r: aioredis.Redis, vset: str, element_id: str, attrs: dict) -> None:
+    """Encode and write VSETATTR for an element."""
+    await r.execute_command("VSETATTR", vset, element_id, json.dumps(attrs, ensure_ascii=False))

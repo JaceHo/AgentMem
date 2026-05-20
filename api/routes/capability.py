@@ -17,6 +17,7 @@ from core import persona as persona_mod
 from core import scene as scene_mod
 from core import store as mem_store
 from core.search import encode
+from core.utils import decode_bytes, decode_attrs
 
 log = logging.getLogger("mem")
 router = APIRouter(tags=["capability"])
@@ -125,11 +126,11 @@ async def recall_procedures(req: RecallToolsRequest):
     while i + 2 < len(results):
         elem = results[i]; score = results[i+1]; raw = results[i+2]
         i += 3
-        elem_str = elem.decode() if isinstance(elem, bytes) else elem
+        elem_str = decode_bytes(elem)
         if elem_str == "__seed__":
             continue
         try:
-            attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+            attrs = decode_attrs(raw)
         except Exception:
             continue
         if attrs.get("_seed") or not attrs.get("task"):
@@ -193,7 +194,7 @@ async def tool_feedback(req: ToolFeedbackRequest):
         return {"ok": False, "reason": "tool not found"}
 
     try:
-        attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+        attrs = decode_attrs(raw)
     except Exception:
         return {"ok": False, "reason": "parse error"}
 
@@ -259,7 +260,7 @@ async def tool_graph(tool_name: str, k: int = 5):
     prefix = f"{elem_key}:"
     trans: dict[str, int] = {}
     for k_b, v_b in all_entries.items():
-        key_s = k_b.decode() if isinstance(k_b, bytes) else k_b
+        key_s = decode_bytes(k_b)
         if key_s.startswith(prefix):
             target = key_s[len(prefix):]
             trans[target] = int(v_b)
@@ -289,7 +290,7 @@ async def detect_meta_tools(threshold: int = 5, background_tasks: BackgroundTask
 
     adj: dict[str, dict[str, int]] = {}
     for k_b, v_b in all_entries.items():
-        key_s = k_b.decode() if isinstance(k_b, bytes) else k_b
+        key_s = decode_bytes(k_b)
         val = int(v_b) if v_b else 0
         if ":" not in key_s:
             continue
@@ -377,11 +378,11 @@ async def procedure_feedback(req: ProcedureFeedbackRequest):
     while idx + 2 < len(results):
         elem = results[idx]; score = results[idx+1]; raw = results[idx+2]
         idx += 3
-        elem_str = elem.decode() if isinstance(elem, bytes) else elem
+        elem_str = decode_bytes(elem)
         if elem_str == "__seed__":
             continue
         try:
-            attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+            attrs = decode_attrs(raw)
         except Exception:
             continue
         if attrs.get("_seed") or not attrs.get("task"):
@@ -430,7 +431,7 @@ async def tool_procedures(tool_name: str):
         if not raw:
             continue
         try:
-            attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+            attrs = decode_attrs(raw)
         except Exception:
             continue
         if not attrs.get("task"):

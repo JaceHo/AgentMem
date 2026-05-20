@@ -15,6 +15,8 @@ v0.9.7 quality hardening:
 import re
 import redis.asyncio as aioredis
 
+from .utils import decode_bytes
+
 PERSONA_KEY = "mem:persona"
 
 _FACT_TO_FIELD: dict[str, str] = {
@@ -201,7 +203,7 @@ async def update(r: aioredis.Redis, category: str, content: str) -> None:
 
     existing_raw = await r.hget(PERSONA_KEY, field)
     existing_entries = _parse_entries(
-        existing_raw.decode() if isinstance(existing_raw, bytes) else (existing_raw or "")
+        decode_bytes(existing_raw)
     )
 
     if _is_duplicate(content, existing_entries):
@@ -226,13 +228,13 @@ async def get_context(r: aioredis.Redis) -> str:
         key_b = field.encode()
         val = raw.get(key_b) or raw.get(field)
         if val:
-            v = val.decode() if isinstance(val, bytes) else val
+            v = decode_bytes(val)
             lines.append(f"- {field}: {v}")
             seen.add(field)
     for k, v in raw.items():
-        k_str = k.decode() if isinstance(k, bytes) else k
+        k_str = decode_bytes(k)
         if k_str not in seen:
-            v_str = v.decode() if isinstance(v, bytes) else v
+            v_str = decode_bytes(v)
             lines.append(f"- {k_str}: {v_str}")
 
     return "\n".join(lines)

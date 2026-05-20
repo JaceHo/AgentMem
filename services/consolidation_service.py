@@ -22,7 +22,7 @@ import numpy as np
 
 from core import extractor
 from core import store as mem_store
-from core.search import BM25Index, encode, vscan
+from core.search import BM25Index, encode, vscan, populate_bm25_from_redis
 
 log = logging.getLogger("mem")
 
@@ -204,7 +204,7 @@ async def do_consolidate(
     # ── Post-consolidation: invalidate BM25 index ─────────────────────────────
     if superseded_elements:
         await bm25_index.reset()
-        spawn_fn(_populate_bm25_from_redis(redis), "bm25-rebuild")
+        spawn_fn(populate_bm25_from_redis(redis, bm25_index), "bm25-rebuild")
 
     ms = int((time.time() - t0) * 1000)
     log.info(
@@ -269,7 +269,7 @@ async def do_hard_prune(redis, bm25_index: BM25Index, spawn_fn) -> dict:
 
     if removed_facts > 0:
         await bm25_index.reset()
-        spawn_fn(_populate_bm25_from_redis(redis), "bm25-rebuild")
+        spawn_fn(populate_bm25_from_redis(redis, bm25_index), "bm25-rebuild")
 
     ms = int((time.time() - t0) * 1000)
     log.info(f"[hard_prune] removed facts={removed_facts} episodes={removed_eps} {ms}ms")
@@ -448,9 +448,3 @@ async def crystallize_session_inline(
     except Exception as e:
         log.warning(f"[crystallize] inline crystallization failed for {session_id}: {e}")
         return None
-
-
-async def _populate_bm25_from_redis(redis) -> list[dict]:
-    """Scan all facts from Redis for BM25 index rebuilding."""
-    items = await vscan(redis, mem_store.FACT_KEY, max_count=500)
-    return items

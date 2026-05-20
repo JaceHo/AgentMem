@@ -12,6 +12,7 @@ from functools import lru_cache
 import numpy as np
 
 from core import embedder
+from core.utils import decode_bytes, decode_attrs
 
 try:
     from rank_bm25 import BM25Okapi as _BM25Okapi
@@ -60,11 +61,11 @@ async def vscan(r, vset_key: str, max_count: int = 200) -> list[dict]:
         score = results[i + 1]
         raw = results[i + 2]
         i += 3
-        elem_str = elem.decode() if isinstance(elem, bytes) else elem
+        elem_str = decode_bytes(elem)
         if elem_str == "__seed__":
             continue
         try:
-            attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+            attrs = decode_attrs(raw)
         except Exception:
             continue
         if attrs.get("_seed"):
@@ -200,3 +201,20 @@ class BM25Index:
             self._bm25 = None
             self._built_at_len = 0
             self._rebuilding = False
+
+
+async def populate_bm25_from_redis(r, bm25_index: BM25Index) -> None:
+    """Load all existing facts from Redis into the in-memory BM25 corpus on startup."""
+    if not BM25_AVAILABLE:
+        return
+    try:
+        from core import store as mem_store
+        scanned = await vscan(r, mem_store.FACT_KEY, max_count=5000)
+        items = [
+            {"_element": item["element"], "content": item["attrs"]["content"], "attrs": item["attrs"]}
+            for item in scanned
+            if item["attrs"].get("content") and not item["attrs"].get("superseded_by")
+        ]
+        await bm25_index.populate_from_items(items)
+    except Exception:
+        pass

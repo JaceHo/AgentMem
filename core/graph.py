@@ -28,7 +28,7 @@ from collections import deque
 
 import redis.asyncio as aioredis
 
-from .utils import decode_json, force_str
+from .utils import decode_json, decode_bytes, force_str
 
 log = logging.getLogger(__name__)
 
@@ -337,13 +337,13 @@ async def get_related(
             raw_edges = await r.hgetall(_key_from_slug(slug))
             if raw_edges:
                 members = {
-                    k.decode() if isinstance(k, bytes) else k
+                    decode_bytes(k)
                     for k in raw_edges.keys()
                 }
             else:
                 # Fallback: legacy Set-based edges (v0.9.0)
                 members_raw = await r.smembers(_key_from_slug(slug))
-                members = {m.decode() if isinstance(m, bytes) else m for m in members_raw}
+                members = {decode_bytes(m) for m in members_raw}
             next_frontier |= members - visited - frontier
         visited |= frontier
         frontier = next_frontier
@@ -419,7 +419,7 @@ async def graph_stats(r: aioredis.Redis) -> dict:
 
     # Batch size lookups via pipeline — raise_on_error=False so WRONGTYPE errors
     # on legacy Set keys come back as ResponseError objects instead of raising.
-    key_strs = [key.decode() if isinstance(key, bytes) else key for key in node_keys]
+    key_strs = [decode_bytes(key) for key in node_keys]
     pipe = r.pipeline(transaction=False)
     for ks in key_strs:
         pipe.hlen(ks)
@@ -577,9 +577,9 @@ async def get_entity_neighbors_with_counts(
         # Parse edges first
         parsed: list[tuple[str, dict]] = []
         for neighbour_raw, edge_raw in sorted(raw_edges.items(), key=lambda x: x[0]):
-            slug = neighbour_raw.decode() if isinstance(neighbour_raw, bytes) else neighbour_raw
+            slug = decode_bytes(neighbour_raw)
             try:
-                edge = json.loads(edge_raw.decode() if isinstance(edge_raw, bytes) else edge_raw)
+                edge = decode_json(edge_raw)
             except (json.JSONDecodeError, UnicodeDecodeError):
                 edge = {"type": "related_to", "confidence": 0.5, "source_count": 1}
             parsed.append((slug, edge))
@@ -607,7 +607,7 @@ async def get_entity_neighbors_with_counts(
     # Fallback: legacy Set-based edges (v0.9.0)
     related_slugs_raw = await r.smembers(_key(entity))
     related_slugs = [
-        (m.decode() if isinstance(m, bytes) else m) for m in related_slugs_raw
+        decode_bytes(m) for m in related_slugs_raw
     ]
     # Batch connection count lookups via pipeline
     if related_slugs:

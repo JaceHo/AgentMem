@@ -105,10 +105,12 @@ from api.schemas.consolidation import (
 )
 
 # ── Search utilities (extracted to core/search.py) ───────────────────────────
-from core.search import BM25Index, encode as _encode, vscan as _vscan, BM25_AVAILABLE as _BM25_AVAILABLE
+from core.search import encode as _encode, vscan as _vscan, populate_bm25_from_redis
+
+# ── Shared state (single source of truth) ────────────────────────────────────
+from api import state
 
 # ── Import refactored modules ────────────────────────────────────────────────
-from concurrency import AtomicCounter, AtomicFloat, TaskManager
 from config.settings import settings
 from utils.text_processing import (
     flatten_message_content,
@@ -148,7 +150,6 @@ from services.consolidation_service import (
     do_consolidate as _do_consolidate,
     do_hard_prune as _do_hard_prune,
     crystallize_session_inline as _crystallize_session_inline,
-    _populate_bm25_from_redis,
 )
 
 logging.basicConfig(level=getattr(logging, settings.log_level), format=settings.log_format)
@@ -165,31 +166,27 @@ _sse_handler = log_sse.LogSSEHandler(level=logging.INFO)
 _sse_handler.setFormatter(logging.Formatter("%(message)s"))
 logging.getLogger().addHandler(_sse_handler)
 
-_redis = None
+_redis = None  # backward compat — delegates to state.redis via property-like access
 
-# ── Task manager for fire-and-forget background work ─────────────────────────
-_task_manager = TaskManager(max_concurrent=settings.bg_task_limit)
-_AUTO_CONSOLIDATE_EVERY = settings.auto_consolidate_every
+# ── Task manager and counters — delegate to api.state (single source of truth) ─
+_task_manager = state.task_manager
+_AUTO_CONSOLIDATE_EVERY = state.AUTO_CONSOLIDATE_EVERY
 
 def _spawn(coro, name: str = "bg") -> None:
     """Fire-and-forget a coroutine with TaskManager supervision."""
-    _task_manager.spawn(coro, name=name)
+    state.spawn(coro, name=name)
 
-# ── Thread-safe auto-consolidation counter (replaces bare int) ────────────────
-_stores_since_consolidation = AtomicCounter()
+# ── Thread-safe counters — delegate to api.state ─────────────────────────────
+_stores_since_consolidation = state.stores_since_consolidation
+_periodic_prune_counter = state.periodic_prune_counter
+_store_attempts = state.store_attempts
+_store_successes = state.store_successes
+_store_skips = state.store_skips
+_store_errors = state.store_errors
+_store_latency_sum_ms = state.store_latency_sum_ms
 
-# ── Thread-safe hard-prune scheduler counter ─────────────────────────────────
-_periodic_prune_counter = AtomicCounter()
-
-# ── Thread-safe store observability counters (replaces bare int/float) ───────
-_store_attempts = AtomicCounter()
-_store_successes = AtomicCounter()
-_store_skips = AtomicCounter()
-_store_errors = AtomicCounter()
-_store_latency_sum_ms = AtomicFloat()
-
-# ── BM25 + search utilities now in core/search.py ────────────────────────────
-_bm25_index = BM25Index()
+# ── BM25 index — delegate to api.state ───────────────────────────────────────
+_bm25_index = state.bm25_index
 
 
 async def _encode_batch_async(texts: list[str]) -> list[np.ndarray]:
@@ -232,23 +229,6 @@ async def _periodic_consolidate() -> None:
                 log.warning(f"[periodic_consolidate] hard-prune error: {e}")
 
 
-async def _populate_bm25_from_redis(r) -> None:
-    """Load all existing facts from Redis into the in-memory BM25 corpus on startup."""
-    if not _BM25_AVAILABLE:
-        return
-    try:
-        scanned = await _vscan(r, mem_store.FACT_KEY, max_count=5000)
-        items = [
-            {"_element": item["element"], "content": item["attrs"]["content"], "attrs": item["attrs"]}
-            for item in scanned
-            if item["attrs"].get("content") and not item["attrs"].get("superseded_by")
-        ]
-        await _bm25_index.populate_from_items(items)
-        log.info(f"[bm25] populated corpus from Redis: {len(items)} facts")
-    except Exception as e:
-        log.warning(f"[bm25] startup population failed: {e}")
-
-
 async def _backfill_crystallized_index(r) -> None:
     """One-time startup backfill: add any existing mem:crystallized:* keys to the sorted set index."""
     try:
@@ -286,10 +266,12 @@ async def _backfill_crystallized_index(r) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _redis
+    from api import state as _state
     log.info("Loading embedding model…")
     embedder._get_provider()  # warm up embedding model
     log.info("Connecting to Redis…")
     _redis = await mem_store.get_client()
+    _state.redis = _redis  # share with compat/health/graph routes
 
     # Dimension guard: if existing vectorset has different dims than current
     # provider, force local (384-dim) to avoid corrupting vector search.
@@ -312,13 +294,13 @@ async def lifespan(app: FastAPI):
     _spawn(_periodic_consolidate(), "consolidate")
     _spawn(_auto_crystallize(), "crystallize")  # Auto-crystallize sessions every 6h
     # Populate BM25 corpus from existing Redis facts (non-blocking, best-effort)
-    _spawn(_populate_bm25_from_redis(_redis), "bm25-populate")
+    _spawn(populate_bm25_from_redis(_redis, state.bm25_index), "bm25-populate")
     # Backfill crystallized sorted-set index from existing keys (idempotent, skips if populated)
     _spawn(_backfill_crystallized_index(_redis), "crystallize-index-backfill")
     log.info("AgentMem v%s ready (session-handoff+hard-prune+auto-graph+batch-MCP+compat+auto-crystallize)", APP_VERSION)
     yield
     # Cancel tracked background tasks before closing Redis
-    await _task_manager.shutdown(timeout=settings.bg_task_shutdown_timeout)
+    await state.task_manager.shutdown(timeout=settings.bg_task_shutdown_timeout)
     await mem_store.close_pool()
 
 
@@ -1926,81 +1908,7 @@ async def get_session(session_id: str):
 # These provide full compatibility with rohitg00/agentmemory hooks & MCP tools.
 # ═══════════════════════════════════════════════════════════════════════════════
 # _compat_sid and _compat_check_auth are now in api/compat.py — imported above.
-
-
-async def _observe_internal(session_id: str, _project: str, _cwd: str,
-                            hook_type: str, data: dict) -> dict:
-    """Core observe logic shared by /observe endpoint."""
-    tool_name = data.get("tool_name", "")
-    tool_input = data.get("tool_input", "")
-    tool_output = data.get("tool_output", "")
-
-    content_parts = []
-    if tool_name:
-        content_parts.append(f"Tool: {tool_name}")
-    if tool_input:
-        inp = tool_input if isinstance(tool_input, str) else json.dumps(tool_input, ensure_ascii=False)
-        content_parts.append(f"Input: {inp[:2000]}")
-    if tool_output:
-        out = tool_output if isinstance(tool_output, str) else json.dumps(tool_output, ensure_ascii=False)
-        content_parts.append(f"Output: {out[:4000]}")
-
-    content = "\n".join(content_parts)
-    if not content.strip():
-        return {"status": "ok", "action": "skipped_empty"}
-
-    if _is_trivial(content) or _is_injected(content):
-        return {"status": "ok", "action": "skipped_filter"}
-    if _contains_secret(content):
-        content = _redact_secrets(content)
-
-    if not await _admission_gate(content):
-        return {"status": "ok", "action": "skipped_gate"}
-
-    emb = _encode(content)
-    uid = await mem_store.save_episode(
-        _redis, session_id, content, emb,
-        ep_type=hook_type,
-    )
-
-    try:
-        from core import extractor
-        facts = await extractor.extract_facts(content, session_id)
-        for fact_text, fact_attrs in facts:
-            fact_emb = _encode(fact_text)
-            await mem_store.save_fact(
-                _redis,
-                content=fact_text,
-                category=fact_attrs.get("category", "fact"),
-                confidence=fact_attrs.get("confidence", 0.7),
-                embedding=fact_emb,
-                language=fact_attrs.get("language", "en"),
-                domain=fact_attrs.get("domain", "general"),
-                keywords=fact_attrs.get("keywords"),
-                importance=fact_attrs.get("importance", 0.5),
-                source_episode_id=uid,
-            )
-    except Exception as e:
-        log.warning("[observe] fact extraction failed: %s", e)
-
-    return {"status": "ok", "action": "observed", "id": uid}
-
-
-# ── Liveness / Feature flags ──────────────────────────────────────────────────
-
-@app.get("/livez")
-async def livez():
-    return {"status": "ok", "service": "agentmem"}
-
-
-@app.get("/config/flags")
-async def config_flags():
-    return {
-        "graphExtractionEnabled": _os.getenv("GRAPH_EXTRACTION_ENABLED", "false").lower() == "true",
-        "consolidationEnabled": True,
-        "autoCompressEnabled": True,
-        "contextInjectionEnabled": _os.getenv("AGENTMEMORY_INJECT_CONTEXT", "true").lower() == "true",
-    }
+# _observe_internal is now in services/store_service.py — imported by route modules.
 
 
 # ── Automatic Crystallization Background Task ────────────────────────────────

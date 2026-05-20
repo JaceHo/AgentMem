@@ -16,11 +16,16 @@ async function loadProfile() {
 
   // Config info
   if (config) {
+    const em = config.embedding_model || {};
+    const st = config.settings || {};
+    const redisOk = config.redis_connected;
     let cfg = '<div style="font-size:11px">';
-    cfg += `<div class="dr"><span class="dk">Embedding</span><span class="dv">${esc(config.embedding_provider || config.embedding?.provider || '—')}</span></div>`;
-    cfg += `<div class="dr"><span class="dk">Auto-consolidate</span><span class="dv">${config.auto_consolidate ? 'On' : 'Off'}</span></div>`;
-    cfg += `<div class="dr"><span class="dk">Consolidate every</span><span class="dv">${config.consolidate_every || 50} stores</span></div>`;
     cfg += `<div class="dr"><span class="dk">Version</span><span class="dv">${esc(config.version || '—')}</span></div>`;
+    cfg += `<div class="dr"><span class="dk">Redis</span><span class="dv" style="color:${redisOk ? 'var(--green)' : 'var(--red, #f55)'}">${redisOk ? 'Connected' : 'Disconnected'}</span></div>`;
+    cfg += `<div class="dr"><span class="dk">Embedding</span><span class="dv">${esc(em.provider || '—')} / ${esc(em.model || '—')} (${em.dims || '?'}d)</span></div>`;
+    cfg += `<div class="dr"><span class="dk">Consolidate every</span><span class="dv">${config.auto_consolidate_every || 50} stores</span></div>`;
+    cfg += `<div class="dr"><span class="dk">Dedup threshold</span><span class="dv">${st.dedup_similarity_threshold ?? '—'}</span></div>`;
+    cfg += `<div class="dr"><span class="dk">Token budget</span><span class="dv">${st.default_token_budget ?? '—'}</span></div>`;
     cfg += '</div>';
     $('profile-config').innerHTML = cfg;
   }

@@ -11,9 +11,25 @@ async function loadDash() {
 
   // Health dot
   const ok = health && health.status === 'ok';
+  const redisOk = health && health.redis && !String(health.redis).includes('error') && health.status !== 'degraded';
   $('dot').className = 'dot ' + (ok ? 'ok' : 'err');
   $('ver').textContent = 'v' + (health?.version || '?');
   $('emb-info').textContent = health?.embedding?.provider || '—';
+
+  // Redis disconnected banner
+  let banner = document.getElementById('redis-banner');
+  if (!redisOk) {
+    if (!banner) {
+      banner = document.createElement('div');
+      banner.id = 'redis-banner';
+      banner.style.cssText = 'background:rgba(255,80,80,.12);border:1px solid rgba(255,80,80,.4);border-radius:var(--radius);padding:8px 14px;margin-bottom:10px;font-size:11px;color:#f77;display:flex;align-items:center;gap:8px';
+      const pane = document.getElementById('p-dashboard');
+      pane.insertBefore(banner, pane.firstChild);
+    }
+    banner.innerHTML = `<span style="font-size:16px">⚠</span> <span><b>Redis disconnected</b> — all memory pages will be empty. ${esc(health?.error || '')} Run <code style="font-family:var(--mono);font-size:10px">brew services start redis</code> then restart AgentMem.</span>`;
+  } else if (banner) {
+    banner.remove();
+  }
 
   // Uptime
   const up = Math.floor((Date.now() - S.t0) / 1000);

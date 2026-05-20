@@ -29,7 +29,7 @@ from typing import Optional
 
 import redis.asyncio as aioredis
 
-from .utils import decode_json, force_str
+from .utils import decode_json, decode_bytes, force_str
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 TOOL_KEY   = "mem:tools"
@@ -115,7 +115,7 @@ async def register_tool(
     try:
         existing_raw = await r.execute_command("VGETATTR", TOOL_KEY, elem_key)
         if existing_raw:
-            prev = json.loads(existing_raw.decode() if isinstance(existing_raw, bytes) else existing_raw)
+            prev = decode_json(existing_raw)
             attr["use_count"]          = prev.get("use_count", 0)
             attr["success_count"]      = prev.get("success_count", 0)
             attr["fail_count"]         = prev.get("fail_count", 0)
@@ -279,8 +279,8 @@ async def get_env(r: aioredis.Redis) -> dict:
         return {}
     result = {}
     for k, v in raw.items():
-        k_str = k.decode() if isinstance(k, bytes) else k
-        v_str = v.decode() if isinstance(v, bytes) else v
+        k_str = decode_bytes(k)
+        v_str = decode_bytes(v)
         # Try to parse JSON lists/dicts
         if v_str.startswith(("[", "{")):
             try:
@@ -344,8 +344,8 @@ async def get_agent(r: aioredis.Redis) -> dict:
         return {}
     result = {}
     for k, v in raw.items():
-        k_str = k.decode() if isinstance(k, bytes) else k
-        v_str = v.decode() if isinstance(v, bytes) else v
+        k_str = decode_bytes(k)
+        v_str = decode_bytes(v)
         if v_str.startswith(("[", "{")):
             try:
                 v_str = json.loads(v_str)
