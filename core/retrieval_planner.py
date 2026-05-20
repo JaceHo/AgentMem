@@ -33,7 +33,7 @@ from .extractor import (
 
 log = logging.getLogger("mem")
 
-_PLAN_TIMEOUT_S = 4.0               # tight: broken models fail in 4s not 15s
+_PLAN_TIMEOUT_S = 8.0               # match extractor timeout for working models
 _PLAN_MAX_RETRIES = 1               # one retry only — keeps recall fast
 
 

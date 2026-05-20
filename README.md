@@ -51,7 +51,7 @@ health matrix only (score > 0). Reduced cloud timeouts to 60s.
 git clone https://github.com/JaceHo/AgentMem
 cd AgentMem
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-bash agentmem.sh setup          # service + all 5 Claude Code hooks
+bash agentmem.sh setup          # service + all 7 Claude Code hooks
 ```
 
 Open a new Claude Code session. Done.
@@ -147,14 +147,14 @@ Redis 8 HNSW gives O(log n) ANN search — at 10K facts: 50ms → **2ms**; at 10
 | **Source** | **fully open** | iii-sdk closed‡‡ | open | open | n/a |
 | **Price** | **$0** | **$0** | $0.002–0.01/op | $0 self-host | $0 |
 | **Fully local** | ✅ | ✅ | ❌ | ✅ option | ✅ |
-| **Memory injection per prompt** | **✅ every prompt** | SessionStart only | manual | manual | manual |
+| **Memory injection per prompt** | **✅ every prompt** | MCP call only⁴ | manual | manual | manual |
 | **Auto-consolidation (always-on)** | **✅ A-MAC gate** | opt-in¹ | manual | manual | none |
 | **Auto-capture hooks** | 7 | **12** | manual | self-edits | manual |
 | **MCP tools** | 9 | 8 default / 53 all² | — | — | — |
 | **6-tier cognitive stack** | **✅** | 4-tier | ❌ | ❌ | ❌ |
 | **HyDE query expansion** | **✅ (default on)** | ❌ | ❌ | ❌ | ❌ |
 | **MIRIX active retrieval topic** | **✅ (default on)** | ❌ | ❌ | ❌ | ❌ |
-| **Session diversity** | **✅** | ❌ | ❌ | ❌ | ❌ |
+| **Session diversity** | **✅ configurable** | hardcoded³ | ❌ | ❌ | ❌ |
 | **ToolMem + TIG + AWO** | **✅** | ❌ | ❌ | ❌ | ❌ |
 | **MACLA Beta procedures** | **✅** | ❌ | ❌ | ❌ | ❌ |
 | **wRRF fusion** | **✅** | ✅ | ❌ | ❌ | ❌ |
@@ -168,13 +168,15 @@ Redis 8 HNSW gives O(log n) ANN search — at 10K facts: 50ms → **2ms**; at 10
 
 > ‡Mem0/Letta: LoCoMo end-to-end QA, different benchmark. †Internal bench, see disclaimer.  
 > ⚠ agentmemory's 95.2% R@5 is measured on raw session text, not LLM-compressed memories. Their compression pipeline would reduce this number.  
-> ‡‡ agentmemory's core runtime (`iii-sdk`) is a closed-source proprietary dependency — not auditable or forkable.  
-> ¹ Requires `CONSOLIDATION_ENABLED=true`; off by default in fresh installs.  
-> ² agentmemory exposes only 8 tools by default (`AGENTMEMORY_TOOLS=core`); 53 tools requires explicit `AGENTMEMORY_TOOLS=all`.
+> ‡‡ `iii-sdk` / `iii engine` is the actual runtime backing all agentmemory hooks and functions — a hard dependency on a closed-source proprietary engine. Not auditable, not forkable, not self-hostable independently.  
+> ¹ Requires `CONSOLIDATION_ENABLED=true`; off by default in fresh installs. Also requires ≥5 session summaries before semantic consolidation runs at all (code: `if (summaries.length >= 5)`).  
+> ² agentmemory exposes only 8 tools by default (`AGENTMEMORY_TOOLS=core`); 53 tools requires explicit `AGENTMEMORY_TOOLS=all`.  
+> ³ agentmemory's `diversifyBySession()` has `maxPerSession=3` hardcoded at the call site (`hybrid-search.ts`). AgentMem's session diversity limit is configurable via recall parameters.  
+> ⁴ agentmemory's `UserPromptSubmit` hook calls `POST /observe` (fire-and-forget, no `additionalContext` return). Memory is injected only when Claude explicitly calls the `mem::recall` MCP tool — not automatically per prompt.
 
-**Where agentmemory wins:** no external DB required, `npm install -g` one-liner, more max-tools (53), more hooks (12).
+**Where agentmemory wins:** no external DB required, `npm install -g` one-liner, more max-tools (53), more hooks (12), real-time viewer UI.
 
-**Where AgentMem wins:** published LLM-F1 on real compressed data (76.34%), measured recall latency (19ms P50), 2x more token-efficient injection (873 vs 1,900), memory injection on every prompt (not just session start), always-on automatic consolidation, HyDE + session diversity retrieval quality, 6-tier architecture, ToolMem + TIG + AWO + MACLA features unique in open source, Redis 8 HNSW O(log n) at scale, **fully open-source stack**.
+**Where AgentMem wins:** published LLM-F1 on real compressed data (76.34%), measured recall latency (19ms P50), 2x more token-efficient injection (873 vs 1,900), **automatic per-prompt injection via `additionalContext`** (agentmemory requires an explicit `mem::recall` MCP tool call), always-on consolidation from session 1 (agentmemory requires `CONSOLIDATION_ENABLED=true` AND ≥5 sessions), HyDE + MIRIX + session diversity retrieval quality, 6-tier architecture, ToolMem + TIG + AWO + MACLA features unique in open source, Redis 8 HNSW O(log n) at scale, **100% open-source stack** (no proprietary engine dependency).
 
 ---
 
@@ -311,7 +313,7 @@ Result: stable ~200MB footprint @ 10K facts, improving quality over time
 | `precompact.sh` | PreCompact | Re-injects memory before context compaction |
 | `store.sh` | Stop + SubagentStop | Store + compress + TIG + AWO meta-tool synthesis |
 
-**Key advantage over agentmemory:** `recall.sh` fires on *every* `UserPromptSubmit` and injects ranked memory as `additionalContext`. agentmemory's UserPromptSubmit hook only records the prompt — it does not inject context per-prompt. Their injection only happens at `SessionStart` (and only if `AGENTMEMORY_INJECT_CONTEXT=true`, which is off by default).
+**Key advantage over agentmemory:** `recall.sh` fires on *every* `UserPromptSubmit` and returns ranked memory as `additionalContext` to Claude before the response. agentmemory's `prompt-submit.mjs` calls `POST /observe` as a fire-and-forget side-effect — it returns nothing. Memory retrieval only happens if Claude explicitly calls the `mem::recall` MCP tool during a response. There is no automatic per-prompt injection in any agentmemory hook.
 
 ---
 
