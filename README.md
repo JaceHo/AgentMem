@@ -31,9 +31,6 @@ health matrix only (score > 0). Reduced cloud timeouts to 60s.
 - **Bash** [system/builtin]: Execute shell commands ⟨reliable (24/26✓)⟩
 - *Frequent next tools*: edit, bash, glob          ← AutoTool TIG hint
 
-## Relevant Skills
-- **Debug systematically**: 1. Reproduce, 2. Isolate, 3. Fix root cause...
-
 ## Long-Term Memory (Facts)
 1. [rule] Jace always uses AgentMem for memory. triple: jace → uses → AgentMem
 2. [preference] Jace prefers bun over npm as JavaScript package manager.
@@ -47,7 +44,7 @@ Zero effort: 5 hooks auto-capture, auto-compress, and auto-inject on every promp
 
 ---
 
-## Quick start — Claude Code
+## Quick start
 
 ```bash
 git clone https://github.com/JaceHo/AgentMem
@@ -63,7 +60,6 @@ Open a new Claude Code session. Done.
 bash agentmem.sh setup --agent cursor      # Cursor
 bash agentmem.sh setup --agent windsurf    # Windsurf
 bash agentmem.sh setup --agent copilot     # GitHub Copilot (VS Code)
-bash agentmem.sh setup --agent zed         # Zed
 bash agentmem.sh setup --agent all         # auto-detect and configure all
 ```
 
@@ -94,19 +90,19 @@ MCP endpoints: `HTTP /mcp` · `SSE /mcp/sse` · `stdio python mcp_server.py`
 
 ## Benchmark
 
-### vs. Published Memory Systems (LoCoMo dataset, LLM-F1)
+### Memory quality — LoCoMo dataset (LLM-F1)
 
-| System | LLM-F1 | Notes |
-|--------|:------:|-------|
+| System | LLM-F1 | Source |
+|--------|:------:|--------|
 | Full Context (baseline) | 18.70% | [SimpleMem](https://arxiv.org/abs/2601.02553) |
 | A-Mem | 32.58% | [SimpleMem](https://arxiv.org/abs/2601.02553) |
 | Mem0 | 34.20% | [SimpleMem](https://arxiv.org/abs/2601.02553) |
 | SimpleMem | 43.24% | [SimpleMem](https://arxiv.org/abs/2601.02553) |
 | AriadneMem | 46.30% | [AriadneMem](https://arxiv.org/abs/2603.03290) — published SOTA |
-| Memori | 81.95% | [Memori](https://arxiv.org/abs/2603.19935) — LoCoMo |
-| **AgentMem v1.1** | **76.34%†** | internal bench — see disclaimer |
+| Memori | 81.95% | [Memori](https://arxiv.org/abs/2603.19935) |
+| **AgentMem v1.1** | **76.34%†** | internal bench |
 
-### Internal bench† (8 convs, 47 Q/A)
+**Internal bench† (8 convs, 47 Q/A):**
 
 | System | LLM-F1 | Context-F1 | AIC | Recall@1 |
 |--------|:------:|:----------:|:---:|:--------:|
@@ -114,130 +110,92 @@ MCP endpoints: `HTTP /mcp` · `SSE /mcp/sse` · `stdio python mcp_server.py`
 | Full Context oracle | — | 36.96% | 100% | 100% |
 | **AgentMem v1.1** | **76.34%** | **34.59%** | **97.9%** | **100%** |
 
-> **†** Internal dataset (8 vs 500 convs), different answer extractor (Kimi-K2.5 vs GPT-4), no official LoCoMo test split. Not directly comparable to published numbers. Run `scripts/bench-f1.py --flush-between-sessions` to reproduce.
+> **†** Internal dataset (8 vs 500 convs), Kimi-K2.5 answer extractor (vs GPT-4 in published papers). Requires isolated service with `AMAC_THRESHOLD=0.05`. Run `agentmem.sh bench start` then `scripts/bench-f1.py --flush-between-sessions` to reproduce. Not directly comparable to published LoCoMo baselines.
 
-### SWE-bench Verified context (May 2026)
-
-The SWE-bench Verified leaderboard top scores as of May 2026:
-
-| Model / Agent | Pass@1 |
-|--------------|:------:|
-| Claude Mythos Preview | 93.9% |
-| Claude Opus 4.7 | 87.6% |
-| GPT-5.3 Codex | 85.0% |
-| Claude Opus 4.5 | 80.9% |
-
-AgentMem is **complementary** to SWE-bench-style agents — it handles *cross-session* memory, not in-session context. Used together with a context-indexing tool (like vexp), the combination addresses both axes of agent efficiency.
-
----
-
-## Benchmark: measured numbers
-
-### Live service results (measured on 4,422 memories)
+### Live service measurements (4,422 memories)
 
 | Metric | AgentMem | agentmemory | vexp |
 |--------|:--------:|:-----------:|:----:|
-| **Retrieval R@5** | **95.2%** | 95.2% | — |
-| **Retrieval R@10** | **98.6%** | 98.6% | — |
-| **LLM-F1 (memory QA)** | **76.34%†** | not published | — |
-| **Token cost reduction** | **90%** | 92% (claimed) | 58% (within-session) |
-| **Context compression** | **99.8%** (405x vs raw) | ~1,900 tokens/session | — |
-| **Orientation hit rate** | **100%** (10/10 queries) | — | 90% tool-call reduction |
-| **Recall latency P50** | **19ms** | — | — |
-| **Recall latency P90** | **57ms** | — | — |
-| **Store latency P50** | **4ms** | — | — |
-| **Memory footprint @ 10K** | **~200MB** | ~1GB (est.) | — |
-| **Cost/month** | **$0** | $0 | paid |
-| **External DB required** | Redis (local) | **none (iii engine)** | none |
-| **MCP tools** | 9 (focused) | **53** | — |
-| **Auto hooks** | 5 | **12** | — |
+| Retrieval R@5 | **95.2%** | 95.2% | — |
+| Retrieval R@10 | **98.6%** | 98.6% | — |
+| LLM-F1 (memory QA) | **76.34%†** | not published | — |
+| Token cost reduction | **90%** (measured) | 92% (claimed) | 58% within-session |
+| Context compression | **405x** vs raw | — | — |
+| Orientation hit rate | **100%** (10/10) | — | 90% fewer tool calls |
+| Recall latency P50 | **19ms** | — | — |
+| Recall latency P90 | **57ms** | — | — |
+| Store latency P50 | **4ms** | — | — |
+| Memory @ 10K facts | **~200MB** | ~1GB (est.) | — |
+| Cost/month | **$0** | $0 | paid |
 
-> Token cost: AgentMem injects ~873 tokens vs ~9,000 for 3 orientation Read calls (90% reduction). agentmemory's "92% fewer tokens" is vs raw full-context. Both land ~1,900 tokens/session at budget.
->
-> †LLM-F1 76.34%: internal bench (8 convs, 47 Q/A, Kimi-K2.5 answer extractor). Run `scripts/bench-f1.py` to reproduce. Not directly comparable to published LoCoMo baselines (different dataset + extractor).
+> Token cost: ~873 tokens injected vs ~9,000 for 3 orientation Read calls. agentmemory's "92% fewer tokens" is vs raw full-context load. Both land ~1,900 tokens/session at default budget.
 
-### vs. vexp — Complementary, not competing
+---
 
-**vexp** targets within-session codebase orientation. AgentMem targets cross-session user memory. They solve different axes and are additive when combined.
+## vs. vexp — Complementary, not competing
+
+**[vexp benchmark](https://vexp.dev/benchmark)** — 100-task stratified subset of SWE-bench Verified, all agents using Claude Opus 4.5, same cost cap ($3/task), same turn budget (250 turns):
+
+| Agent | Pass@1 | $/task | Unique Wins |
+|-------|:------:|:------:|:-----------:|
+| **vexp + Claude Code** | **73%** | **$0.67** | **7–10** |
+| Live-SWE-Agent | 72% | $0.86 | — |
+| OpenHands | 70% | $1.77 | — |
+| Sonar Foundation | 70% | $1.98 | — |
+
+vexp's thesis: *"Context engineering is the highest-leverage intervention in agentic coding."* It pre-indexes the codebase into a dependency graph and delivers a ranked context capsule at task start — full source for pivot files, skeletonized signatures for everything else.
+
+**AgentMem addresses the orthogonal axis** — not what the codebase looks like *now*, but what the developer decided, preferred, and learned *across all previous sessions*:
 
 ```
-vexp        → agent knows the current codebase  (23 tool calls → 2, per task)
+vexp        → agent knows the current codebase  (23 tool calls → 2 per task)
 AgentMem    → agent remembers across ALL sessions (decisions, preferences, procedures)
 Together    → agent knows your codebase AND remembers everything it's ever done
 ```
 
 | | vexp | AgentMem |
 |---|:---:|:---:|
-| **What it stores** | Codebase structure | User facts, episodes, procedures |
-| **Memory scope** | Current task | All sessions, forever |
+| **What it indexes** | Codebase structure (current state) | User facts, episodes, procedures |
+| **Memory scope** | Within one task | Across all sessions, forever |
 | **Problem solved** | "Agent doesn't know the codebase" | "Agent forgot what was done last week" |
-| **Token impact** | 58% less per task | 90% less per session |
-| **SWE-bench** | 73% pass@1 at $0.67/task | cross-session axis |
+| **SWE-bench** | 73% pass@1 at $0.67/task | cross-session axis (not measured on SWE-bench) |
+| **Token impact** | 58% less cost per task | 90% fewer tokens per session |
 | **Works together?** | ✅ | ✅ (used in this project) |
+
+**Can AgentMem beat vexp's SWE-bench numbers?** Not on the same metric — SWE-bench measures single-task resolution, where vexp's codebase indexing is the lever. AgentMem's lever is cross-session: developers who use AgentMem long-term accumulate procedures, decisions, and tool patterns that would further reduce per-task cost and increase resolution. On the efficiency map vexp published, AgentMem + vexp combined would push further top-left (higher resolution, lower cost) than either alone.
 
 ---
 
 ## vs. Memory Systems
-
-### Architecture
 
 | Feature | **AgentMem** | agentmemory | Mem0 (53K ⭐) | Letta/MemGPT | SuperMemory |
 |---------|:------------:|:-----------:|:------------:|:------------:|:-----------:|
 | **Backend** | Redis 8 HNSW | iii engine | Qdrant/pgvector | Postgres+vector | Cloud |
 | **Language** | Python | TypeScript/Node | Python | Python | Cloud |
 | **External DB** | Redis (local) | **none** | Required | Required | Required |
+| **Install** | pip + Redis | `npm install -g` | pip | pip | SaaS |
 | **Retrieval R@5** | **95.2%** | 95.2% | 68.5%‡ | 83.2%‡ | — |
 | **LLM-F1** | **76.34%†** | not published | 34.20% | — | — |
-| **P50 Latency** | **19ms** (measured) | — | ~50ms | ~200ms | ~200ms (API) |
-| **Token/session** | **~873 tokens** | ~1,900 | Varies | Always in ctx | Varies |
-| **Context compression** | **405x** vs raw | — | — | — | — |
+| **P50 Latency** | **19ms** | — | ~50ms | ~200ms | ~200ms API |
+| **Tokens/session** | **~873** | ~1,900 | Varies | Always in ctx | Varies |
 | **Price** | **$0** | **$0** | $0.002–0.01/op | Free (self-host) | $29–$99/mo |
 | **Fully local** | ✅ | ✅ | ❌ cloud | ✅ option | ❌ cloud |
+| **MCP tools** | 9 | **53** | — | — | — |
+| **Auto hooks** | 5 | **12** | Manual | Self-edits | Manual |
+| **6-tier cognitive stack** | **✅** | ❌ (4-tier) | ❌ | ❌ | ❌ |
+| **Procedural memory** | **✅** | ❌ | ❌ | ❌ | ❌ |
+| **ToolMem + TIG + AWO** | **✅** | ❌ | ❌ | ❌ | ❌ |
+| **Semantic triples (s,p,o)** | **✅** | ✅ | ❌ | ❌ | ❌ |
+| **BM25 + Vector + Graph wRRF** | **✅** | ✅ | ❌ | ❌ | ❌ |
+| **3-phase consolidation** | **✅** | ✅ | ❌ | ❌ | ❌ |
+| **Knowledge graph** | **✅** | ✅ | ✅ | ❌ | ❌ |
+| **Secret redaction** | **✅** | ✅ | ❌ | ❌ | ❌ |
+| **CJK / Chinese** | **✅** | ✅ | Limited | Limited | Depends |
 
-> ‡Mem0/Letta figures are end-to-end QA on LoCoMo — different benchmark. †Internal bench, see disclaimer.
+> ‡Mem0/Letta figures are end-to-end QA on LoCoMo — different benchmark from retrieval R@5.
 
-### Intelligence
-
-| Feature | **AgentMem** | agentmemory | Mem0 | Letta | CLAUDE.md |
-|---------|:------------:|:-----------:|:----:|:-----:|:---------:|
-| Auto-capture hooks | 5 | **12** | Manual `add()` | Self-edits | Manual |
-| MCP tools | 9 | **53** | — | — | — |
-| A-MAC 5-factor dedup gate | **✅** | ✅ | Hash only | None | None |
-| Semantic triples (s,p,o) | **✅** | ✅ | ❌ | ❌ | ❌ |
-| BM25 + Vector + Graph wRRF | **✅** | ✅ | ❌ | ❌ | ❌ |
-| 3-phase consolidation | **✅** | ✅ | ❌ | ❌ | ❌ |
-| Knowledge graph | **✅** | ✅ | ✅ | ❌ | ❌ |
-| 6-tier cognitive architecture | **✅** | ❌ (4-tier) | ❌ | ❌ | ❌ |
-| Procedural / how-to memory | **✅** | ❌ | ❌ | ❌ | ❌ |
-| ToolMem reliability tracking | **✅** | ❌ | ❌ | ❌ | ❌ |
-| AutoTool TIG next-tool hints | **✅** | ❌ | ❌ | ❌ | ❌ |
-| AWO meta-tool synthesis | **✅** | ❌ | ❌ | ❌ | ❌ |
-| MACLA Beta procedure scoring | **✅** | ❌ | ❌ | ❌ | ❌ |
-| Cross-session pinned handoff | **✅** | ✅ | Basic | Basic | ❌ |
-| Secret redaction | **✅** | ✅ | ❌ | ❌ | ❌ |
-| CJK / Chinese | **✅** | ✅ | Limited | Limited | Depends |
-
-### Where agentmemory wins over AgentMem
-
-| | agentmemory | AgentMem |
-|---|:---:|:---:|
-| External DB required | **none (iii engine)** | Redis |
-| Install complexity | `npm install -g` | pip + Redis |
-| MCP tools | **53** | 9 |
-| Auto hooks (Claude Code) | **12** | 5 |
-
-### Where AgentMem wins over agentmemory
-
-| | **AgentMem** | agentmemory |
-|---|:---:|:---:|
-| Recall latency P50 | **19ms** (measured) | not published |
-| Token injection/session | **~873** | ~1,900 |
-| Context compression | **405x** vs raw | not measured |
-| LLM-F1 quality | **76.34%†** | not published |
-| 6-tier cognitive stack | **✅** | 4-tier |
-| ToolMem + TIG + AWO | **✅** | ❌ |
-| Procedural memory (MACLA) | **✅** | ❌ |
-| Vector search backend | **Redis 8 HNSW** (O(log n)) | iii (flat scan) |
+**Where agentmemory wins:** no Redis required, `npm install -g` simplicity, 53 MCP tools, 12 auto hooks.  
+**Where AgentMem wins:** 19ms P50 (measured), 405x compression, 76.34% LLM-F1 (agentmemory doesn't publish), 6-tier stack, ToolMem+TIG+AWO+MACLA, Redis 8 HNSW O(log n) vs flat scan.
 
 ---
 
@@ -247,11 +205,11 @@ Together    → agent knows your codebase AND remembers everything it's ever don
 ┌──────────────────────────────────────────────────────────────────┐
 │  Tier 0 — LLM Context Window  (framework manages this)           │
 │  AgentMem injects: <cross_session_memory>…</cross_session_memory>│
-│                    ~1,900 tokens vs ~22,000 raw  (91% smaller)   │
+│                    ~873 tokens (measured) vs ~353K raw (405x ↓)  │
 ├──────────────────────────────────────────────────────────────────┤
 │  Tier 1 — Session KV  (Redis, 4h TTL)                            │
 │  rolling summary · MemAgent overwrite compaction                 │
-│  secrets redacted on write · auto-compact when >3K chars         │
+│  secrets redacted · auto-compact when >3K chars                  │
 │  pinned at session end → always injected on cold start           │
 ├──────────────────────────────────────────────────────────────────┤
 │  Tier 2 — Episodic  mem:episodes                                  │
@@ -300,7 +258,7 @@ Query →
   │
   ├─ Heat rerank (access frequency + recency boost, 237ns @ 100 items)
   │
-  └─ Token-budget greedy packing → <cross_session_memory> (~1,900 tokens)
+  └─ Token-budget greedy packing → <cross_session_memory> (~873 tokens measured)
 ```
 
 ---
@@ -309,13 +267,13 @@ Query →
 
 | Operation | AgentMem | agentmemory | Improvement |
 |-----------|----------|-------------|-------------|
-| Heat Score Compute | **237ns** | ~50μs | 211x faster |
-| Heat Rerank @ 100 items | **28μs** | ~5ms | 179x faster |
-| Recall P50 Latency | **15ms** | ~50ms | 3.3x faster |
-| Hybrid Search (BM25+Vec) | **<10ms** | ~100ms | 10x faster |
+| Heat Score Compute | **237ns** | ~50μs | 211x |
+| Heat Rerank @ 100 items | **28μs** | ~5ms | 179x |
+| Recall P50 Latency | **19ms** (measured) | ~50ms | 2.6x |
+| Hybrid Search (BM25+Vec) | **<10ms** | ~100ms | 10x |
 | Memory @ 10K facts | **~200MB** | ~1GB | 5x smaller |
 
-Redis 8 Vectorset (HNSW) gives O(log n) ANN search. At 10K facts: 50ms → **2ms**. At 100K: 500ms → **8ms**.
+Redis 8 Vectorset (HNSW): O(log n) ANN. At 10K facts: 50ms → **2ms**. At 100K: 500ms → **8ms**.
 
 ---
 
@@ -325,7 +283,7 @@ Redis 8 Vectorset (HNSW) gives O(log n) ANN search. At 10K facts: 50ms → **2ms
 |------|---------|--------|
 | `register-env.sh` | Session start | Registers OS / git / cwd / model |
 | `register-tools.sh` | Session start | Registers built-in + MCP tools |
-| `recall.sh` | Every prompt | Injects memory via `additionalContext` (~15ms) |
+| `recall.sh` | Every prompt | Injects memory via `additionalContext` (P50 19ms) |
 | `compact.sh` | After every tool | Session compact + ToolMem feedback |
 | `store.sh` | Session end | Store + compress + TIG + AWO meta-tool synthesis |
 
@@ -334,24 +292,24 @@ Redis 8 Vectorset (HNSW) gives O(log n) ANN search. At 10K facts: 50ms → **2ms
 ## Intelligent Lifecycle
 
 ```
-Every store:   A-MAC 5-factor gate → admit or discard (threshold=0.15)
-               Cosine dedup (>0.95 similarity → skip)
+Every store:    A-MAC 5-factor gate → admit or discard (threshold=0.15)
+                Cosine dedup (>0.95 similarity → skip)
 
 Every 50 stores:
-  Phase 1 — Decay:   age >90d → importance × 0.9
-  Phase 2 — Merge:   affinity = cosine × exp(−λ·days) ≥ 0.85 → LLM merge
-  Phase 3 — Prune:   importance <0.05 → soft-delete
-  Category floors:   identity/rule ≥ 0.80, preference ≥ 0.75
+  Phase 1 — Decay:  age >90d → importance × 0.9
+  Phase 2 — Merge:  affinity ≥ 0.85 → LLM merge cluster
+  Phase 3 — Prune:  importance <0.05 → soft-delete
+  Category floors:  identity/rule ≥ 0.80, preference ≥ 0.75
 
-Daily:         Hard-delete: superseded facts >7d, stale episodes >180d (VREM)
-               AWO: scan TIG for 2-hop chains → auto-create meta-tool procedures
+Daily:          Hard-delete: superseded facts >7d, stale episodes >180d
+                AWO: scan TIG for 2-hop chains → auto-create meta-tool procedures
 
 Result: stable ~200MB footprint @ 10K facts, improving quality over time
 ```
 
 ---
 
-## MCP Tools (9 tools)
+## MCP Tools
 
 | Tool | Description |
 |------|-------------|
@@ -366,16 +324,6 @@ Result: stable ~200MB footprint @ 10K facts, improving quality over time
 | `batch_store_memory` | Parallel store for multiple observations |
 
 Available via HTTP (`/mcp`), SSE (`/mcp/sse`), or stdio (`python mcp_server.py`).
-
----
-
-## Cost
-
-| | AgentMem | Mem0 | SuperMemory | Letta |
-|---|:---:|:---:|:---:|:---:|
-| Monthly | **$0** | $0.002–0.01/op | $29–$99 | $0 (self-host) |
-| Cloud dependency | **None** | Required | Required | Optional |
-| Annual estimate | **~$10 (electricity)** | $200–$1,200+ | $350–$1,200 | $0 |
 
 ---
 
