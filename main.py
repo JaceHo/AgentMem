@@ -3071,6 +3071,66 @@ async def graph_stats_endpoint():
         return {"nodes": 0, "edges": 0, "total_nodes": 0, "total_edges": 0, "error": str(e)}
 
 
+@app.get("/graph/nodes")
+async def graph_nodes_endpoint(limit: int = 60):
+    """
+    Return top N most-connected entities with their edges for graph visualization.
+    Scans mem:graph:* keys, ranks by connection count, returns nodes + edges.
+    """
+    try:
+        prefix = graph_mod.GRAPH_PREFIX
+        # Collect all entity keys
+        all_keys = []
+        async for key in _redis.scan_iter(f"{prefix}*", count=500):
+            all_keys.append(key.decode() if isinstance(key, bytes) else key)
+
+        if not all_keys:
+            return {"nodes": [], "edges": []}
+
+        # Batch get connection counts — try scard (Set keys), fall back handled per-key
+        pipe = _redis.pipeline(transaction=False)
+        for k in all_keys:
+            pipe.scard(k)
+        scards = await pipe.execute(raise_on_error=False)
+
+        # Sort by connection count descending, take top limit
+        ranked = sorted(
+            [(k, int(sc) if isinstance(sc, int) else 0) for k, sc in zip(all_keys, scards)],
+            key=lambda x: x[1], reverse=True
+        )[:limit]
+
+        # Fetch neighbors for top entities
+        top_keys = [k for k, _ in ranked]
+        pipe = _redis.pipeline(transaction=False)
+        for k in top_keys:
+            pipe.smembers(k)  # legacy Set edges (slug strings)
+        members_list = await pipe.execute(raise_on_error=False)
+
+        top_slugs = {k[len(prefix):] for k in top_keys}
+        nodes_out = []
+        edges_out = []
+        seen_edges: set[tuple] = set()
+
+        for (k, conn_count), members in zip(ranked, members_list):
+            slug = k[len(prefix):]
+            label = slug.replace("_", " ")
+            nodes_out.append({"id": slug, "label": label, "connections": conn_count})
+
+            if not isinstance(members, (set, list)):
+                continue
+            for m in members:
+                nb = m.decode() if isinstance(m, bytes) else m
+                pair = (min(slug, nb), max(slug, nb))
+                if pair not in seen_edges:
+                    seen_edges.add(pair)
+                    edges_out.append({"source": slug, "target": nb, "type": "related_to"})
+
+        return {"nodes": nodes_out, "edges": edges_out}
+    except Exception as e:
+        log.error(f"[graph/nodes] {e}")
+        return {"nodes": [], "edges": [], "error": str(e)}
+
+
 @app.get("/graph/{entity}")
 async def graph_neighbors(entity: str):
     """
