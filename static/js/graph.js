@@ -17,7 +17,6 @@ const EDGE_COLOR = 'rgba(79,195,247,0.15)';
 const EDGE_COLOR_HOT = 'rgba(79,195,247,0.55)';
 
 async function loadGraph() {
-  resizeGCanvas(); // canvas may have been 0×0 while pane was hidden
   const q = $('gq')?.value?.trim() || '';
   const [stats, graphData] = await Promise.all([
     api('/graph/stats'),
@@ -284,26 +283,23 @@ function searchNode(entityId) {
 
 // ── Canvas setup & interactions ───────────────────────────────────────────────
 
-function resizeGCanvas() {
-  const gc = $('gcanvas'); if (!gc) return;
-  const wrap = gc.parentElement;
-  if (!wrap) return;
-  const W = wrap.clientWidth;
-  if (!W) return; // pane still hidden — skip
-  const H = Math.max(400, window.innerHeight - 200);
-  gc.style.width = W + 'px';
-  gc.style.height = H + 'px';
-  gc.width = W * G.dpr;
-  gc.height = H * G.dpr;
-}
-
 function setupGCanvas() {
   const gc = $('gcanvas'); if (!gc) return;
 
   G.dpr = window.devicePixelRatio || 1;
 
-  resizeGCanvas();
-  window.addEventListener('resize', () => { resizeGCanvas(); if (G.loaded) renderG(); });
+  function resizeCanvas() {
+    const wrap = gc.parentElement;
+    if (!wrap) return;
+    const W = wrap.clientWidth;
+    const H = Math.max(400, window.innerHeight - 200);
+    gc.style.width = W + 'px';
+    gc.style.height = H + 'px';
+    gc.width = W * G.dpr;
+    gc.height = H * G.dpr;
+  }
+  resizeCanvas();
+  window.addEventListener('resize', () => { resizeCanvas(); if (G.loaded) renderG(); });
 
   // Wheel zoom
   gc.addEventListener('wheel', e => {

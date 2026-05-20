@@ -1041,34 +1041,6 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
                 prev_episode_id=prev_ep_id,
             )
             ep_saved = 1
-        
-        # Ensure session metadata exists for /sessions endpoint (run regardless of dup status)
-        # Create if not exists (NX) to avoid overwriting /session/start metadata
-        session_meta_key = f"mem:session:{session_id}"
-        existing_meta = await _redis.exists(session_meta_key)
-        if not existing_meta:
-            import json as _json
-            await _redis.set(
-                session_meta_key,
-                _json.dumps({
-                    "session_id": session_id,
-                    "project": "",
-                    "started_at": time.time(),
-                    "observations": 1,  # First observation
-                }),
-                ex=86400 * 30,  # 30 days TTL for metadata
-            )
-        else:
-            # Increment observation count for existing session
-            try:
-                meta_raw = await _redis.get(session_meta_key)
-                if meta_raw:
-                    import json as _json
-                    meta = _json.loads(meta_raw.decode() if isinstance(meta_raw, bytes) else meta_raw)
-                    meta["observations"] = meta.get("observations", 0) + 1
-                    await _redis.set(session_meta_key, _json.dumps(meta), ex=86400 * 30)
-            except Exception as e:
-                log.warning(f"[store] failed to update observation count: {e}")
 
         # 5. Hybrid fact extraction (regex + LLM) → dedup → save → update persona
         # Extract from all roles: assistant messages contain rich facts too
