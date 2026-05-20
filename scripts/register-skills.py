@@ -67,4 +67,4 @@ print(f"  queued: {result.get('tool_count')} agents\n")
 # --- Stats ---
 with urllib.request.urlopen(f"{AGENTMEM}/stats", timeout=5) as r:
     d = json.loads(r.read())
-print(f"AgentMem: tools={d['tools']}  procedures={d['procedures']}  episodes={d['episodes']}")
+print(f"AgentMem: tools={d.get('tools', 0)}  procedures={d.get('procedures', 0)}  episodes={d.get('episodes', 0)}")

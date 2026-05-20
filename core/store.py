@@ -41,6 +41,8 @@ import numpy as np
 import redis.asyncio as aioredis
 from ulid import ULID
 
+from .utils import decode_json, force_str
+
 log = logging.getLogger(__name__)
 
 REDIS_URL    = os.getenv("REDIS_URL", "redis://localhost:6379")
@@ -319,13 +321,13 @@ async def knn_search(
         raw   = results[i + 2]
         i += 3
 
-        elem_str = elem.decode() if isinstance(elem, bytes) else elem
+        elem_str = force_str(elem)
         if elem_str == "__seed__":
             continue
 
         try:
-            attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
-        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            attrs = decode_json(raw) or {}
+        except Exception as e:
             log.warning("knn_search: failed to parse attrs for %s: %s", elem_str, e)
             attrs = {}
 
@@ -392,7 +394,7 @@ async def get_last_episode_id(r: aioredis.Redis, session_id: str) -> str:
     val = await r.get(f"{SESSION_PRE}{session_id}:last_ep")
     if val is None:
         return ""
-    return val.decode("utf-8", errors="replace") if isinstance(val, bytes) else val
+    return force_str(val)
 
 
 async def set_last_episode_id(r: aioredis.Redis, session_id: str, uid: str) -> None:
@@ -409,7 +411,7 @@ async def update_episode_next_id(r: aioredis.Redis, uid: str, next_uid: str) -> 
     try:
         raw = await r.execute_command("VGETATTR", EPISODE_KEY, uid)
         if raw:
-            attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+            attrs = decode_json(raw) or {}
             attrs["next_episode_id"] = next_uid
             await r.execute_command("VSETATTR", EPISODE_KEY, uid, json.dumps(attrs))
     except Exception as e:
@@ -557,7 +559,7 @@ async def soft_delete_fact(
         )
         if scan and len(scan) >= 2:
             raw = scan[1]
-            attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+            attrs = decode_json(raw) or {}
             if attrs.get("superseded_by"):
                 return  # already superseded, idempotent
             attrs["superseded_by"] = superseded_by
@@ -572,7 +574,7 @@ async def soft_delete_fact(
     try:
         raw = await r.execute_command("VGETATTR", FACT_KEY, element_id)
         if raw:
-            attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+            attrs = decode_json(raw) or {}
             if attrs.get("superseded_by"):
                 return  # already superseded, idempotent
             attrs["superseded_by"] = superseded_by
@@ -609,7 +611,7 @@ async def get_procs_for_tool(
     """
     key = f"{PROC_BY_TOOL_PRE}{tool_name.lower()}"
     members = await r.smembers(key)
-    return [m.decode() if isinstance(m, bytes) else m for m in members]
+    return [force_str(m) for m in members]
 
 
 async def scan_all_procedures(r: aioredis.Redis, max_count: int = 1000) -> list[dict]:
@@ -634,11 +636,11 @@ async def scan_all_procedures(r: aioredis.Redis, max_count: int = 1000) -> list[
     while i + 2 < len(results):
         elem = results[i]; raw = results[i + 2]
         i += 3
-        elem_str = elem.decode() if isinstance(elem, bytes) else elem
+        elem_str = force_str(elem)
         if elem_str == "__seed__":
             continue
         try:
-            attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+            attrs = decode_json(raw)
         except Exception:
             continue
         if attrs.get("_seed") or not attrs.get("task"):

@@ -21,11 +21,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import time
 from collections import deque
 
 import redis.asyncio as aioredis
+
+from .utils import decode_json, force_str
+
+log = logging.getLogger(__name__)
 
 GRAPH_PREFIX = "mem:graph:"
 
@@ -39,6 +44,67 @@ RELATIONSHIP_TYPES = frozenset({
     "supersedes",     # A supersedes B (newer version replaces older)
     "related_to",     # Default co-occurrence (legacy)
 })
+
+# ── Atomic edge upsert via Lua script ─────────────────────────────────────────
+# Race condition fix: the old Python read-modify-write pattern lost source_count
+# increments under concurrent access (two coroutines both read source_count=N,
+# both write N+1 instead of N+2). This Lua script does the read+merge+write
+# atomically inside Redis, which is single-threaded for Lua execution.
+
+_UPSERT_EDGE_LUA = """
+local key = KEYS[1]
+local field = ARGV[1]
+local edge_type = ARGV[2]
+local confidence = tonumber(ARGV[3])
+local now_ms = tonumber(ARGV[4])
+local source = ARGV[5]
+
+local raw = redis.call('HGET', key, field)
+if raw then
+    local ok, edge = pcall(cjson.decode, raw)
+    if ok and type(edge) == 'table' then
+        edge['source_count'] = (edge['source_count'] or 1) + 1
+        edge['confidence'] = math.max(edge['confidence'] or 0.5, confidence)
+        edge['last_seen'] = now_ms
+        if source and source ~= '' then
+            local sources = edge['sources'] or {}
+            local found = false
+            for i, s in ipairs(sources) do
+                if s == source then found = true; break end
+            end
+            if not found then
+                table.insert(sources, source)
+                if #sources > 5 then
+                    local trimmed = {}
+                    for i = #sources - 4, #sources do
+                        trimmed[#trimmed+1] = sources[i]
+                    end
+                    sources = trimmed
+                end
+                edge['sources'] = sources
+            end
+        end
+        redis.call('HSET', key, field, cjson.encode(edge))
+        return 1
+    end
+end
+
+-- New edge
+local new_edge = {
+    type = edge_type,
+    confidence = confidence,
+    source_count = 1,
+    last_seen = now_ms,
+    sources = {}
+}
+if source and source ~= '' then
+    new_edge['sources'] = {source}
+end
+redis.call('HSET', key, field, cjson.encode(new_edge))
+return 0
+"""
+
+_edge_script = None  # cached Script object
 
 
 def _slug(entity: str) -> str:
@@ -71,7 +137,8 @@ async def record_entities(
     Record co-occurrence edges for all pairs in entities + persons.
 
     For N items this creates N*(N-1) directed edges (stored as undirected
-    by writing both directions). Uses a Redis pipeline for efficiency.
+    by writing both directions). Uses atomic Lua scripts for each edge
+    to prevent race conditions during concurrent updates.
 
     LLM Wiki v2 (v1.1): edges are now typed with confidence and source_count.
     Stored as Redis Hash: {neighbour_slug: edge_json} where edge_json contains
@@ -95,7 +162,10 @@ async def record_entities(
     if len(all_ents) < 2:
         return
 
-    pipe = r.pipeline(transaction=False)
+    global _edge_script
+    if _edge_script is None:
+        _edge_script = r.register_script(_UPSERT_EDGE_LUA)
+
     now_ms = int(time.time() * 1000)
 
     for i, a in enumerate(all_ents):
@@ -104,32 +174,15 @@ async def record_entities(
             slug_b = _slug(b)
             if slug_a == slug_b:
                 continue
-            # Read existing edges to merge (not overwrite)
-            # We must read before the pipeline, so do it outside the pipeline
+            # Atomic upsert for both directions using Lua script
             for key, field in [(_key(a), slug_b), (_key(b), slug_a)]:
-                existing = await r.hget(key, field)
-                if existing:
-                    try:
-                        edge = json.loads(existing.decode() if isinstance(existing, bytes) else existing)
-                        edge["source_count"] = edge.get("source_count", 1) + 1
-                        edge["confidence"] = max(edge.get("confidence", 0.5), confidence)
-                        edge["last_seen"] = now_ms
-                        if source and source not in edge.get("sources", []):
-                            edge.setdefault("sources", []).append(source)
-                            edge["sources"] = edge["sources"][:5]
-                        pipe.hset(key, field, json.dumps(edge))
-                        continue
-                    except (json.JSONDecodeError, UnicodeDecodeError):
-                        pass  # corrupt data → overwrite with fresh edge
-                edge_data = json.dumps({
-                    "type": relationship_type,
-                    "confidence": confidence,
-                    "source_count": 1,
-                    "last_seen": now_ms,
-                    "sources": [source][:5] if source else [],
-                })
-                pipe.hset(key, field, edge_data)
-    await pipe.execute()
+                try:
+                    await _edge_script(
+                        keys=[key],
+                        args=[field, relationship_type, str(confidence), str(now_ms), source or ""],
+                    )
+                except Exception as e:
+                    log.warning("record_entities Lua failed for %s/%s: %s", key, field, e)
 
 
 async def add_typed_edge(
@@ -150,6 +203,9 @@ async def add_typed_edge(
     If an edge already exists between the same pair, increments source_count
     and updates confidence to max(existing, new).
 
+    Uses atomic Lua script to prevent race conditions during concurrent
+    edge updates (same pattern as record_entities).
+
     Args:
         r:                Redis client.
         source_entity:    Source entity name.
@@ -167,31 +223,20 @@ async def add_typed_edge(
     if slug_s == slug_t:
         return
 
+    global _edge_script
+    if _edge_script is None:
+        _edge_script = r.register_script(_UPSERT_EDGE_LUA)
+
     now_ms = int(time.time() * 1000)
 
     async def _upsert_edge(key: str, field: str) -> None:
-        existing = await r.hget(key, field)
-        if existing:
-            try:
-                edge = json.loads(existing.decode() if isinstance(existing, bytes) else existing)
-                edge["source_count"] = edge.get("source_count", 1) + 1
-                edge["confidence"] = max(edge.get("confidence", 0.5), confidence)
-                edge["last_seen"] = now_ms
-                if source and source not in edge.get("sources", []):
-                    edge.setdefault("sources", []).append(source)
-                    edge["sources"] = edge["sources"][:5]
-                await r.hset(key, field, json.dumps(edge))
-                return
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                pass
-        edge_data = json.dumps({
-            "type": relationship_type,
-            "confidence": confidence,
-            "source_count": 1,
-            "last_seen": now_ms,
-            "sources": [source][:5] if source else [],
-        })
-        await r.hset(key, field, edge_data)
+        try:
+            await _edge_script(
+                keys=[key],
+                args=[field, relationship_type, str(confidence), str(now_ms), source or ""],
+            )
+        except Exception as e:
+            log.warning("add_typed_edge Lua failed for %s/%s: %s", key, field, e)
 
     await _upsert_edge(_key(source_entity), slug_t)
     if bidirectional:
@@ -244,12 +289,12 @@ async def traverse(
         # Get neighbours from hash
         raw_edges = await r.hgetall(_key_from_slug(slug))
         for neighbour_raw, edge_raw in raw_edges.items():
-            n_slug = neighbour_raw.decode() if isinstance(neighbour_raw, bytes) else neighbour_raw
+            n_slug = force_str(neighbour_raw)
             if n_slug in visited:
                 continue
             try:
-                edge = json.loads(edge_raw.decode() if isinstance(edge_raw, bytes) else edge_raw)
-            except (json.JSONDecodeError, UnicodeDecodeError):
+                edge = decode_json(edge_raw)
+            except Exception:
                 edge = {"type": "related_to", "confidence": 0.5}
 
             e_type = edge.get("type", "related_to")
@@ -362,26 +407,39 @@ async def graph_stats(r: aioredis.Redis) -> dict:
     A node = any mem:graph:* key (one per distinct entity slug).
     An edge = one hash field or set member (each real edge stored as two directed members).
     Handles both Hash-based typed edges (v1.1) and legacy Set-based edges (v0.9.0).
+    Uses pipeline for batched size lookups (avoids N+1 queries).
     """
     node_keys = []
     async for key in r.scan_iter(f"{GRAPH_PREFIX}*"):
         node_keys.append(key)
 
     node_count = len(node_keys)
+    if not node_keys:
+        return {"node_count": 0, "edge_count_directed": 0, "edge_count_undirected": 0}
+
+    # Batch size lookups via pipeline
+    key_strs = [key.decode() if isinstance(key, bytes) else key for key in node_keys]
+    pipe = r.pipeline(transaction=False)
+    for ks in key_strs:
+        pipe.hlen(ks)
+    hlens = await pipe.execute()
+
     edge_count = 0
-    for key in node_keys:
-        key_str = key.decode() if isinstance(key, bytes) else key
-        # Try Hash-based typed edges first (v1.1)
-        try:
-            hlen = await r.hlen(key_str)
-            if hlen > 0:
-                edge_count += hlen
-                continue
-        except Exception:
-            pass
-        # Fallback: legacy Set-based edges (v0.9.0)
-        card = await r.scard(key_str)
-        edge_count += card
+    # For keys with hlen=0, fall back to scard (legacy Set-based edges)
+    fallback_keys = []
+    for ks, hlen_val in zip(key_strs, hlens):
+        if hlen_val and hlen_val > 0:
+            edge_count += hlen_val
+        else:
+            fallback_keys.append(ks)
+
+    if fallback_keys:
+        pipe = r.pipeline(transaction=False)
+        for ks in fallback_keys:
+            pipe.scard(ks)
+        scards = await pipe.execute()
+        for sc in scards:
+            edge_count += sc
 
     # edge_count is sum of directed edges; undirected count = edge_count // 2
     return {
@@ -500,20 +558,31 @@ async def get_entity_neighbors_with_counts(
     Return related entities with their edge type and connection counts.
 
     Works with both Hash-based typed edges (v1.1) and legacy Set-based edges.
+    Uses pipeline for batched connection count lookups (avoids N+1 queries).
     """
     # Try Hash-based typed edges first (v1.1)
     raw_edges = await r.hgetall(_key(entity))
     if raw_edges:
-        results = []
+        # Parse edges first
+        parsed: list[tuple[str, dict]] = []
         for neighbour_raw, edge_raw in sorted(raw_edges.items(), key=lambda x: x[0]):
             slug = neighbour_raw.decode() if isinstance(neighbour_raw, bytes) else neighbour_raw
             try:
                 edge = json.loads(edge_raw.decode() if isinstance(edge_raw, bytes) else edge_raw)
             except (json.JSONDecodeError, UnicodeDecodeError):
                 edge = {"type": "related_to", "confidence": 0.5, "source_count": 1}
-            # Count connections of the neighbour
-            n_edges = await r.hlen(_key_from_slug(slug))
+            parsed.append((slug, edge))
+
+        # Batch connection count lookups via pipeline
+        pipe = r.pipeline(transaction=False)
+        for slug, _ in parsed:
+            pipe.hlen(_key_from_slug(slug))
+        counts = await pipe.execute()
+
+        results = []
+        for (slug, edge), n_edges in zip(parsed, counts):
             if not n_edges:
+                # Fallback: try legacy Set-based count
                 n_edges = await r.scard(_key_from_slug(slug))
             results.append({
                 "entity": slug,
@@ -529,9 +598,16 @@ async def get_entity_neighbors_with_counts(
     related_slugs = [
         (m.decode() if isinstance(m, bytes) else m) for m in related_slugs_raw
     ]
+    # Batch connection count lookups via pipeline
+    if related_slugs:
+        pipe = r.pipeline(transaction=False)
+        for slug in related_slugs:
+            pipe.scard(_key_from_slug(slug))
+        counts = await pipe.execute()
+    else:
+        counts = []
     results = []
-    for slug in sorted(related_slugs):
-        card = await r.scard(_key_from_slug(slug))
+    for slug, card in zip(sorted(related_slugs), counts):
         results.append({
             "entity": slug,
             "connection_count": int(card or 0),

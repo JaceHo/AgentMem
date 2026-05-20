@@ -1,68 +1,28 @@
 #!/usr/bin/env python3
 """session-start hook — registers session, optionally injects context."""
 
-import json
 import os
-import sys
 
-try:
-    import httpx
-except ImportError:
-    sys.exit(0)
+from hooks.common import current_project, current_session_id, post_and_write_output, read_input, skip_hook
 
-REST_URL = os.getenv("AGENTMEMORY_URL", "http://localhost:18800")
-SECRET = os.getenv("AGENTMEMORY_SECRET", "")
-INJECT_CONTEXT = os.getenv("AGENTMEMORY_INJECT_CONTEXT", "true").lower() == "true"
-REGISTER_TIMEOUT = 0.8
 INJECT_TIMEOUT = 1.5
 
 
 def main():
-    try:
-        data = json.load(sys.stdin)
-    except Exception:
+    data = read_input()
+    if not data or skip_hook(data):
         return
 
-    if os.getenv("AGENTMEMORY_SDK_CHILD") == "1":
-        return
-    if isinstance(data, dict) and data.get("entrypoint") == "sdk-ts":
-        return
-
-    session_id = data.get("session_id") or f"ses_{os.getpid()}"
-    project = data.get("cwd") or os.getcwd()
-
-    headers = {"Content-Type": "application/json"}
-    if SECRET:
-        headers["Authorization"] = f"Bearer {SECRET}"
+    session_id = current_session_id(data, default=f"ses_{os.getpid()}")
+    project = current_project(data)
 
     payload = {"sessionId": session_id, "project": project, "cwd": project}
 
-    if not INJECT_CONTEXT:
-        try:
-            httpx.post(
-                f"{REST_URL}/agentmemory/session/start",
-                json=payload,
-                headers=headers,
-                timeout=REGISTER_TIMEOUT,
-            )
-        except Exception:
-            pass
+    if not os.getenv("AGENTMEMORY_INJECT_CONTEXT", "true").lower() == "true":
+        post_and_write_output("/agentmemory/session/start", payload, timeout=INJECT_TIMEOUT)
         return
 
-    try:
-        resp = httpx.post(
-            f"{REST_URL}/agentmemory/session/start",
-            json=payload,
-            headers=headers,
-            timeout=INJECT_TIMEOUT,
-        )
-        if resp.status_code == 200:
-            result = resp.json()
-            context = result.get("context")
-            if context:
-                sys.stdout.write(context)
-    except Exception:
-        pass
+    post_and_write_output("/agentmemory/session/start", payload, timeout=INJECT_TIMEOUT)
 
 
 if __name__ == "__main__":

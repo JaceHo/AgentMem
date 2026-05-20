@@ -1,5 +1,5 @@
 """
-AgentMem — Local Agent Memory Service  v1.0.0
+AgentMem — Local Agent Memory Service  v1.1.0
 ==============================================
 Replaces memos-cloud-openclaw-plugin with fully local, persistent memory.
 
@@ -9,7 +9,7 @@ Replaces memos-cloud-openclaw-plugin with fully local, persistent memory.
   Tier 2 — Long-term vectors : episodic + semantic + procedural (Redis HNSW, permanent)
   +       — Capability layer : tool/env/agent self-model (Redis Hash + vectorset)
 
-Features (v0.9.2 — A-MAC + wRRF + importance floors):
+Features (v1.1.0 — Refactored with atomic counters + centralized config):
   1. Heat-tiered recall        — frequently/recently accessed memories rank higher
   2. Scene isolation           — language + domain tags filter recall by context
   3. Evolving persona          — structured user profile updated from extracted facts
@@ -54,6 +54,8 @@ Features (v0.9.2 — A-MAC + wRRF + importance floors):
                                  keyword/topic enrichment on existing fact (v1.1)
  29. Dual-layer fact linking  — source_episode_id links each fact to source episode
                                  for Memori-style narrative context retrieval (v1.1)
+ 30. Atomic counters          — thread-safe state management (v1.1 refactor)
+ 31. Centralized config       — environment-variable tunable parameters (v1.1 refactor)
 
 Endpoints:
   POST /recall              — before_agent_start hook (includes tool context + graph)
@@ -83,7 +85,6 @@ Endpoints:
   GET  /stats
 """
 
-import ast
 import asyncio
 import json
 import logging
@@ -92,7 +93,6 @@ import re
 import time
 from contextlib import asynccontextmanager
 from functools import lru_cache
-from typing import Any
 
 import httpx
 import numpy as np
@@ -101,45 +101,39 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from api.schemas.memory import RecallRequest, Message, StoreRequest
+
 try:
     from rank_bm25 import BM25Okapi as _BM25Okapi
     _BM25_AVAILABLE = True
 except ImportError:
     _BM25_AVAILABLE = False
 
+# ── Import refactored modules ────────────────────────────────────────────────
+from concurrency import AtomicCounter, AtomicFloat, TaskManager
+from config.settings import settings
+from utils.text_processing import (
+    flatten_message_content,
+    estimate_tokens,
+    redact_secrets,
+    contains_secret,
+    strip_platform_noise,
+    is_only_platform_noise,
+    is_brief_option_reply,
+    is_trivial,
+    is_injected_system_content,
+)
 
-# ── Background task manager ────────────────────────────────────────────────────
-# Replaces bare asyncio.create_task() calls with tracked tasks that:
-#   1. Capture and log exceptions (no silent failures)
-#   2. Limit concurrency (max 50 concurrent background tasks)
-#   3. Are cancelled on shutdown
-_bg_tasks: set[asyncio.Task] = set()
-_BG_TASK_LIMIT = 50
-
-
-def _spawn(coro, name: str = "bg") -> None:
-    """Fire-and-forget a coroutine as a tracked background task.
-
-    Unlike bare asyncio.create_task(), this:
-    - Logs uncaught exceptions instead of silently swallowing them
-    - Limits concurrent background tasks to prevent memory leaks
-    - Tracks tasks so they can be cancelled at shutdown
-    """
-    if len(_bg_tasks) >= _BG_TASK_LIMIT:
-        log.warning("[bg] task limit (%d) reached, dropping %s", _BG_TASK_LIMIT, name)
-        return
-    task = asyncio.create_task(coro)
-    _bg_tasks.add(task)
-    task.add_done_callback(lambda t: _bg_tasks.discard(t))
-    # Log exceptions from background tasks (also consumes the exception
-    # to prevent Python's "Task exception was never retrieved" warning)
-    def _log_exception(t: asyncio.Task):
-        if t.cancelled():
-            return
-        exc = t.exception()
-        if exc:
-            log.error("[bg:%s] unhandled exception: %s", name, exc)
-    task.add_done_callback(_log_exception)
+# Private aliases — used throughout main.py with underscore prefix
+_is_injected = is_injected_system_content
+_strip_platform_noise = strip_platform_noise
+_is_only_platform_noise = is_only_platform_noise
+_is_brief_option_reply = is_brief_option_reply
+_contains_secret = contains_secret
+_redact_secrets = redact_secrets
+_is_trivial = is_trivial
+_flatten_message_content = flatten_message_content
+_estimate_tokens = estimate_tokens
 
 from core import capability as cap_mod
 from core import embedder
@@ -153,9 +147,9 @@ from core import scene as scene_mod
 from core import store as mem_store
 from core import summarizer
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [mem] %(message)s")
+logging.basicConfig(level=getattr(logging, settings.log_level), format=settings.log_format)
 log = logging.getLogger("mem")
-APP_VERSION = "1.0.0"
+APP_VERSION = settings.app_version
 
 # Attach SSE log handler — broadcasts every record to dashboard clients,
 # stores it in an in-memory ring buffer, and persists it to
@@ -169,66 +163,26 @@ logging.getLogger().addHandler(_sse_handler)
 
 _redis = None
 
-# ── Auto-consolidation counters ────────────────────────────────────────────────
-_stores_since_consolidation: int = 0
-_AUTO_CONSOLIDATE_EVERY: int = 50   # trigger after every N stored facts
+# ── Task manager for fire-and-forget background work ─────────────────────────
+_task_manager = TaskManager(max_concurrent=settings.bg_task_limit)
+_AUTO_CONSOLIDATE_EVERY = settings.auto_consolidate_every
 
-# ── Hard-prune (physical VREM of superseded entries) runs every 24 hours ───────
-_periodic_prune_counter: int = 0    # incremented each hourly _periodic_consolidate call
+def _spawn(coro, name: str = "bg") -> None:
+    """Fire-and-forget a coroutine with TaskManager supervision."""
+    _task_manager.spawn(coro, name=name)
 
-# ── Store observability counters (in-process, resets on restart) ───────────────
-_store_attempts: int = 0
-_store_successes: int = 0
-_store_skips: int = 0
-_store_errors: int = 0
-_store_latency_sum_ms: float = 0.0
+# ── Thread-safe auto-consolidation counter (replaces bare int) ────────────────
+_stores_since_consolidation = AtomicCounter()
 
-# ── System-injected content filter ────────────────────────────────────────────
-_SKIP_PREFIXES = (
-    "## Long-Term Memory",
-    "## Recent Relevant Episodes",
-    "## Current Session Context",
-    "## User Profile",
-    "[cron:",
-)
+# ── Thread-safe hard-prune scheduler counter ─────────────────────────────────
+_periodic_prune_counter = AtomicCounter()
 
-# Platform tags that must never be stored as content
-_PLATFORM_TAG_RE = re.compile(
-    r"\[\[reply_to_current\]\]|\[\[reply_to:[^\]]*\]\]",
-    re.IGNORECASE,
-)
-
-# Matches a message that is ONLY a <cross_session_memory> block (possibly followed
-# by whitespace or a HEARTBEAT keyword — nothing real).
-_ONLY_CROSS_SESSION_RE = re.compile(
-    r"^\s*<cross_session_memory>.*?</cross_session_memory>\s*(HEARTBEAT[^\n]*)?\s*$",
-    re.DOTALL | re.IGNORECASE,
-)
-
-# Matches the leading <cross_session_memory>…</cross_session_memory> block so we
-# can strip it and keep whatever real message follows.
-_CROSS_SESSION_PREFIX_RE = re.compile(
-    r"^\s*<cross_session_memory>.*?</cross_session_memory>\s*",
-    re.DOTALL | re.IGNORECASE,
-)
-
-
-_OPTION_REPLY_RE = re.compile(
-    r"^\s*(?:option|choice|select|pick)?\s*[#(]?\s*(\d{1,2})\s*[)\].:,-]?\s*$",
-    re.IGNORECASE,
-)
-
-_SECRET_PATTERNS: list[tuple[re.Pattern[str], str]] = [
-    (re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{12,}\b"), "[REDACTED_GITHUB_TOKEN]"),
-    (re.compile(r"\bsk-[A-Za-z0-9_-]{10,}\b"), "[REDACTED_API_KEY]"),
-    (re.compile(r"\btoken-active-\d+\b", re.IGNORECASE), "[REDACTED_TOKEN]"),
-]
-
-_SECRET_KEYWORD_VALUE_RE = re.compile(
-    r"(?i)\b(password|token|api[_ -]?key|secret)\b"
-    r"(\s*(?:is|=|:|for\s+[^:\n]{1,80}?\s+is)\s*)"
-    r"([\'\"]?)([^\'\"\s;,\n]+)\3"
-)
+# ── Thread-safe store observability counters (replaces bare int/float) ───────
+_store_attempts = AtomicCounter()
+_store_successes = AtomicCounter()
+_store_skips = AtomicCounter()
+_store_errors = AtomicCounter()
+_store_latency_sum_ms = AtomicFloat()
 
 # ── BM25 in-memory index (Memori arXiv:2603.19935 hybrid retrieval) ────────────
 # Maintains a live BM25Okapi corpus over stored facts for exact-term matching.
@@ -335,71 +289,6 @@ class _BM25Index:
 
 _bm25_index = _BM25Index()
 
-
-def _is_injected(text: str) -> bool:
-    t = text.strip()
-    return any(t.startswith(p) for p in _SKIP_PREFIXES)
-
-
-def _strip_platform_noise(text: str) -> str:
-    """Remove platform tags and cross_session_memory prefixes from content.
-
-    1. Strip leading <cross_session_memory>…</cross_session_memory> block.
-    2. Remove any remaining [[reply_to_current]] / [[reply_to:<id>]] tags.
-    """
-    # Strip cross_session_memory prefix block (keep real content after it)
-    text = _CROSS_SESSION_PREFIX_RE.sub("", text)
-    # Strip platform reply tags anywhere in the text
-    text = _PLATFORM_TAG_RE.sub("", text)
-    return text.strip()
-
-
-def _is_only_platform_noise(text: str) -> bool:
-    """Return True when the entire message is a cross_session_memory wrapper
-    with no meaningful user content after it (or just a HEARTBEAT line).
-    """
-    return bool(_ONLY_CROSS_SESSION_RE.match(text))
-
-
-def _is_brief_option_reply(text: str) -> bool:
-    return bool(_OPTION_REPLY_RE.match(text or ""))
-
-
-def _contains_secret(text: str) -> bool:
-    if not text:
-        return False
-    if any(pattern.search(text) for pattern, _ in _SECRET_PATTERNS):
-        return True
-    return bool(_SECRET_KEYWORD_VALUE_RE.search(text))
-
-
-def _redact_secrets(text: str) -> str:
-    if not text:
-        return ""
-    redacted = text
-    for pattern, replacement in _SECRET_PATTERNS:
-        redacted = pattern.sub(replacement, redacted)
-    return _SECRET_KEYWORD_VALUE_RE.sub(
-        lambda m: f"{m.group(1)}{m.group(2)}[REDACTED]",
-        redacted,
-    )
-
-
-# ── Trivial message filter ─────────────────────────────────────────────────────
-_TRIVIAL_MIN_CHARS = 15  # user text shorter than this → skip episode store
-_TRIVIAL_PATTERNS = re.compile(
-    r"^(hi+|hello+|hey+|yo+|ok+|okay|sure|thanks?|thx|bye+|good\s*(morning|night|day)|"
-    r"好的|嗯|哦|呵|哈|谢谢|再见|早|晚安|你好|您好|ji+|test+|ping)[\s!?.。！？]*$",
-    re.IGNORECASE,
-)
-
-def _is_trivial(user_text: str) -> bool:
-    t = user_text.strip()
-    if len(t) < _TRIVIAL_MIN_CHARS:
-        return True
-    return bool(_TRIVIAL_PATTERNS.match(t))
-
-
 # ── Embedding cache ────────────────────────────────────────────────────────────
 @lru_cache(maxsize=1024)
 def _cached_encode(text: str) -> bytes:
@@ -407,6 +296,44 @@ def _cached_encode(text: str) -> bytes:
 
 def _encode(text: str) -> np.ndarray:
     return np.frombuffer(_cached_encode(text), dtype=np.float32).copy()
+
+# ── VSIM scan helper (repeated pattern: zero-vector scan to list all elements) ─
+_ZERO_VEC = np.zeros(embedder.DIMS, dtype=np.float32)
+
+async def _vscan(r, vset_key: str, max_count: int = 200) -> list[dict]:
+    """Scan all elements in a vectorset using zero-vector VSIM.
+
+    Returns list of {element, score, attrs} dicts, excluding __seed__ entries.
+    Common pattern extracted from 13+ call sites.
+    """
+    card = await r.execute_command("VCARD", vset_key)
+    if not card or int(card) <= 1:
+        return []
+    try:
+        results = await r.execute_command(
+            "VSIM", vset_key, "FP32", _ZERO_VEC.tobytes(),
+            "COUNT", min(int(card), max_count), "WITHSCORES", "WITHATTRIBS"
+        )
+    except Exception:
+        return []
+    items = []
+    i = 0
+    while i + 2 < len(results):
+        elem = results[i]
+        score = results[i + 1]
+        raw = results[i + 2]
+        i += 3
+        elem_str = elem.decode() if isinstance(elem, bytes) else elem
+        if elem_str == "__seed__":
+            continue
+        try:
+            attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+        except Exception:
+            continue
+        if attrs.get("_seed"):
+            continue
+        items.append({"element": elem_str, "score": float(score) if score else 0.0, "attrs": attrs})
+    return items
 
 # ── Session handoff: pinned last-session summary ───────────────────────────────
 # Key stores the most recent session summary so the NEXT session can always
@@ -426,9 +353,9 @@ async def _periodic_consolidate() -> None:
                 await _do_consolidate()
         except Exception as e:
             log.warning(f"[periodic_consolidate] error: {e}")
-        _periodic_prune_counter += 1
-        if _periodic_prune_counter >= 24:
-            _periodic_prune_counter = 0
+        prune_count = await _periodic_prune_counter.increment()
+        if prune_count >= 24:
+            await _periodic_prune_counter.reset()
             try:
                 await _do_hard_prune()
             except Exception as e:
@@ -440,31 +367,12 @@ async def _populate_bm25_from_redis(r) -> None:
     if not _BM25_AVAILABLE:
         return
     try:
-        card = await r.execute_command("VCARD", mem_store.FACT_KEY)
-        if not card or int(card) <= 1:
-            return
-        seed = np.zeros(embedder.DIMS, dtype=np.float32)
-        results = await r.execute_command(
-            "VSIM", mem_store.FACT_KEY, "FP32", seed.astype("float32").tobytes(),
-            "COUNT", min(int(card), 5000), "WITHSCORES", "WITHATTRIBS"
-        )
-        items: list[dict] = []
-        i = 0
-        while i + 2 < len(results):
-            elem = results[i]; raw = results[i + 2]
-            i += 3
-            elem_str = elem.decode() if isinstance(elem, bytes) else elem
-            if elem_str == "__seed__":
-                continue
-            try:
-                attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
-            except Exception:
-                continue
-            if attrs.get("_seed") or not attrs.get("content"):
-                continue
-            if attrs.get("superseded_by"):
-                continue
-            items.append({"_element": elem_str, "content": attrs["content"], "attrs": attrs})
+        scanned = await _vscan(r, mem_store.FACT_KEY, max_count=5000)
+        items = [
+            {"_element": item["element"], "content": item["attrs"]["content"], "attrs": item["attrs"]}
+            for item in scanned
+            if item["attrs"].get("content") and not item["attrs"].get("superseded_by")
+        ]
         await _bm25_index.populate_from_items(items)
         log.info(f"[bm25] populated corpus from Redis: {len(items)} facts")
     except Exception as e:
@@ -504,13 +412,20 @@ async def lifespan(app: FastAPI):
     log.info("AgentMem v%s ready (session-handoff+hard-prune+auto-graph+batch-MCP+compat+auto-crystallize)", APP_VERSION)
     yield
     # Cancel tracked background tasks before closing Redis
-    for t in list(_bg_tasks):
-        t.cancel()
-    _bg_tasks.clear()
+    await _task_manager.shutdown(timeout=settings.bg_task_shutdown_timeout)
     await mem_store.close_pool()
 
 
 app = FastAPI(title="AgentMem — Local Agent Memory Service", version=APP_VERSION, lifespan=lifespan)
+
+
+@app.middleware("http")
+async def redis_guard(request: Request, call_next):
+    """Return 503 if Redis is not connected (prevents NoneType crashes)."""
+    if _redis is None and request.url.path not in ("/health", "/docs", "/openapi.json", "/redoc"):
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=503, content={"detail": "Redis not connected"})
+    return await call_next(request)
 
 # ── Static files + SSE log router ─────────────────────────────────────────────
 import os as _os
@@ -526,6 +441,8 @@ if _os.path.isdir(_static_dir):
         app.mount("/js", StaticFiles(directory=_js_dir), name="js")
 
 app.include_router(log_sse.log_sse_router)
+from api.routes import memory_router
+app.include_router(memory_router)
 
 # ── WebSocket for real-time dashboard updates ─────────────────────────────────
 _ws_clients: set[WebSocket] = set()
@@ -584,29 +501,7 @@ async def dashboard():
 
 
 # ── Request / Response models ──────────────────────────────────────────────────
-class RecallRequest(BaseModel):
-    query: str
-    session_id: str = ""
-    memory_limit_number: int = 6
-    include_tools: bool = True          # Whether to append relevant tool context
-    include_procedures: bool = False    # Whether to append relevant skill/procedure context (v0.9.4)
-    include_graph: bool = False         # Explicitly expand knowledge graph neighbours (v0.9.0)
-    auto_graph: bool = True             # Auto-trigger graph expansion when query has named entities (v1.0)
-    # SimpleMem Section 3.3: Intent-Aware Retrieval Planning (v0.9.1)
-    enable_planning: bool = False       # LLM-based query planning (adds ~300-600ms)
-    enable_reflection: bool = False     # LLM sufficiency check + second-pass retrieval
-    token_budget: int = 1500            # Max tokens in context output (SimpleMem budget)
-    # SimpleMem symbolic filter: restrict recall to a time window (Unix ms)
-    time_from: int | None = None        # e.g. 1740000000000 (ms)
-    time_to:   int | None = None        # e.g. 1742687999000 (ms)
-
-class Message(BaseModel):
-    role: str
-    content: Any
-
-class StoreRequest(BaseModel):
-    messages: list[Message]
-    session_id: str = ""
+# RecallRequest, Message, and StoreRequest are now defined in api.schemas.memory
 
 # ── Capability request models ──────────────────────────────────────────────────
 class ToolDefinition(BaseModel):
@@ -772,37 +667,6 @@ class ImportRequest(BaseModel):
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
-def _flatten_message_content(content: Any) -> str:
-    if isinstance(content, str):
-        raw = content.strip()
-        if not raw:
-            return ""
-        if raw[:1] in "[{":
-            parsed = None
-            try:
-                parsed = json.loads(raw)
-            except Exception:
-                try:
-                    parsed = ast.literal_eval(raw)
-                except Exception:
-                    parsed = None
-            if parsed is not None and parsed is not content:
-                return _flatten_message_content(parsed)
-        return raw
-    if isinstance(content, dict):
-        block_type = str(content.get("type", "")).lower()
-        if block_type in {"tool_use", "tool_result", "thinking"}:
-            return ""
-        if "text" in content:
-            return _flatten_message_content(content.get("text"))
-        if "content" in content:
-            return _flatten_message_content(content.get("content"))
-        return ""
-    if isinstance(content, list):
-        parts = [_flatten_message_content(item) for item in content]
-        return " ".join(part for part in parts if part).strip()
-    return ""
-
 
 def _msg_text(m: Message) -> str:
     raw = _flatten_message_content(m.content)
@@ -812,10 +676,6 @@ def _messages_to_text(messages: list[Message]) -> str:
     return "\n".join(
         f"{m.role}: {_msg_text(m)}" for m in messages if _msg_text(m)
     )
-
-def _estimate_tokens(text: str) -> int:
-    """Fast word-count token estimate (SimpleMem Section 3.3 budget packing)."""
-    return len(text.split())
 
 
 def _format_prepend(
@@ -1343,7 +1203,7 @@ async def _check_contradiction(existing_fact: dict, new_fact) -> None:
 # ── Background store ──────────────────────────────────────────────────────────
 async def _do_store(messages: list[Message], session_id: str) -> None:
     global _store_attempts, _store_successes, _store_skips, _store_errors, _store_latency_sum_ms
-    _store_attempts += 1
+    await _store_attempts.increment()
     t0 = time.time()
     outcome = "error"
     try:
@@ -1520,16 +1380,16 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
         #    the whole session rather than holding only the last turn.
         await _accumulate_session(session_id, summary)
 
-        # 9. Auto-consolidation: trigger after every _AUTO_CONSOLIDATE_EVERY stored facts
+        # 9. Auto-consolidation: trigger after every settings.auto_consolidate_every stored facts
         global _stores_since_consolidation
-        _stores_since_consolidation += fact_saved
-        if _stores_since_consolidation >= _AUTO_CONSOLIDATE_EVERY:
-            _stores_since_consolidation = 0
+        fact_count = await _stores_since_consolidation.increment(fact_saved)
+        if fact_count >= settings.auto_consolidate_every:
+            await _stores_since_consolidation.reset()
             _spawn(_do_consolidate(), "consolidate")
             log.info("[store] auto-consolidation triggered")
 
         ms = int((time.time() - t0) * 1000)
-        _store_successes += 1
+        await _store_successes.increment()
         outcome = "success"
         log.info(f"[store] session={session_id} lang={lang} domain={domain} "
                  f"ep+{ep_saved} facts+{fact_saved} {ms}ms")
@@ -1538,12 +1398,11 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
         log.warning(f"[store] background error: {e}", exc_info=True)
     finally:
         ms = int((time.time() - t0) * 1000)
-        _store_latency_sum_ms += ms
+        await _store_latency_sum_ms.add(ms)
         if outcome == "skip":
-            _store_skips += 1
+            await _store_skips.increment()
         elif outcome == "error":
-            _store_errors += 1
-
+            await _store_errors.increment()
 
 # ── Session helpers (Tier 1 — rolling accumulation + promote) ─────────────────
 
@@ -1910,16 +1769,20 @@ async def recall(req: RecallRequest):
     domain_filter = f'.domain == "{q_domain}"' if q_domain != "general" else None
 
     # SimpleMem symbolic filter: time-range hard constraint
-    # Combines with lang_filter as a compound VSIM FILTER expression
-    def _build_filter(base_filter: str) -> str:
-        parts = [base_filter] if base_filter else []
+    # Combines with lang_filter + domain_filter as a compound VSIM FILTER expression
+    def _build_filter(base_filter: str | None, domain_f: str | None = None) -> str:
+        parts = []
+        if base_filter:
+            parts.append(base_filter)
+        if domain_f:
+            parts.append(domain_f)
         if req.time_from is not None:
             parts.append(f".ts >= {req.time_from}")
         if req.time_to is not None:
             parts.append(f".ts <= {req.time_to}")
         return " && ".join(parts) if parts else ""
 
-    lang_filter_sym = _build_filter(lang_filter)
+    lang_filter_sym = _build_filter(lang_filter, domain_filter)
 
     # Recall strategy: scene-filtered first, supplement with global if sparse
     async def _fetch(vset: str, k: int, fexpr=None):
@@ -2004,26 +1867,33 @@ async def recall(req: RecallRequest):
         try:
             pattern = "mem:crystallized:*"
             cursor = 0
-            digests = []
-            
+            all_keys = []
+
             while True:
                 cursor, keys = await _redis.scan(cursor, match=pattern, count=50)
-                
-                for key in keys:
-                    key_str = key.decode() if isinstance(key, bytes) else key
-                    raw = await _redis.get(key)
-                    if not raw:
-                        continue
-                    
-                    try:
-                        digest = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
-                        digests.append(digest)
-                    except Exception:
-                        continue
-                
-                if cursor == 0 or len(digests) >= 10:
+                all_keys.extend(keys)
+                if cursor == 0 or len(all_keys) >= 10:
                     break
-            
+
+            if not all_keys:
+                return []
+
+            # Batch fetch all values via pipeline (avoids N+1 round-trips)
+            pipe = _redis.pipeline(transaction=False)
+            for key in all_keys:
+                pipe.get(key)
+            raw_values = await pipe.execute()
+
+            digests = []
+            for raw in raw_values:
+                if not raw:
+                    continue
+                try:
+                    digest = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+                    digests.append(digest)
+                except Exception:
+                    continue
+
             # Sort by crystallized_at (most recent first), return top 3
             digests.sort(key=lambda d: d.get("crystallized_at", 0), reverse=True)
             return digests[:3]
@@ -2058,7 +1928,6 @@ async def recall(req: RecallRequest):
     if sym_entities:
         sym_tasks = []
         for ent in sym_entities[:3]:   # cap at 3 to bound latency
-            ent_slug = ent.lower().replace(" ", "_")
             sym_tasks.append(
                 mem_store.knn_search(_redis, mem_store.FACT_KEY, _encode(ent), k=3,
                                      filter_expr=lang_filter_sym or None)
@@ -2927,40 +2796,16 @@ async def _do_consolidate(
     now_ms = int(time.time() * 1000)
     NINETY_DAYS_MS = 90 * 86_400_000
 
-    card = await _redis.execute_command("VCARD", mem_store.FACT_KEY)
-    if not card or int(card) <= 1:
+    scanned = await _vscan(_redis, mem_store.FACT_KEY, max_count=500)
+    if not scanned:
         return {"merged": 0, "decayed": 0, "pruned": 0, "ms": 0}
 
-    try:
-        seed = np.zeros(embedder.DIMS, dtype=np.float32)
-        results = await _redis.execute_command(
-            "VSIM", mem_store.FACT_KEY, "FP32", seed.tobytes(),
-            "COUNT", min(int(card), 500), "WITHSCORES", "WITHATTRIBS"
-        )
-    except Exception as e:
-        log.warning(f"[consolidate] failed to scan facts: {e}")
-        return {"error": str(e)}
-
-    # Parse only active (non-superseded) facts
-    all_facts = []
-    i = 0
-    while i + 2 < len(results):
-        elem = results[i]
-        score = results[i + 1]
-        raw = results[i + 2]
-        i += 3
-        elem_str = elem.decode() if isinstance(elem, bytes) else elem
-        if elem_str == "__seed__":
-            continue
-        try:
-            attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
-        except Exception:
-            continue
-        if attrs.get("_seed") or not attrs.get("content"):
-            continue
-        if attrs.get("superseded_by"):   # skip already-superseded entries
-            continue
-        all_facts.append({"element": elem_str, "attrs": attrs})
+    # Filter only active (non-superseded) facts with content
+    all_facts = [
+        {"element": item["element"], "attrs": item["attrs"]}
+        for item in scanned
+        if item["attrs"].get("content") and not item["attrs"].get("superseded_by")
+    ]
 
     if len(all_facts) < 2:
         return {"merged": 0, "decayed": 0, "pruned": 0, "total": len(all_facts), "ms": 0}
@@ -3157,46 +3002,26 @@ async def _do_hard_prune() -> dict:
     removed_eps   = 0
 
     async def _hard_prune_vset(vset_key: str, max_scan: int = 2000) -> int:
-        card = await _redis.execute_command("VCARD", vset_key)
-        if not card or int(card) <= 1:
-            return 0
-        seed = np.zeros(embedder.DIMS, dtype=np.float32)
-        try:
-            results = await _redis.execute_command(
-                "VSIM", vset_key, "FP32", seed.tobytes(),
-                "COUNT", min(int(card), max_scan), "WITHSCORES", "WITHATTRIBS"
-            )
-        except Exception as e:
-            log.warning(f"[hard_prune] scan failed for {vset_key}: {e}")
+        items = await _vscan(_redis, vset_key, max_count=max_scan)
+        if not items:
             return 0
 
         to_remove: list[str] = []
-        i = 0
-        while i + 2 < len(results):
-            elem = results[i]; raw = results[i + 2]; i += 3
-            elem_str = elem.decode() if isinstance(elem, bytes) else elem
-            if elem_str == "__seed__":
-                continue
-            try:
-                attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
-            except Exception:
-                continue
-            if attrs.get("_seed"):
-                continue
-
+        for item in items:
+            attrs = item["attrs"]
             ts = attrs.get("ts", now_ms)
             age_ms = now_ms - ts
 
             # Hard-delete soft-deleted entries older than 7 days
             superseded = attrs.get("superseded_by", "")
             if superseded and age_ms > SEVEN_DAYS_MS:
-                to_remove.append(elem_str)
+                to_remove.append(item["element"])
                 continue
 
             # Hard-delete stale episodes: 180+ days old, never recalled
             if vset_key == mem_store.EPISODE_KEY:
                 if age_ms > SIX_MONTHS_MS and attrs.get("access_count", 0) == 0:
-                    to_remove.append(elem_str)
+                    to_remove.append(item["element"])
 
         removed = 0
         for elem_str in to_remove:
@@ -3768,32 +3593,13 @@ async def crystallize(req: CrystallizeRequest):
     work and automatically distilling it into a structured digest. What was the
     question? What did we find? What entities were involved? What lessons emerged?"
     """
-    # Gather session facts
-    session_key = f"mem:session:{req.session_id}"
-    session_data = await _redis.get(session_key)
-
-    # Gather facts from this session (by timestamp proximity)
-    card = await _redis.execute_command("VCARD", mem_store.FACT_KEY)
-    if not card or int(card) <= 1:
-        return {"session_id": req.session_id, "facts": [], "entities": [], "lessons": []}
-
-    seed = np.zeros(embedder.DIMS, dtype=np.float32)
-    results = await _redis.execute_command(
-        "VSIM", mem_store.FACT_KEY, "FP32", seed.tobytes(),
-        "COUNT", min(int(card), 200), "WITHSCORES", "WITHATTRIBS"
-    )
+    scanned = await _vscan(_redis, mem_store.FACT_KEY, max_count=200)
 
     facts = []
     all_entities: set[str] = set()
-    i = 0
-    while i + 2 < len(results):
-        raw = results[i + 2]
-        i += 3
-        try:
-            attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
-        except Exception:
-            continue
-        if attrs.get("_seed") or not attrs.get("content") or attrs.get("superseded_by"):
+    for item in scanned:
+        attrs = item["attrs"]
+        if not attrs.get("content") or attrs.get("superseded_by"):
             continue
         facts.append(attrs)
         for e in attrs.get("entities", []):
@@ -3868,7 +3674,7 @@ def _compat_check_auth(request: Request) -> dict | None:
     return None
 
 
-async def _observe_internal(session_id: str, project: str, cwd: str,
+async def _observe_internal(session_id: str, _project: str, _cwd: str,
                             hook_type: str, data: dict) -> dict:
     """Core observe logic shared by /observe endpoint."""
     tool_name = data.get("tool_name", "")
@@ -3948,37 +3754,20 @@ async def config_flags():
 async def _crystallize_session_inline(session_id: str, session_obj: dict, max_facts: int = 20) -> dict | None:
     """
     Inline crystallization logic (same as /crystallize endpoint but without HTTP overhead).
-    
+
     Returns digest dict or None if crystallization fails.
     """
     try:
-        # Gather facts from this session
-        card = await _redis.execute_command("VCARD", mem_store.FACT_KEY)
-        if not card or int(card) <= 1:
-            return None
-        
-        seed = np.zeros(embedder.DIMS, dtype=np.float32)
-        results = await _redis.execute_command(
-            "VSIM", mem_store.FACT_KEY, "FP32", seed.tobytes(),
-            "COUNT", min(int(card), 200), "WITHSCORES", "WITHATTRIBS"
-        )
-        
+        scanned = await _vscan(_redis, mem_store.FACT_KEY, max_count=200)
+
         facts = []
         all_entities: set[str] = set()
-        i = 0
-        while i + 2 < len(results):
-            raw = results[i + 2]
-            i += 3
-            try:
-                attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
-            except Exception:
+        session_ts = session_obj.get("ts", 0)
+
+        for item in scanned:
+            attrs = item["attrs"]
+            if not attrs.get("content") or attrs.get("superseded_by"):
                 continue
-            
-            if attrs.get("_seed") or not attrs.get("content") or attrs.get("superseded_by"):
-                continue
-            
-            # Filter by session timestamp proximity
-            session_ts = session_obj.get("ts", 0)
             fact_ts = attrs.get("ts", 0)
             if abs(fact_ts - session_ts) < 3600000:  # within 1 hour
                 facts.append(attrs)
@@ -4050,121 +3839,111 @@ async def _auto_crystallize() -> None:
     Crystallization distills completed work chains into structured digests.
     Runs every 6 hours.
     """
-    from datetime import timedelta
-    
     while True:
         await asyncio.sleep(21600)  # 6 hours
         try:
             now_ms = int(time.time() * 1000)
             twenty_four_hours_ms = 24 * 3600 * 1000
-            
-            # Scan all session keys to find candidates
+
+            # Phase 1: Batch-scan all session keys and crystallized keys
             session_pattern = "mem:session:*"
             cursor = 0
-            crystallized_count = 0
-            
+            all_session_keys = []
+
             while True:
                 cursor, keys = await _redis.scan(cursor, match=session_pattern, count=100)
-                
-                for key in keys:
-                    key_str = key.decode() if isinstance(key, bytes) else key
-                    session_id = key_str.replace("mem:session:", "")
-                    
-                    # Check if already crystallized
-                    crystal_key = f"mem:crystallized:{session_id}"
-                    exists = await _redis.exists(crystal_key)
-                    if exists:
-                        continue
-                    
-                    # Get session metadata
-                    session_data = await _redis.get(key)
-                    if not session_data:
-                        continue
-                    
-                    try:
-                        session_obj = json.loads(session_data.decode() if isinstance(session_data, bytes) else session_data)
-                    except Exception:
-                        continue
-                    
-                    # Check age
-                    ts = session_obj.get("ts", 0)
-                    # Fallback to started_at if ts is missing
-                    if not ts:
-                        started_at = session_obj.get("started_at", 0)
-                        if started_at:
-                            ts = int(started_at * 1000)
-                    
-                    if not ts:
-                        continue
-                        
-                    age_ms = now_ms - ts
-                    if age_ms < twenty_four_hours_ms:
-                        continue  # too recent
-                    
-                    # Count facts in this session (approximate by timestamp proximity)
-                    card = await _redis.execute_command("VCARD", mem_store.FACT_KEY)
-                    if not card or int(card) <= 5:
-                        continue  # not enough facts
-                    
-                    seed = np.zeros(embedder.DIMS, dtype=np.float32)
-                    results = await _redis.execute_command(
-                        "VSIM", mem_store.FACT_KEY, "FP32", seed.tobytes(),
-                        "COUNT", min(int(card), 200), "WITHSCORES", "WITHATTRIBS"
-                    )
-                    
-                    fact_count = 0
-                    i = 0
-                    while i + 2 < len(results):
-                        raw = results[i + 2]
-                        i += 3
-                        try:
-                            attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
-                        except Exception:
-                            continue
-                        
-                        # Check if fact is from this session (within ±1 hour of session start)
-                        fact_ts = attrs.get("ts", 0)
-                        if abs(fact_ts - ts) < 3600000:  # 1 hour window
-                            if not attrs.get("superseded_by"):
-                                fact_count += 1
-                    
-                    if fact_count < 5:
-                        continue  # not substantial enough
-                    
-                    # Crystallize this session
-                    log.info(f"[crystallize] auto-crystallizing session {session_id} ({fact_count} facts, age={age_ms/3600000:.1f}h)")
-                    
-                    # Call crystallize logic inline
-                    digest = await _crystallize_session_inline(session_id, session_obj, fact_count)
-                    
-                    if digest:
-                        # Store digest with 90-day TTL
-                        await _redis.setex(
-                            crystal_key,
-                            90 * 86400,  # 90 days
-                            json.dumps(digest, ensure_ascii=False)
-                        )
-                        crystallized_count += 1
-                        await _ws_broadcast("crystallize_auto", {
-                            "session_id": session_id,
-                            "fact_count": fact_count,
-                            "digest_summary": digest.get("summary", "")[:200]
-                        })
-                
+                all_session_keys.extend(keys)
                 if cursor == 0:
                     break
-            
+
+            if not all_session_keys:
+                continue
+
+            # Batch check which sessions are already crystallized + get session data
+            # Pipeline: exists(crystal_key) + get(session_key) per session
+            pipe = _redis.pipeline(transaction=False)
+            key_map = []  # track (session_key, session_id, crystal_key) for each pipeline pair
+            for key in all_session_keys:
+                key_str = key.decode() if isinstance(key, bytes) else key
+                session_id = key_str.replace("mem:session:", "")
+                crystal_key = f"mem:crystallized:{session_id}"
+                pipe.exists(crystal_key)
+                pipe.get(key)
+                key_map.append((key_str, session_id, crystal_key))
+
+            pipe_results = await pipe.execute()
+
+            # Parse pipeline results (pairs: exists, get for each session)
+            candidates = []
+            for idx, (key_str, session_id, crystal_key) in enumerate(key_map):
+                exists = pipe_results[idx * 2]
+                session_data = pipe_results[idx * 2 + 1]
+                if exists:
+                    continue
+                if not session_data:
+                    continue
+                try:
+                    session_obj = json.loads(session_data.decode() if isinstance(session_data, bytes) else session_data)
+                except Exception:
+                    continue
+
+                ts = session_obj.get("ts", 0)
+                if not ts:
+                    started_at = session_obj.get("started_at", 0)
+                    if started_at:
+                        ts = int(started_at * 1000)
+                if not ts:
+                    continue
+                age_ms = now_ms - ts
+                if age_ms < twenty_four_hours_ms:
+                    continue
+
+                candidates.append((session_id, session_obj, ts, crystal_key))
+
+            if not candidates:
+                continue
+
+            # Phase 2: Fetch all facts once (not per-session) and count per session
+            scanned = await _vscan(_redis, mem_store.FACT_KEY, max_count=200)
+            if len(scanned) <= 5:
+                continue
+
+            # Build fact timestamp list once
+            fact_timestamps = [
+                item["attrs"].get("ts", 0)
+                for item in scanned
+                if not item["attrs"].get("superseded_by")
+            ]
+
+            # Phase 3: Crystallize qualifying sessions
+            crystallized_count = 0
+            for session_id, session_obj, ts, crystal_key in candidates:
+                # Count facts within ±1 hour of session start
+                fact_count = sum(1 for ft in fact_timestamps if abs(ft - ts) < 3600000)
+                if fact_count < 5:
+                    continue
+
+                log.info(f"[crystallize] auto-crystallizing session {session_id} ({fact_count} facts, age={(now_ms - ts)/3600000:.1f}h)")
+
+                digest = await _crystallize_session_inline(session_id, session_obj, fact_count)
+                if digest:
+                    await _redis.setex(
+                        crystal_key,
+                        90 * 86400,
+                        json.dumps(digest, ensure_ascii=False)
+                    )
+                    crystallized_count += 1
+                    await _ws_broadcast("crystallize_auto", {
+                        "session_id": session_id,
+                        "fact_count": fact_count,
+                        "digest_summary": digest.get("summary", "")[:200]
+                    })
+
             if crystallized_count > 0:
                 log.info(f"[crystallize] auto-crystallized {crystallized_count} sessions")
-        
+
         except Exception as e:
             log.warning(f"[crystallize] auto-crystallization error: {e}", exc_info=True)
-
-
-@app.on_event("startup")
-async def startup_event():
-    """Start background tasks."""
-    asyncio.create_task(_auto_crystallize())
 
 
 # ── Session lifecycle (agentmemory hooks) ─────────────────────────────────────
@@ -4375,20 +4154,29 @@ async def session_by_commit(sha: str = ""):
 
 @app.get("/commits")
 async def commits(branch: str = "", repo: str = "", limit: int = 20):
-    cursor, keys = await _redis.scan(match="mem:commit:*", count=limit)
-    results = []
+    _, keys = await _redis.scan(match="mem:commit:*", count=limit)
+    if not keys:
+        return {"commits": []}
+
+    # Batch fetch all commit data via pipeline (avoids N+1 round-trips)
+    pipe = _redis.pipeline(transaction=False)
     for key in keys:
         k = key.decode() if isinstance(key, bytes) else key
-        data = await _redis.hgetall(k)
-        if data:
-            entry = {dk.decode() if isinstance(dk, bytes) else dk:
-                     dv.decode() if isinstance(dv, bytes) else dv
-                     for dk, dv in data.items()}
-            if branch and entry.get("branch") != branch:
-                continue
-            if repo and entry.get("repo") != repo:
-                continue
-            results.append(entry)
+        pipe.hgetall(k)
+    pipe_results = await pipe.execute()
+
+    results = []
+    for data in pipe_results:
+        if not data:
+            continue
+        entry = {dk.decode() if isinstance(dk, bytes) else dk:
+                 dv.decode() if isinstance(dv, bytes) else dv
+                 for dk, dv in data.items()}
+        if branch and entry.get("branch") != branch:
+            continue
+        if repo and entry.get("repo") != repo:
+            continue
+        results.append(entry)
     results.sort(key=lambda x: x.get("timestamp", "0"), reverse=True)
     return {"commits": results[:limit]}
 
@@ -4606,10 +4394,18 @@ async def compress_file(filePath: str = ""):
 @app.get("/sessions")
 async def compat_sessions(limit: int = 20):
     cursor, keys = await _redis.scan(match="mem:session:*", count=limit)
-    results = []
+    if not keys:
+        return {"sessions": []}
+
+    # Batch fetch all session data via pipeline (avoids N+1 round-trips)
+    pipe = _redis.pipeline(transaction=False)
     for key in keys:
         k = key.decode() if isinstance(key, bytes) else key
-        raw = await _redis.get(k)
+        pipe.get(k)
+    raw_values = await pipe.execute()
+
+    results = []
+    for raw in raw_values:
         if raw:
             try:
                 data = json.loads(raw.decode() if isinstance(raw, bytes) else raw)

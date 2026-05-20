@@ -15,8 +15,9 @@ keeping memory at a fixed target size. O(1) per chunk, linear total cost.
 """
 
 import asyncio
-import httpx
 import logging
+
+from .http import async_get_json, async_post_json
 
 log = logging.getLogger("mem")
 
@@ -43,16 +44,13 @@ _OVERWRITE_PROMPT = (
 
 async def _get_model() -> str:
     """Ask aiserv for the best NLP model via live health matrix."""
-    try:
-        async with httpx.AsyncClient(timeout=2.0) as client:
-            resp = await client.get(
-                f"{AISERV_BASE}/v1/role/nlp",
-                headers={"Authorization": f"Bearer {AISERV_KEY}"},
-            )
-            if resp.status_code == 200:
-                return resp.json().get("model", _FALLBACK_MODEL)
-    except Exception:
-        pass
+    data = await async_get_json(
+        f"{AISERV_BASE}/v1/role/nlp",
+        headers={"Authorization": f"Bearer {AISERV_KEY}"},
+        timeout=2.0,
+    )
+    if data is not None:
+        return data.get("model", _FALLBACK_MODEL)
     return _FALLBACK_MODEL
 
 
@@ -62,18 +60,15 @@ async def _report_quality(model: str, score: int, reason: str = "") -> None:
     reason: optional ("timeout"/"5xx"/"other") — when set on score=-1, aiserv
     triggers an urgent re-probe and temporarily suppresses the failing route.
     """
-    try:
-        payload: dict = {"model": model, "score": score, "task_type": "language"}
-        if reason:
-            payload["reason"] = reason
-        async with httpx.AsyncClient(timeout=2.0) as client:
-            await client.post(
-                f"{AISERV_BASE}/v1/quality-feedback",
-                json=payload,
-                headers={"Authorization": f"Bearer {AISERV_KEY}"},
-            )
-    except Exception:
-        pass
+    payload: dict = {"model": model, "score": score, "task_type": "language"}
+    if reason:
+        payload["reason"] = reason
+    await async_post_json(
+        f"{AISERV_BASE}/v1/quality-feedback",
+        payload=payload,
+        headers={"Authorization": f"Bearer {AISERV_KEY}"},
+        timeout=2.0,
+    )
 
 
 async def summarize(text: str) -> str:
@@ -88,25 +83,21 @@ async def summarize(text: str) -> str:
 
     model = await _get_model()
     try:
-        async with httpx.AsyncClient(timeout=TIMEOUT_S) as client:
-            resp = await client.post(
-                AISERV_URL,
-                json={
-                    "model":      model,
-                    "max_tokens": 80,
-                    "messages":   [{"role": "user", "content": prompt}],
-                },
-                headers={"Authorization": f"Bearer {AISERV_KEY}"},
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                choices = data.get("choices", [])
-                if choices:
-                    asyncio.create_task(_report_quality(model, +1))
-                    return choices[0]["message"]["content"].strip()
-    except httpx.TimeoutException:
-        log.debug("[summarizer] %s timed out", model)
-        asyncio.create_task(_report_quality(model, -1, reason="timeout"))
+        data = await async_post_json(
+            AISERV_URL,
+            payload={
+                "model":      model,
+                "max_tokens": 80,
+                "messages":   [{"role": "user", "content": prompt}],
+            },
+            headers={"Authorization": f"Bearer {AISERV_KEY}"},
+            timeout=TIMEOUT_S,
+        )
+        if data is not None:
+            choices = data.get("choices", [])
+            if choices:
+                asyncio.create_task(_report_quality(model, +1))
+                return choices[0]["message"]["content"].strip()
     except Exception as e:
         log.debug("[summarizer] %s failed: %s", model, e)
         asyncio.create_task(_report_quality(model, -1, reason="other"))
@@ -140,25 +131,21 @@ async def overwrite_update(
 
     model = await _get_model()
     try:
-        async with httpx.AsyncClient(timeout=TIMEOUT_S) as client:
-            resp = await client.post(
-                AISERV_URL,
-                json={
-                    "model":      model,
-                    "max_tokens": 400,   # ~900-1000 chars at ~2.5 chars/token
-                    "messages":   [{"role": "user", "content": prompt}],
-                },
-                headers={"Authorization": f"Bearer {AISERV_KEY}"},
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                choices = data.get("choices", [])
-                if choices:
-                    asyncio.create_task(_report_quality(model, +1))
-                    return choices[0]["message"]["content"].strip()
-    except httpx.TimeoutException:
-        log.debug("[summarizer:overwrite] %s timed out", model)
-        asyncio.create_task(_report_quality(model, -1, reason="timeout"))
+        data = await async_post_json(
+            AISERV_URL,
+            payload={
+                "model":      model,
+                "max_tokens": 400,   # ~900-1000 chars at ~2.5 chars/token
+                "messages":   [{"role": "user", "content": prompt}],
+            },
+            headers={"Authorization": f"Bearer {AISERV_KEY}"},
+            timeout=TIMEOUT_S,
+        )
+        if data is not None:
+            choices = data.get("choices", [])
+            if choices:
+                asyncio.create_task(_report_quality(model, +1))
+                return choices[0]["message"]["content"].strip()
     except Exception as e:
         log.debug("[summarizer:overwrite] %s failed: %s", model, e)
         asyncio.create_task(_report_quality(model, -1, reason="other"))

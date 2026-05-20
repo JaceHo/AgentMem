@@ -29,6 +29,8 @@ from typing import Optional
 
 import redis.asyncio as aioredis
 
+from .utils import decode_json, force_str
+
 # ── Constants ──────────────────────────────────────────────────────────────────
 TOOL_KEY   = "mem:tools"
 ENV_KEY    = "mem:env"
@@ -166,11 +168,11 @@ async def recall_tools(
         score = results[i + 1]
         raw   = results[i + 2]
         i += 3
-        elem_str = elem.decode() if isinstance(elem, bytes) else elem
+        elem_str = force_str(elem)
         if elem_str == "__seed__":
             continue
         try:
-            attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+            attrs = decode_json(raw) or {}
         except Exception:
             attrs = {}
         if attrs.get("_seed") or not attrs.get("name"):
@@ -230,11 +232,11 @@ async def list_all_tools(r: aioredis.Redis) -> list[dict]:
         elem = results[i]
         raw  = results[i + 2]
         i += 3
-        elem_str = elem.decode() if isinstance(elem, bytes) else elem
+        elem_str = force_str(elem)
         if elem_str == "__seed__":
             continue
         try:
-            attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+            attrs = decode_json(raw)
         except Exception:
             continue
         if attrs.get("_seed") or not attrs.get("name"):

@@ -25,8 +25,7 @@ from __future__ import annotations
 import json
 import logging
 
-import httpx
-
+from .http import async_post_json
 from .extractor import (
     AISERV_URL, AISERV_KEY, LLM_TIMEOUT_S, LLM_MAX_RETRIES,
     _resolve_nlp_model, AISERV_FALLBACK_MODEL, _parse_llm_json,
@@ -50,33 +49,25 @@ async def _llm_call(prompt: str, system: str, max_tokens: int = 300) -> str | No
         if model in tried:
             model = AISERV_FALLBACK_MODEL
         tried.append(model)
-        try:
-            async with httpx.AsyncClient(timeout=_PLAN_TIMEOUT_S) as client:
-                resp = await client.post(
-                    AISERV_URL,
-                    json={
-                        "model":      model,
-                        "max_tokens": max_tokens,
-                        "messages": [
-                            {"role": "system", "content": system},
-                            {"role": "user", "content": prompt},
-                        ],
-                    },
-                    headers={"Authorization": f"Bearer {AISERV_KEY}"},
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    choices = data.get("choices", [])
-                    if choices:
-                        return choices[0]["message"]["content"].strip()
-                log.warning("[planner] %s returned %d", model, resp.status_code)
-                exclude = model
-        except httpx.TimeoutException:
-            log.warning("[planner] %s timed out (%.0fs)", model, _PLAN_TIMEOUT_S)
-            exclude = model
-        except Exception as e:
-            log.debug("[planner] %s failed: %s: %s", model, type(e).__name__, e)
-            exclude = model
+        data = await async_post_json(
+            AISERV_URL,
+            payload={
+                "model":      model,
+                "max_tokens": max_tokens,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": prompt},
+                ],
+            },
+            headers={"Authorization": f"Bearer {AISERV_KEY}"},
+            timeout=_PLAN_TIMEOUT_S,
+        )
+        if data is not None:
+            choices = data.get("choices", [])
+            if choices:
+                return choices[0]["message"]["content"].strip()
+        log.warning("[planner] %s returned no usable response", model)
+        exclude = model
     log.warning("[planner] All models exhausted (%s)", ", ".join(tried))
     return None
 
