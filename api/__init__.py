@@ -1,5 +1,1 @@
-"""API package - HTTP layer."""
-
-from api.routes import memory_router
-
-__all__ = ["memory_router"]
+"""API package - HTTP layer with schemas, routes, and shared state."""

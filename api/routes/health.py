@@ -27,16 +27,15 @@ async def livez():
 @router.get("/stats")
 async def stats():
     r = state.redis
-    mem_store = state.mem_store
     try:
-        counts = await mem_store.vcard(r)
+        counts = await state.mem_store.vcard(r)
         persona_raw = await r.hgetall("mem:persona")
         counts["persona_fields"] = len(persona_raw)
 
         tool_card = await r.execute_command("VCARD", state.cap_mod.TOOL_KEY)
         counts["tools"] = max(0, int(tool_card or 0) - 1)
 
-        proc_card = await r.execute_command("VCARD", mem_store.PROC_KEY)
+        proc_card = await r.execute_command("VCARD", state.mem_store.PROC_KEY)
         counts["procedures"] = max(0, int(proc_card or 0) - 1)
 
         env_raw = await r.hgetall(state.cap_mod.ENV_KEY)
@@ -65,7 +64,6 @@ async def stats():
 @router.get("/config")
 async def config():
     r = state.redis
-    mem_store = state.mem_store
     consolidations = await state.stores_since_consolidation.get()
     return {
         "version": settings.app_version,

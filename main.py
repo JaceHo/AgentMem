@@ -92,14 +92,12 @@ import math
 import re
 import time
 from contextlib import asynccontextmanager
-from functools import lru_cache
 
 import httpx
 import numpy as np
 from fastapi import FastAPI, BackgroundTasks, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
 
 # ── Schemas (extracted to api/schemas/) ──────────────────────────────────────
 from api.schemas.memory import RecallRequest, Message, StoreRequest
@@ -125,7 +123,7 @@ from api.schemas.graph import (
 )
 
 # ── Compat helpers (extracted to api/compat.py) ──────────────────────────────
-from api.compat import compat_sid, check_auth as _compat_check_auth
+from api.compat import compat_sid as _compat_sid, check_auth as _compat_check_auth
 
 # ── Search utilities (extracted to core/search.py) ───────────────────────────
 from core.search import BM25Index, encode as _encode, vscan as _vscan, BM25_AVAILABLE as _BM25_AVAILABLE
@@ -3106,7 +3104,6 @@ async def graph_nodes_endpoint(limit: int = 60):
             pipe.smembers(k)  # legacy Set edges (slug strings)
         members_list = await pipe.execute(raise_on_error=False)
 
-        top_slugs = {k[len(prefix):] for k in top_keys}
         nodes_out = []
         edges_out = []
         seen_edges: set[tuple] = set()
@@ -3387,21 +3384,7 @@ async def get_config():
 # Absorbed agentmemory scaffold endpoints (no /agentmemory prefix)
 # These provide full compatibility with rohitg00/agentmemory hooks & MCP tools.
 # ═══════════════════════════════════════════════════════════════════════════════
-
-def _compat_sid(req) -> str:
-    """Extract session ID from compat request (supports both camelCase and snake_case)."""
-    return req.sessionId or req.session_id or f"ses_{int(time.time())}"
-
-
-def _compat_check_auth(request: Request) -> dict | None:
-    """Check AGENTMEMORY_SECRET bearer token if configured."""
-    secret = _os.getenv("AGENTMEMORY_SECRET", "")
-    if not secret:
-        return None
-    auth = request.headers.get("authorization", "")
-    if auth != f"Bearer {secret}":
-        return {"status_code": 401, "error": "unauthorized"}
-    return None
+# _compat_sid and _compat_check_auth are now in api/compat.py — imported above.
 
 
 async def _observe_internal(session_id: str, _project: str, _cwd: str,

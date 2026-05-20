@@ -125,6 +125,13 @@ class Settings(BaseSettings):
         json_schema_extra={"env": "RRF_K"}
     )
     
+    # ── Pruning Configuration ─────────────────────────────────────────────
+    prune_importance_threshold: float = Field(
+        default=0.05,
+        description="Prune facts with importance below this threshold",
+        json_schema_extra={"env": "PRUNE_THRESHOLD"}
+    )
+    
     # ── A-MAC Admission Gate ───────────────────────────────────────────────
     amac_threshold: float = Field(
         default=0.40,
