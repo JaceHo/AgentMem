@@ -143,6 +143,7 @@ class OllamaProvider(BaseProvider):
             f"{self.base_url}/api/embed",
             json={"model": self.model, "input": texts},
             timeout=60,
+            verify=False,
         )
         r.raise_for_status()
         data = r.json()
@@ -278,7 +279,7 @@ def _detect_provider() -> BaseProvider:
     try:
         import httpx
         base = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-        r = httpx.get(f"{base}/api/tags", timeout=2)
+        r = httpx.get(f"{base}/api/tags", timeout=2, verify=False)
         if r.status_code == 200:
             models = r.json().get("models", [])
             # Check if any model is an embedding model (nomic-embed-text, mxbai-embed, etc.)

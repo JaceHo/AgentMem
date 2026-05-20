@@ -282,17 +282,9 @@ async def test_hard_prune_removes_stale_episodes(async_redis_client):
     # Should have removed the stale episode
     assert result["removed_episodes"] >= 0
     
-    # Verify episode is gone (VGETATTR returns None or error for deleted items)
-    try:
-        raw = await async_redis_client.execute_command("VGETATTR", mem_store.EPISODE_KEY, element_id)
-        # If we get here, either item exists or command failed gracefully
-        if raw:
-            attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
-            # Item might still exist if pruning didn't trigger yet - that's ok
-            assert "content" in attrs or "_seed" not in attrs
-    except Exception:
-        # Command failed because item doesn't exist - this is expected after pruning
-        pass
+    # Verify episode is gone
+    raw = await async_redis_client.execute_command("VGETATTR", mem_store.EPISODE_KEY, element_id)
+    assert raw is None or json.loads(raw.decode() if isinstance(raw, bytes) else raw).get("_seed")
 
 
 @pytest.mark.asyncio

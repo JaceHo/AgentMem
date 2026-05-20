@@ -439,28 +439,78 @@ async def compress_file(filePath: str = ""):
 @router.get("/sessions")
 async def compat_sessions(limit: int = 20):
     r = state.redis
-    _, ctx_keys = await r.scan(match="mem:session:*:ctx", count=500)
-    if not ctx_keys:
+    cursor = 0
+    sessions: dict[str, dict] = {}
+
+    while True:
+        cursor, keys = await r.scan(cursor=cursor, match="mem:session:*", count=500)
+        if not keys and cursor == 0:
+            break
+
+        pipe = r.pipeline(transaction=False)
+        for key in keys:
+            pipe.get(key)
+        raw_values = await pipe.execute()
+
+        for key, raw in zip(keys, raw_values):
+            k = decode_bytes(key)
+            if not k:
+                continue
+            if k.endswith(":ctx"):
+                sid = k[len("mem:session:"):-4]
+                if not sid:
+                    continue
+                session = sessions.setdefault(sid, {
+                    "session_id": sid,
+                    "status": "active",
+                    "observation_count": 0,
+                    "summary": None,
+                })
+                ctx_str = decode_bytes(raw) or ""
+                if ctx_str:
+                    session["summary"] = ctx_str[:300]
+                    session["status"] = "active"
+                continue
+            if k.endswith(":last_ep"):
+                continue
+            if not k.startswith("mem:session:"):
+                continue
+            sid = k[len("mem:session:"):]
+            if not sid:
+                continue
+            raw_str = decode_bytes(raw) or ""
+            try:
+                meta = json.loads(raw_str)
+            except Exception:
+                continue
+            if not isinstance(meta, dict):
+                continue
+            session = sessions.setdefault(sid, {
+                "session_id": sid,
+                "status": "active",  # Default to active for new sessions with metadata
+                "observation_count": 0,
+                "summary": None,
+            })
+            session["project"] = meta.get("project") or session.get("project")
+            session["started_at"] = meta.get("started_at") or session.get("started_at")
+            session["observation_count"] = meta.get("observations", session.get("observation_count", 0))
+            # Only mark as ended if explicitly set and no active context exists
+            # New sessions without :ctx are still considered active
+            if session.get("status") != "active":
+                session["status"] = "ended"
+
+        if cursor == 0:
+            break
+
+    if not sessions:
         return {"sessions": []}
 
-    pipe = r.pipeline(transaction=False)
-    for key in ctx_keys:
-        pipe.get(key)
-    raw_values = await pipe.execute()
-
-    results = []
-    for key, raw in zip(ctx_keys, raw_values):
-        k = decode_bytes(key)
-        parts = k.split(":")
-        sid = parts[2] if len(parts) >= 4 else k
-        ctx_str = decode_bytes(raw) or ""
-        results.append({
-            "session_id": sid,
-            "status": "ended",
-            "observation_count": 0,
-            "summary": ctx_str[:300] if ctx_str else None,
-        })
-    return {"sessions": results[:limit]}
+    sorted_sessions = sorted(
+        sessions.values(),
+        key=lambda s: s.get("started_at") or 0,
+        reverse=True,
+    )
+    return {"sessions": sorted_sessions[:limit]}
 
 
 @router.get("/observations")
