@@ -487,16 +487,27 @@ async def compat_sessions(limit: int = 20):
                 continue
             session = sessions.setdefault(sid, {
                 "session_id": sid,
-                "status": "active",  # Default to active for new sessions with metadata
+                "status": "active",  # Default to active; will be set to ended only if stale
                 "observation_count": 0,
                 "summary": None,
             })
             session["project"] = meta.get("project") or session.get("project")
             session["started_at"] = meta.get("started_at") or session.get("started_at")
             session["observation_count"] = meta.get("observations", session.get("observation_count", 0))
-            # Only mark as ended if explicitly set and no active context exists
-            # New sessions without :ctx are still considered active
-            if session.get("status") != "active":
+            
+            # Determine if session should be marked as ended
+            # A session is ended if:
+            # 1. It has NO context key (:ctx) AND
+            # 2. It has NO recent activity (check observation count and age)
+            obs_count = session.get("observation_count", 0)
+            started_at = session.get("started_at", 0)
+            now = time.time()
+            hours_since_start = (now - started_at) / 3600 if started_at else 999
+            
+            # Mark as ended only if truly inactive:
+            # - No observations ever made, OR
+            # - Started long ago (>24h) with minimal activity
+            if obs_count == 0 or (hours_since_start > 24 and obs_count <= 1):
                 session["status"] = "ended"
 
         if cursor == 0:
