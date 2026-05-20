@@ -63,7 +63,7 @@ function loadTab(t) {
     activity: () => window.loadAct?.(),
     profile: () => window.loadProfile?.(),
     replay: () => window.loadReplay?.(),
-    logs: () => {},
+    logs: () => window.loadLogs?.(),
     api: () => window.loadAPI?.(),
   };
   (loaders[t] || (() => {}))();

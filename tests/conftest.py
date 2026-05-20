@@ -42,23 +42,26 @@ def redis_client():
 
 
 @pytest.fixture
-def async_redis_client():
+async def async_redis_client():
     """Provide an async Redis client for async tests."""
     import redis.asyncio as aioredis
     
-    async def _create():
-        r = aioredis.Redis(host="localhost", port=6379, db=15, decode_responses=True)
-        await r.flushdb()
-        return r
-    
-    r = asyncio.get_event_loop().run_until_complete(_create())
+    r = aioredis.Redis(host="localhost", port=6379, db=15, decode_responses=True)
+    await r.flushdb()
     yield r
     
-    async def _cleanup():
-        await r.flushdb()
-        await r.close()
-    
-    asyncio.get_event_loop().run_until_complete(_cleanup())
+    await r.flushdb()
+    await r.aclose()
+
+
+@pytest.fixture(autouse=True)
+async def patch_main_redis(async_redis_client):
+    """Automatically patch main._redis global variable for all async tests."""
+    import main
+    original_redis = main._redis
+    main._redis = async_redis_client
+    yield
+    main._redis = original_redis
 
 
 @pytest.fixture

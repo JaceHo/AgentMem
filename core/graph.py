@@ -417,35 +417,43 @@ async def graph_stats(r: aioredis.Redis) -> dict:
     if not node_keys:
         return {"node_count": 0, "edge_count_directed": 0, "edge_count_undirected": 0}
 
-    # Batch size lookups via pipeline
+    # Batch size lookups via pipeline — raise_on_error=False so WRONGTYPE errors
+    # on legacy Set keys come back as ResponseError objects instead of raising.
     key_strs = [key.decode() if isinstance(key, bytes) else key for key in node_keys]
     pipe = r.pipeline(transaction=False)
     for ks in key_strs:
         pipe.hlen(ks)
-    hlens = await pipe.execute()
+    hlens = await pipe.execute(raise_on_error=False)
 
     edge_count = 0
-    # For keys with hlen=0, fall back to scard (legacy Set-based edges)
     fallback_keys = []
     for ks, hlen_val in zip(key_strs, hlens):
-        if hlen_val and hlen_val > 0:
+        if isinstance(hlen_val, int) and hlen_val > 0:
             edge_count += hlen_val
         else:
+            # WRONGTYPE error (Set key) or 0 → fall back to SCARD
             fallback_keys.append(ks)
 
     if fallback_keys:
         pipe = r.pipeline(transaction=False)
         for ks in fallback_keys:
             pipe.scard(ks)
-        scards = await pipe.execute()
+        scards = await pipe.execute(raise_on_error=False)
         for sc in scards:
-            edge_count += sc
+            if isinstance(sc, int):
+                edge_count += sc
 
-    # edge_count is sum of directed edges; undirected count = edge_count // 2
+    directed = edge_count
+    undirected = directed // 2
     return {
         "node_count": node_count,
-        "edge_count_directed": edge_count,
-        "edge_count_undirected": edge_count // 2,
+        "edge_count_directed": directed,
+        "edge_count_undirected": undirected,
+        # Dashboard-friendly aliases
+        "nodes": node_count,
+        "edges": undirected,
+        "total_nodes": node_count,
+        "total_edges": undirected,
     }
 
 
@@ -560,8 +568,11 @@ async def get_entity_neighbors_with_counts(
     Works with both Hash-based typed edges (v1.1) and legacy Set-based edges.
     Uses pipeline for batched connection count lookups (avoids N+1 queries).
     """
-    # Try Hash-based typed edges first (v1.1)
-    raw_edges = await r.hgetall(_key(entity))
+    # Try Hash-based typed edges first (v1.1); fall back on WRONGTYPE (legacy Sets)
+    try:
+        raw_edges = await r.hgetall(_key(entity))
+    except Exception:
+        raw_edges = {}
     if raw_edges:
         # Parse edges first
         parsed: list[tuple[str, dict]] = []

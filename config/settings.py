@@ -12,11 +12,16 @@ Usage:
 """
 
 from pydantic import Field
-from pydantic_settings import BaseSettings
-
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     """AgentMem configuration with environment variable overrides."""
+    
+    model_config = SettingsConfigDict(
+        env_prefix="AGENTMEM_",
+        env_file=".env",
+        extra="ignore"
+    )
     
     # ── Service Configuration ──────────────────────────────────────────────
     host: str = Field(default="0.0.0.0", description="Host to bind")
@@ -43,88 +48,88 @@ class Settings(BaseSettings):
     auto_consolidate_every: int = Field(
         default=50,
         description="Trigger consolidation after N stored facts",
-        env="AUTO_CONSOLIDATE_EVERY"
+        json_schema_extra={"env": "AUTO_CONSOLIDATE_EVERY"}
     )
     periodic_consolidate_interval_hours: int = Field(
         default=1,
         description="Run consolidation check every N hours",
-        env="CONSOLIDATE_INTERVAL"
+        json_schema_extra={"env": "CONSOLIDATE_INTERVAL"}
     )
     hard_prune_interval_hours: int = Field(
         default=24,
         description="Run hard prune every N hours",
-        env="PRUNE_INTERVAL"
+        json_schema_extra={"env": "PRUNE_INTERVAL"}
     )
     
     # ── Session Management ─────────────────────────────────────────────────
     session_ttl_seconds: int = Field(
         default=14400,
         description="Session KV TTL in seconds (4 hours)",
-        env="SESSION_TTL"
+        json_schema_extra={"env": "SESSION_TTL"}
     )
     session_compact_threshold_chars: int = Field(
         default=3000,
         description="Compact session when > N chars",
-        env="COMPACT_THRESHOLD"
+        json_schema_extra={"env": "COMPACT_THRESHOLD"}
     )
     session_overwrite_target_chars: int = Field(
         default=900,
         description="Target length after overwrite compaction",
-        env="OVERWRITE_TARGET"
+        json_schema_extra={"env": "OVERWRITE_TARGET"}
     )
     
     # ── Retrieval Configuration ────────────────────────────────────────────
     default_token_budget: int = Field(
         default=1500,
         description="Default token budget for context injection",
-        env="TOKEN_BUDGET"
+        json_schema_extra={"env": "TOKEN_BUDGET"}
     )
     default_memory_limit: int = Field(
         default=6,
         description="Default number of memories to retrieve",
-        env="MEMORY_LIMIT"
+        json_schema_extra={"env": "MEMORY_LIMIT"}
     )
     dedup_similarity_threshold: float = Field(
         default=0.95,
         description="Similarity threshold for deduplication",
-        env="DEDUP_THRESHOLD"
+        json_schema_extra={"env": "DEDUP_THRESHOLD"}
     )
     bm25_top_k: int = Field(
         default=10,
         description="Top-k results to return from BM25 search",
-        env="BM25_TOP_K"
+        json_schema_extra={"env": "BM25_TOP_K"}
     )
     retrieval_top_k: int = Field(
         default=12,
         description="Top-k results to return from vector retrieval",
-        env="RETRIEVAL_TOP_K"
+        json_schema_extra={"env": "RETRIEVAL_TOP_K"}
     )
     retrieval_max_facts: int = Field(
         default=50,
         description="Maximum number of fused facts to keep after ranking",
-        env="RETRIEVAL_MAX_FACTS"
+        json_schema_extra={"env": "RETRIEVAL_MAX_FACTS"}
     )
     graph_expansion_depth: int = Field(
         default=2,
         description="Max graph traversal depth for retrieval expansion",
-        env="GRAPH_EXPANSION_DEPTH"
+        json_schema_extra={"env": "GRAPH_EXPANSION_DEPTH"}
     )
     graph_max_neighbors: int = Field(
         default=10,
         description="Max number of graph neighbors to return",
-        env="GRAPH_MAX_NEIGHBORS"
+        json_schema_extra={"env": "GRAPH_MAX_NEIGHBORS"}
     )
     rrf_k_constant: int = Field(
         default=60,
         description="RRF smoothing constant",
-        env="RRF_K"
+        json_schema_extra={"env": "RRF_K"}
     )
     
     # ── A-MAC Admission Gate ───────────────────────────────────────────────
     amac_threshold: float = Field(
         default=0.40,
         description="A-MAC admission gate threshold",
-        env="AMAC_THRESHOLD"
+        json_schema_extra={"env": "AMAC_THRESHOLD"}
     )
     amac_weights_semantic_novelty: float = Field(
         default=0.25,
@@ -151,7 +156,7 @@ class Settings(BaseSettings):
     bg_task_limit: int = Field(
         default=50,
         description="Max concurrent background tasks",
-        env="BG_TASK_LIMIT"
+        json_schema_extra={"env": "BG_TASK_LIMIT"}
     )
     bg_task_shutdown_timeout: float = Field(
         default=5.0,
@@ -182,12 +187,12 @@ class Settings(BaseSettings):
     llm_api_key: str | None = Field(
         default=None,
         description="API key for LLM provider",
-        env="LLM_API_KEY"
+        json_schema_extra={"env": "LLM_API_KEY"}
     )
     llm_base_url: str | None = Field(
         default=None,
         description="Base URL for LLM API",
-        env="LLM_BASE_URL"
+        json_schema_extra={"env": "LLM_BASE_URL"}
     )
     llm_timeout_seconds: float = Field(
         default=30.0,
@@ -209,12 +214,6 @@ class Settings(BaseSettings):
         default=True,
         description="Enable automatic secret redaction"
     )
-    
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
-        case_sensitive = False
-        extra = "ignore"  # Ignore unknown environment variables
 
 # Singleton instance
 settings = Settings()

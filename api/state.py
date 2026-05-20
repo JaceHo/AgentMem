@@ -1,0 +1,55 @@
+"""
+Application state singletons — shared across all route modules.
+
+This module owns the runtime singletons (Redis client, embedder, store, etc.)
+that are initialized during lifespan startup and accessed by route handlers.
+
+Route modules import from here instead of from main.py, breaking the
+circular-import problem that occurs when routes import from the app module
+that also registers them.
+"""
+
+import logging
+
+from concurrency import AtomicCounter, AtomicFloat, TaskManager
+from core import embedder
+from core import store as mem_store
+from core import graph as graph_mod
+from core import capability as cap_mod
+from core import persona as persona_mod
+from core import heat as heat_mod
+from core import scene as scene_mod
+from core import extractor
+from core import summarizer
+from core import retrieval_planner
+from core import log_sse
+from core.search import BM25Index, encode, vscan
+
+log = logging.getLogger("mem")
+
+# ── Runtime singletons (initialized during lifespan) ──────────────────────────
+
+redis = None                          # aioredis.Redis — set during lifespan
+
+# ── Task manager for fire-and-forget background work ──────────────────────────
+task_manager = TaskManager(max_concurrent=10)
+
+AUTO_CONSOLIDATE_EVERY = 50           # override from settings in lifespan
+
+
+def spawn(coro, name: str = "bg") -> None:
+    """Fire-and-forget a coroutine with TaskManager supervision."""
+    task_manager.spawn(coro, name=name)
+
+
+# ── Thread-safe counters ──────────────────────────────────────────────────────
+stores_since_consolidation = AtomicCounter()
+periodic_prune_counter = AtomicCounter()
+store_attempts = AtomicCounter()
+store_successes = AtomicCounter()
+store_skips = AtomicCounter()
+store_errors = AtomicCounter()
+store_latency_sum_ms = AtomicFloat()
+
+# ── BM25 in-memory index ──────────────────────────────────────────────────────
+bm25_index = BM25Index()

@@ -101,13 +101,34 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+# ── Schemas (extracted to api/schemas/) ──────────────────────────────────────
 from api.schemas.memory import RecallRequest, Message, StoreRequest
+from api.schemas.capability import (
+    ToolDefinition, RegisterToolsRequest, EnvState,
+    RecallToolsRequest, StoreProcedureRequest,
+    ToolFeedbackRequest, ToolSequenceRequest, ProcedureFeedbackRequest,
+)
+from api.schemas.compat import (
+    CompatSessionStartRequest, CompatSessionEndRequest,
+    ObserveRequest, SummarizeRequest, EnrichRequest,
+    ContextRequest, SessionCommitRequest,
+    SearchRequest, RememberRequest, ForgetRequest,
+    FileContextRequest, PatternsRequest, SmartSearchRequest,
+    TimelineRequest, ClaudeBridgeSyncRequest, ImportRequest,
+)
+from api.schemas.consolidation import (
+    CompactRequest, AnswerRequest, CompressSessionRequest,
+    FeedbackRequest, CrystallizeRequest,
+)
+from api.schemas.graph import (
+    GraphRecallRequest, TypedEdgeRequest, TraverseRequest, ReinforceRequest,
+)
 
-try:
-    from rank_bm25 import BM25Okapi as _BM25Okapi
-    _BM25_AVAILABLE = True
-except ImportError:
-    _BM25_AVAILABLE = False
+# ── Compat helpers (extracted to api/compat.py) ──────────────────────────────
+from api.compat import compat_sid, check_auth as _compat_check_auth
+
+# ── Search utilities (extracted to core/search.py) ───────────────────────────
+from core.search import BM25Index, encode as _encode, vscan as _vscan, BM25_AVAILABLE as _BM25_AVAILABLE
 
 # ── Import refactored modules ────────────────────────────────────────────────
 from concurrency import AtomicCounter, AtomicFloat, TaskManager
@@ -184,156 +205,8 @@ _store_skips = AtomicCounter()
 _store_errors = AtomicCounter()
 _store_latency_sum_ms = AtomicFloat()
 
-# ── BM25 in-memory index (Memori arXiv:2603.19935 hybrid retrieval) ────────────
-# Maintains a live BM25Okapi corpus over stored facts for exact-term matching.
-# Vector search is excellent for semantic similarity but misses exact names/dates.
-# BM25 complements by scoring term frequency — together they form true hybrid search.
-
-class _BM25Index:
-    """Lazy-rebuild BM25 corpus over fact contents + triple strings.
-
-    Thread-safe: uses asyncio.Lock to prevent concurrent mutation during search.
-    Superseded facts (superseded_by != "") are excluded from search results.
-    Rebuilt when corpus size changes by ≥10 entries or when forced.
-    """
-    def __init__(self):
-        self._docs: list[tuple[str, str, dict]] = []   # (uid, content, attrs)
-        self._bm25 = None
-        self._built_at_len: int = 0
-        self._rebuild_threshold: int = 10
-        self._lock = asyncio.Lock()
-
-    async def add(self, uid: str, content: str, attrs: dict) -> None:
-        """Add a fact to the corpus. Invalidates the BM25 index."""
-        async with self._lock:
-            self._docs.append((uid, content, attrs))
-
-    def _tokenize(self, text: str) -> list[str]:
-        """Tokenize for BM25: English words ≥3 chars + CJK bigrams."""
-        text = text.lower()
-        en = re.findall(r'\b[a-z]{3,}\b', text)
-        zh = re.findall(r'[\u4e00-\u9fff\u3400-\u4dbf]{2,}', text)
-        return en + zh
-
-    def _ensure_built(self) -> bool:
-        """Rebuild BM25 index if corpus has changed enough. Returns False if corpus empty."""
-        n = len(self._docs)
-        if n == 0:
-            return False
-        if self._bm25 is None or (n - self._built_at_len) >= self._rebuild_threshold:
-            # Build corpus: content + triple_str for richer term coverage
-            # Skip superseded facts (soft-deleted by consolidation)
-            corpus = []
-            for _, content, attrs in self._docs:
-                if attrs.get("superseded_by"):
-                    corpus.append([])  # empty token list → zero BM25 score
-                    continue
-                text = content
-                triple_str = attrs.get("triple_str", "")
-                if triple_str:
-                    text = f"{text} {triple_str}"
-                corpus.append(self._tokenize(text))
-            self._bm25 = _BM25Okapi(corpus)
-            self._built_at_len = n
-            log.debug(f"[bm25] rebuilt corpus n={n}")
-        return True
-
-    async def search(self, query: str, k: int = 10) -> list[dict]:
-        """Return top-k facts by BM25 score. Returns [] if corpus empty or BM25 unavailable."""
-        async with self._lock:
-            if not _BM25_AVAILABLE or not self._ensure_built():
-                return []
-            tokens = self._tokenize(query)
-            if not tokens:
-                return []
-            scores = self._bm25.get_scores(tokens)
-            # Get top-k indices (non-zero scores only, skip superseded)
-            top_idx = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:k * 2]
-            results = []
-            for idx in top_idx:
-                if scores[idx] <= 0:
-                    break
-                uid, content, attrs = self._docs[idx]
-                # Skip superseded facts (soft-deleted by consolidation)
-                if attrs.get("superseded_by"):
-                    continue
-                results.append({
-                    "content": content,
-                    "category": attrs.get("category", ""),
-                    "language": attrs.get("language", "en"),
-                    "domain":   attrs.get("domain", "general"),
-                    "score":    float(scores[idx]),
-                    "attrs":    attrs,
-                    "_element": uid,
-                })
-                if len(results) >= k:
-                    break
-            return results
-
-    async def populate_from_items(self, items: list[dict]) -> None:
-        """Bulk-load from knn_search result items (called at startup)."""
-        async with self._lock:
-            for item in items:
-                uid = item.get("_element", "")
-                content = item.get("content", "")
-                attrs = item.get("attrs", {})
-                if uid and content:
-                    self._docs.append((uid, content, attrs))
-
-    async def reset(self) -> None:
-        async with self._lock:
-            self._docs.clear()
-            self._bm25 = None
-            self._built_at_len = 0
-
-
-_bm25_index = _BM25Index()
-
-# ── Embedding cache ────────────────────────────────────────────────────────────
-@lru_cache(maxsize=1024)
-def _cached_encode(text: str) -> bytes:
-    return embedder.encode(text).tobytes()
-
-def _encode(text: str) -> np.ndarray:
-    return np.frombuffer(_cached_encode(text), dtype=np.float32).copy()
-
-# ── VSIM scan helper (repeated pattern: zero-vector scan to list all elements) ─
-_ZERO_VEC = np.zeros(embedder.DIMS, dtype=np.float32)
-
-async def _vscan(r, vset_key: str, max_count: int = 200) -> list[dict]:
-    """Scan all elements in a vectorset using zero-vector VSIM.
-
-    Returns list of {element, score, attrs} dicts, excluding __seed__ entries.
-    Common pattern extracted from 13+ call sites.
-    """
-    card = await r.execute_command("VCARD", vset_key)
-    if not card or int(card) <= 1:
-        return []
-    try:
-        results = await r.execute_command(
-            "VSIM", vset_key, "FP32", _ZERO_VEC.tobytes(),
-            "COUNT", min(int(card), max_count), "WITHSCORES", "WITHATTRIBS"
-        )
-    except Exception:
-        return []
-    items = []
-    i = 0
-    while i + 2 < len(results):
-        elem = results[i]
-        score = results[i + 1]
-        raw = results[i + 2]
-        i += 3
-        elem_str = elem.decode() if isinstance(elem, bytes) else elem
-        if elem_str == "__seed__":
-            continue
-        try:
-            attrs = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
-        except Exception:
-            continue
-        if attrs.get("_seed"):
-            continue
-        items.append({"element": elem_str, "score": float(score) if score else 0.0, "attrs": attrs})
-    return items
+# ── BM25 + search utilities now in core/search.py ────────────────────────────
+_bm25_index = BM25Index()
 
 # ── Session handoff: pinned last-session summary ───────────────────────────────
 # Key stores the most recent session summary so the NEXT session can always
@@ -501,170 +374,7 @@ async def dashboard():
 
 
 # ── Request / Response models ──────────────────────────────────────────────────
-# RecallRequest, Message, and StoreRequest are now defined in api.schemas.memory
-
-# ── Capability request models ──────────────────────────────────────────────────
-class ToolDefinition(BaseModel):
-    name: str
-    description: str
-    category: str = ""
-    source: str = "builtin"             # builtin | mcp | plugin | skill
-    parameters: list[str] = []
-
-class RegisterToolsRequest(BaseModel):
-    tools: list[ToolDefinition]
-    agent_id: str = ""                  # optional agent identifier
-    replace_all: bool = False           # if True, clear existing tools first
-
-class EnvState(BaseModel):
-    os: str = ""
-    os_version: str = ""
-    shell: str = ""
-    cwd: str = ""
-    git_repo: str = ""
-    git_branch: str = ""
-    runtime: str = ""                   # e.g. "python3.12", "node20"
-    active_mcps: list[str] = []
-    active_plugins: list[str] = []
-    active_skills: list[str] = []
-    agent_model: str = ""               # e.g. "claude-sonnet-4-6"
-    agent_version: str = ""
-    session_id: str = ""
-    extra: dict = {}                    # any extra key/value pairs
-
-class RecallToolsRequest(BaseModel):
-    query: str
-    k: int = 5
-    category: str = ""                  # optional filter by tool category
-    source: str = ""                    # optional filter by source
-
-class StoreProcedureRequest(BaseModel):
-    task: str                           # what kind of task (used as embedding key)
-    procedure: str                      # the step-by-step procedure
-    tools_used: list[str] = []          # tools/skills involved
-    domain: str = ""
-    session_id: str = ""
-
-# ── ToolMem + TIG + MACLA request models (v0.9.5) ─────────────────────────────
-class ToolFeedbackRequest(BaseModel):
-    tool_name: str                      # slugified tool name (e.g. "web_search_prime")
-    success: bool                       # did the tool invocation succeed?
-    session_id: str = ""
-
-class ToolSequenceRequest(BaseModel):
-    sequence: list[str]                 # ordered list of tool names used in session
-    session_id: str = ""
-
-class ProcedureFeedbackRequest(BaseModel):
-    task_prefix: str                    # first ~80 chars of task to identify procedure
-    success: bool
-    session_id: str = ""
-
-# ── Compat request models (absorbed from agentmemory scaffold) ─────────────────
-class CompatSessionStartRequest(BaseModel):
-    sessionId: str = ""
-    session_id: str = ""
-    project: str = ""
-    cwd: str = ""
-
-class CompatSessionEndRequest(BaseModel):
-    sessionId: str = ""
-    session_id: str = ""
-    project: str = ""
-    cwd: str = ""
-
-class ObserveRequest(BaseModel):
-    hookType: str = ""
-    sessionId: str = ""
-    session_id: str = ""
-    project: str = ""
-    cwd: str = ""
-    timestamp: str = ""
-    data: dict = {}
-
-class SummarizeRequest(BaseModel):
-    sessionId: str = ""
-    session_id: str = ""
-    project: str = ""
-    cwd: str = ""
-
-class EnrichRequest(BaseModel):
-    sessionId: str = ""
-    session_id: str = ""
-    project: str = ""
-    cwd: str = ""
-    files: list[str] = []
-    query: str = ""
-
-class ContextRequest(BaseModel):
-    sessionId: str = ""
-    session_id: str = ""
-    project: str = ""
-    cwd: str = ""
-    query: str = ""
-    token_budget: int = 1500
-
-class SessionCommitRequest(BaseModel):
-    sessionId: str = ""
-    session_id: str = ""
-    sha: str = ""
-    message: str = ""
-    branch: str = ""
-    repo: str = ""
-    cwd: str = ""
-
-class SearchRequest(BaseModel):
-    query: str
-    limit: int = 10
-    format: str = "full"
-    token_budget: int | None = None
-    sessionId: str = ""
-    session_id: str = ""
-
-class RememberRequest(BaseModel):
-    content: str
-    type: str = "fact"
-    concepts: str = ""
-    files: str = ""
-    sessionId: str = ""
-    session_id: str = ""
-
-class ForgetRequest(BaseModel):
-    query: str
-    limit: int = 10
-    dry_run: bool = True
-
-class FileContextRequest(BaseModel):
-    files: str
-    sessionId: str = ""
-    session_id: str = ""
-
-class PatternsRequest(BaseModel):
-    query: str = ""
-    limit: int = 10
-
-class SmartSearchRequest(BaseModel):
-    query: str
-    limit: int = 10
-    depth: str = "auto"
-
-class TimelineRequest(BaseModel):
-    sessionId: str = ""
-    session_id: str = ""
-    from_: str = ""
-    to: str = ""
-    limit: int = 20
-
-class ClaudeBridgeSyncRequest(BaseModel):
-    sessionId: str = ""
-    session_id: str = ""
-    project: str = ""
-    cwd: str = ""
-
-class ImportRequest(BaseModel):
-    data: dict = {}
-    version: str = ""
-
+# All Pydantic request models are now in api/schemas/ — imported above.
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -1534,10 +1244,6 @@ async def _do_compress_session(session_id: str) -> dict:
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
-class CompactRequest(BaseModel):
-    session_id: str
-    threshold_chars: int = 3000   # only compact if session KV exceeds this
-
 
 @app.post("/session/compact")
 async def session_compact(req: CompactRequest):
@@ -1596,11 +1302,6 @@ async def session_compact(req: CompactRequest):
         "size_after":    size_after,
         "reduction_pct": round(100 * (1 - size_after / size_before), 1),
     }
-
-
-class AnswerRequest(BaseModel):
-    query:   str
-    context: str
 
 
 @app.post("/answer")
@@ -1725,14 +1426,19 @@ async def stats():
         # v0.9.7+: background writer observability (since process start).
         # Nested under "writer" so the dashboard can render it as its own panel
         # and the top-level stat list stays focused on memory tier counts.
-        completed = _store_successes + _store_errors
+        w_attempts = await _store_attempts.get()
+        w_successes = await _store_successes.get()
+        w_skips = await _store_skips.get()
+        w_errors = await _store_errors.get()
+        w_latency = await _store_latency_sum_ms.get()
+        completed = w_successes + w_errors
         counts["writer"] = {
-            "attempts": _store_attempts,
-            "successes": _store_successes,
-            "skips": _store_skips,        # intentional drops (heartbeats, trivial, admission gate)
-            "errors": _store_errors,
-            "success_rate": round(_store_successes / completed, 3) if completed > 0 else None,
-            "avg_ms": round(_store_latency_sum_ms / _store_attempts) if _store_attempts > 0 else None,
+            "attempts": w_attempts,
+            "successes": w_successes,
+            "skips": w_skips,
+            "errors": w_errors,
+            "success_rate": round(w_successes / completed, 3) if completed > 0 else None,
+            "avg_ms": round(w_latency / w_attempts) if w_attempts > 0 else None,
         }
 
         return counts
@@ -2160,10 +1866,6 @@ async def store_memory(req: StoreRequest):
 
 
 # ── Session Tier-1 endpoints (v0.7.0) ─────────────────────────────────────────
-
-class CompressSessionRequest(BaseModel):
-    session_id: str
-    wait: bool = False   # True → sync (returns results); False → background
 
 @app.post("/session/compress")
 async def compress_session(req: CompressSessionRequest, background_tasks: BackgroundTasks):
@@ -3144,11 +2846,6 @@ async def admin_delete_facts_by_content(pattern: str = "Always send a report"):
 # ── User Feedback Endpoints (v1.2.0) ──────────────────────────────────────────
 # Enable users to rate, pin, and delete memories for continuous quality improvement
 
-class FeedbackRequest(BaseModel):
-    element_id: str
-    rating: int  # 1-5 stars (1=unhelpful, 5=very helpful)
-    comment: str = ""
-
 
 @app.post("/feedback")
 async def provide_feedback(req: FeedbackRequest):
@@ -3364,9 +3061,14 @@ async def get_fact_metadata(element_id: str):
 
 # ── Knowledge Graph endpoints (v0.9.0) ────────────────────────────────────────
 
-class GraphRecallRequest(BaseModel):
-    entity: str
-    k: int = 5
+@app.get("/graph/stats")
+async def graph_stats_endpoint():
+    """Return knowledge graph statistics: node count and edge count."""
+    try:
+        return await graph_mod.graph_stats(_redis)
+    except Exception as e:
+        log.error(f"[graph/stats] {e}")
+        return {"nodes": 0, "edges": 0, "total_nodes": 0, "total_edges": 0, "error": str(e)}
 
 
 @app.get("/graph/{entity}")
@@ -3401,39 +3103,7 @@ async def graph_recall(req: GraphRecallRequest):
     }
 
 
-@app.get("/graph/stats")
-async def graph_stats_endpoint():
-    """Return knowledge graph statistics: node count and edge count."""
-    return await graph_mod.graph_stats(_redis)
-
-
 # ── LLM Wiki v2 endpoints (v1.1) ─────────────────────────────────────────────
-
-class TypedEdgeRequest(BaseModel):
-    source_entity: str
-    target_entity: str
-    relationship_type: str = "related_to"   # uses, depends_on, contradicts, caused, fixed, supersedes
-    confidence: float = 0.8
-    source: str = ""
-    bidirectional: bool = False
-
-
-class TraverseRequest(BaseModel):
-    entity: str
-    relationship_types: list[str] | None = None
-    max_depth: int = 2
-    max_nodes: int = 50
-
-
-class ReinforceRequest(BaseModel):
-    element_id: str
-    source: str = ""
-
-
-class CrystallizeRequest(BaseModel):
-    session_id: str
-    max_facts: int = 20
-
 
 @app.post("/graph/edge")
 async def add_graph_edge(req: TypedEdgeRequest):
@@ -4307,7 +3977,6 @@ async def compat_remember(req: RememberRequest, request: Request):
     if auth_err:
         return auth_err
 
-    sid = _compat_sid(req)
     content = req.content
     emb = _encode(content)
 
@@ -4393,26 +4062,31 @@ async def compress_file(filePath: str = ""):
 
 @app.get("/sessions")
 async def compat_sessions(limit: int = 20):
-    cursor, keys = await _redis.scan(match="mem:session:*", count=limit)
-    if not keys:
+    # Sessions are stored as mem:session:{id}:ctx (plain-text string, not JSON).
+    # Scan for :ctx keys to enumerate known session IDs.
+    _, ctx_keys = await _redis.scan(match="mem:session:*:ctx", count=500)
+    if not ctx_keys:
         return {"sessions": []}
 
-    # Batch fetch all session data via pipeline (avoids N+1 round-trips)
     pipe = _redis.pipeline(transaction=False)
-    for key in keys:
-        k = key.decode() if isinstance(key, bytes) else key
-        pipe.get(k)
+    for key in ctx_keys:
+        pipe.get(key)
     raw_values = await pipe.execute()
 
     results = []
-    for raw in raw_values:
-        if raw:
-            try:
-                data = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
-                results.append(data)
-            except Exception:
-                pass
-    results.sort(key=lambda x: x.get("started_at", 0), reverse=True)
+    for key, raw in zip(ctx_keys, raw_values):
+        k = key.decode() if isinstance(key, bytes) else key
+        # Extract session ID from "mem:session:{id}:ctx"
+        parts = k.split(":")
+        sid = parts[2] if len(parts) >= 4 else k
+        ctx_str = (raw.decode() if isinstance(raw, bytes) else raw) or ""
+        results.append({
+            "session_id": sid,
+            "status": "ended",
+            "observation_count": 0,
+            "summary": ctx_str[:300] if ctx_str else None,
+        })
+
     return {"sessions": results[:limit]}
 
 
@@ -4585,8 +4259,13 @@ async def compat_timeline(req: TimelineRequest, request: Request):
 
 @app.get("/profile")
 async def compat_profile():
-    ctx = await persona_mod.get_context(_redis)
-    return {"profile": ctx or ""}
+    # Return raw persona hash fields (not the formatted markdown string)
+    persona_raw = await _redis.hgetall("mem:persona")
+    fields = {
+        (k.decode() if isinstance(k, bytes) else k): (v.decode() if isinstance(v, bytes) else v)
+        for k, v in persona_raw.items()
+    }
+    return {"profile": fields}
 
 
 # ── Export / Import ───────────────────────────────────────────────────────────
