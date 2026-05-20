@@ -22,12 +22,13 @@ print(d.get('session_id', ''))
 PAYLOAD=$(python3 -c "
 import json, sys
 print(json.dumps({'query': sys.argv[1], 'session_id': sys.argv[2],
-                  'memory_limit_number': 6, 'include_tools': True,
-                  'include_procedures': True}))
+                  'memory_limit_number': 8, 'include_tools': True,
+                  'include_procedures': True, 'include_graph': True,
+                  'enable_planning': True, 'enable_hyde': True}))
 " "$PROMPT" "$SESSION" 2>/dev/null)
 
-# Hard-cap recall to 2s. If it can't answer that fast, skip silently.
-RESULT=$(curl -sf -m 2 -X POST http://localhost:18800/recall \
+# Hard-cap recall to 4s (planning adds ~300-600ms). Skip silently if exceeded.
+RESULT=$(curl -sf -m 4 -X POST http://localhost:18800/recall \
   -H 'Content-Type: application/json' -d "$PAYLOAD" 2>/dev/null)
 
 python3 -c "

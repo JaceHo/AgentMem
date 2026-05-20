@@ -158,10 +158,10 @@ AISERV_BASE  = "http://127.0.0.1:4000"
 AISERV_URL   = f"{AISERV_BASE}/v1/chat/completions"
 AISERV_KEY   = "sk-aiserv-local"
 AISERV_ROLE  = "nlp"                    # maps to /v1/role/nlp
-AISERV_FALLBACK_MODEL = "fast"          # used only if /v1/role/nlp is unreachable
+AISERV_FALLBACK_MODEL = "aiserv/GLM-4.7-Flash"  # direct fallback if /v1/role/nlp returns broken models
 AISERV_MODEL_CASCADE = []               # populated dynamically; kept for import compat
 FAST_LLM_TIMEOUT_S = 4.0
-ROLE_LLM_TIMEOUT_S = 15.0
+ROLE_LLM_TIMEOUT_S = 8.0               # reduced from 15s — broken models fail fast
 LLM_TIMEOUT_S = ROLE_LLM_TIMEOUT_S
 LLM_MAX_RETRIES = 3
 LLM_MAX_INPUT = 3000   # chars of conversation to send to LLM
@@ -397,11 +397,20 @@ async def _llm_extract(conversation_text: str) -> list[ExtractedFact]:
 
     exclude = None
     tried_models = []
-    for attempt in range(LLM_MAX_RETRIES):
-        model, tier = await _resolve_nlp_model(exclude=exclude)
+    # Build candidate list: up to LLM_MAX_RETRIES role-routed models, then fallback
+    candidate_models = []
+    for _ in range(min(LLM_MAX_RETRIES, 2)):
+        m, t = await _resolve_nlp_model(exclude=exclude)
+        if m not in candidate_models:
+            candidate_models.append(m)
+        exclude = m
+    if AISERV_FALLBACK_MODEL not in candidate_models:
+        candidate_models.append(AISERV_FALLBACK_MODEL)
+
+    for model in candidate_models:
         if model in tried_models:
-            log.warning("[extractor] duplicate route from role API: %s", model)
-            break
+            continue
+        tier = "fast" if model == AISERV_FALLBACK_MODEL else "premium"
         tried_models.append(model)
         timeout_s = _timeout_for(model, tier)
         try:

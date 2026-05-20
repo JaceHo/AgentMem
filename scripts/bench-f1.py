@@ -418,9 +418,10 @@ def recall_context(api: str, query: str, session_id: str) -> str:
         {
             "query":              query,
             "session_id":         session_id,
-            "memory_limit_number": 12,
-            "token_budget":       1500,
+            "memory_limit_number": 15,
+            "token_budget":       2500,
             "enable_planning":    True,   # SimpleMem intent-aware query expansion
+            "enable_hyde":        True,   # HyDE: hypothetical document embeddings
             "enable_reflection":  True,   # Re-fetch if first pass is insufficient
             "include_graph":      True,   # AriadneMem: graph bridge discovery
         },

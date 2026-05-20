@@ -39,7 +39,7 @@ from typing import Optional
 
 import numpy as np
 import redis.asyncio as aioredis
-from ulid import ULID
+import ulid as _ulid_mod
 
 from .utils import decode_json, force_str
 
@@ -58,7 +58,9 @@ SESSION_PRE  = "mem:session:"
 PERSONA_KEY  = "mem:persona"
 from core import embedder as _embed_mod
 
-DIMS         = _embed_mod.DIMS
+def _dims() -> int:
+    """Current embedding dimensions — resolved lazily after provider init."""
+    return _embed_mod._get_provider().dims
 
 # ── Shared connection pool (singleton) ────────────────────────────────────────
 # Prevents connection leaks: get_client() returns the SAME Redis instance
@@ -265,7 +267,7 @@ async def ensure_indexes(r: aioredis.Redis) -> None:
     for key in (EPISODE_KEY, FACT_KEY):
         card = await r.execute_command("VCARD", key)
         if not card:
-            seed = np.zeros(DIMS, dtype=np.float32)
+            seed = np.zeros(_dims(), dtype=np.float32)
             attr = json.dumps({"_seed": True, "content": "",
                                "language": "en", "domain": "general",
                                "access_count": 0, "ts": 0,
@@ -274,11 +276,11 @@ async def ensure_indexes(r: aioredis.Redis) -> None:
                                     "SETATTR", attr)
     # Tool capability vectorset
     from .capability import ensure_tool_index
-    await ensure_tool_index(r, DIMS)
+    await ensure_tool_index(r, _dims())
     # Procedural memory vectorset
     card = await r.execute_command("VCARD", PROC_KEY)
     if not card:
-        seed = np.zeros(DIMS, dtype=np.float32)
+        seed = np.zeros(_dims(), dtype=np.float32)
         attr = json.dumps({"_seed": True, "task": "", "procedure": "",
                            "tools_used": [], "success_count": 0, "ts": 0})
         await r.execute_command("VADD", PROC_KEY, "FP32", _blob(seed), "__seed__",
@@ -367,7 +369,7 @@ async def save_episode(
     ep_type: str = "general",          # claude-mem taxonomy: bugfix|feature|discovery|decision|change|procedure|preference|context|general
     prev_episode_id: str = "",         # causal chain: predecessor episode UID
 ) -> str:
-    uid  = str(ULID())
+    uid  = str(_ulid_mod.new())
     attr = json.dumps({
         "content":         content[:2000],
         "category":        "episode",
@@ -465,7 +467,7 @@ async def save_fact(
       version:           incrementing counter for each fact (tracks edits)
       sources:           list of source identifiers that contributed to this fact
     """
-    uid  = str(ULID())
+    uid  = str(_ulid_mod.new())
     now_ms = int(time.time() * 1000)
     attr_dict: dict = {
         "content":           content[:500],
@@ -622,7 +624,7 @@ async def scan_all_procedures(r: aioredis.Redis, max_count: int = 1000) -> list[
     card = await r.execute_command("VCARD", PROC_KEY)
     if not card or int(card) <= 1:
         return []
-    seed = np.zeros(DIMS, dtype=np.float32)
+    seed = np.zeros(_dims(), dtype=np.float32)
     try:
         results = await r.execute_command(
             "VSIM", PROC_KEY, "FP32", _blob(seed),
@@ -662,7 +664,7 @@ async def save_procedure(
     Store a successful procedure/workflow in mem:procedures.
     Also updates the reverse index mem:proc_by_tool:<tool> for each tool.
     """
-    uid = str(ULID())
+    uid = str(_ulid_mod.new())
     tools = (tools_used or [])[:10]
     attr = json.dumps({
         "task":          task[:300],

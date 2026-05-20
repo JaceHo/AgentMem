@@ -70,7 +70,7 @@ async def ensure_tool_index(r: aioredis.Redis, dims: int | None = None) -> None:
     import numpy as np
     if dims is None:
         from . import embedder
-        dims = embedder.DIMS
+        dims = embedder._get_provider().dims
     card = await r.execute_command("VCARD", TOOL_KEY)
     if not card:
         seed = np.zeros(dims, dtype=np.float32)
@@ -217,7 +217,7 @@ async def list_all_tools(r: aioredis.Redis) -> list[dict]:
     if not card or int(card) <= 1:
         return []
 
-    seed = np.zeros(embedder.DIMS, dtype=np.float32)
+    seed = np.zeros(embedder._get_provider().dims, dtype=np.float32)
     try:
         results = await r.execute_command(
             "VSIM", TOOL_KEY, "FP32", seed.tobytes(),

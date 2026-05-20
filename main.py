@@ -286,7 +286,7 @@ async def lifespan(app: FastAPI):
                 log.warning("Dimension mismatch: existing vectors=%d, provider=%s dims=%d — forcing local provider",
                             existing_dims, embedder._get_provider().name, embedder.DIMS)
                 embedder._reset_provider("local")
-                mem_store.DIMS = embedder.DIMS
+                pass  # _dims() in store.py resolves lazily from embedder
     except Exception:
         pass  # no existing vectorset, safe to use any provider
 
@@ -816,6 +816,28 @@ def _rrf_merge(
         item = dict(items_by_content[content])
         item["score"] = rrf_score
         result.append(item)
+    return result
+
+
+# ── Session diversity: prevent one session dominating recall results ──────────
+
+def _session_diversify(items: list[dict], max_per_session: int = 3) -> list[dict]:
+    """Limit results from the same session to avoid recall dominated by one session.
+
+    Preserves rank order within each session group. Items without a session_id
+    (facts with no origin session) are always kept.
+    """
+    seen: dict[str, int] = {}
+    result = []
+    for item in items:
+        sid = item.get("attrs", {}).get("session_id", "")
+        if not sid:
+            result.append(item)
+            continue
+        count = seen.get(sid, 0)
+        if count < max_per_session:
+            result.append(item)
+            seen[sid] = count + 1
     return result
 
 
@@ -1467,6 +1489,38 @@ async def recall(req: RecallRequest):
     q_lang, q_domain = query_scene["language"], query_scene["domain"]
     emb = _encode(req.query)
 
+    # HyDE + MIRIX Active Retrieval Topic — run both in parallel for zero extra latency.
+    #
+    # HyDE (Gao et al. 2022, arXiv:2212.10496): generate hypothetical memory → embed →
+    #   average with query embedding. Hypothetical docs are closer in embedding space
+    #   to actual stored memories than raw questions.
+    #
+    # MIRIX Active Retrieval (arXiv:2507.07957 §3.2): generate focused retrieval topic
+    #   from vague queries ("that auth thing" → "JWT token validation middleware error").
+    #   Use topic as the BM25 search query for better lexical precision on vague prompts.
+    _hyde_task = (
+        retrieval_planner.generate_hyde_doc(req.query)
+        if req.enable_hyde and req.query.strip() and len(req.query) > 10
+        else asyncio.sleep(0)
+    )
+    _topic_task = (
+        retrieval_planner.generate_retrieval_topic(req.query)
+        if req.query.strip() and len(req.query) > 8
+        else asyncio.sleep(0)
+    )
+    _augment_results = await asyncio.gather(_hyde_task, _topic_task)
+    _hyde_doc   = _augment_results[0] if isinstance(_augment_results[0], str) else None
+    _mirix_topic = _augment_results[1] if isinstance(_augment_results[1], str) else None
+
+    if _hyde_doc:
+        hyde_emb = _encode(_hyde_doc)
+        merged = (emb * 0.5 + hyde_emb * 0.5).astype(np.float32)
+        norm = np.linalg.norm(merged)
+        emb = merged / norm if norm > 0 else merged
+
+    # Use MIRIX topic for BM25 search when available (vague queries benefit most)
+    _bm25_query = _mirix_topic if _mirix_topic else req.query
+
     if _is_brief_option_reply(req.query):
         hint = (
             "<cross_session_memory>\n"
@@ -1691,7 +1745,7 @@ async def recall(req: RecallRequest):
     else:
         supplement_tasks.append(asyncio.sleep(0))
 
-    supplement_tasks.append(_bm25_index.search(req.query, k=n_facts))
+    supplement_tasks.append(_bm25_index.search(_bm25_query, k=n_facts))
 
     supp_results = await asyncio.gather(*supplement_tasks)
     facts_global = supp_results[0] if isinstance(supp_results[0], list) else []
@@ -1741,6 +1795,11 @@ async def recall(req: RecallRequest):
     # High-importance facts (rules, identity, preferences) surface above transient context.
     facts    = _importance_boost(facts)
     episodes = _importance_boost(episodes, weight=0.05)  # lighter for episodes
+
+    # Session diversity: cap at 3 results per source session to prevent
+    # one verbose session drowning out facts from other sessions.
+    facts    = _session_diversify(facts,    max_per_session=3)
+    episodes = _session_diversify(episodes, max_per_session=4)
 
     # SimpleMem reflection loop (opt-in): check if results sufficient, if not re-fetch
     if req.enable_reflection and facts:
@@ -1854,9 +1913,11 @@ async def recall(req: RecallRequest):
     ms = int((time.time() - t0) * 1000)
 
     planning_info = f" planning={req.enable_planning}" if req.enable_planning else ""
+    hyde_info = f" hyde={bool(_hyde_doc)}" if req.enable_hyde else ""
+    topic_info = f" topic={_mirix_topic[:30]!r}" if _mirix_topic else ""
     log.info(f"[recall] session={req.session_id} lang={q_lang} domain={q_domain} "
              f"facts={len(facts)} ep={len(episodes)} tools={len(tools_raw)} procs={len(proc_ctx)}"
-             f"{planning_info} {ms}ms")
+             f"{planning_info}{hyde_info}{topic_info} {ms}ms")
 
     return {"prependContext": prepend if prepend else None, "latency_ms": ms}
 

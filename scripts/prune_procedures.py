@@ -8,7 +8,7 @@ and soft-deletes duplicates by marking them superseded_by.
 Target: reduce ~2422 → ~200 high-signal procedures.
 
 Usage:
-    cd ~/code/agentmem && source venv/bin/activate
+    cd ~/code/agentmem && source .venv/bin/activate
     python prune_procedures.py [--dry-run] [--threshold 0.92]
 """
 import argparse

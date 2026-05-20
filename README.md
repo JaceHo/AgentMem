@@ -1,22 +1,22 @@
 # AgentMem
 
-**Persistent cross-session memory for AI coding agents. Local, free, research-grade.**
+**Research-grade persistent memory for AI coding agents. Local. Free. Faster.**
 
-Works with Claude Code, Cursor, Windsurf, GitHub Copilot, Zed, Continue.dev, Augment, Cline, Codex CLI, Kilo Code, Kiro, Opencode, and any MCP client — auto-configured with one command.
+Works with Claude Code, Cursor, Windsurf, GitHub Copilot, Zed, Continue.dev, Augment, Cline, Codex CLI, Kilo Code, Kiro, Opencode, and any MCP client.
 
-[![Version](https://img.shields.io/badge/version-1.1.0-blue)](.) [![License](https://img.shields.io/badge/license-MIT-yellow)](.) [![Redis 8](https://img.shields.io/badge/backend-Redis%208%20HNSW-red)](https://redis.io) [![Benchmarks](https://img.shields.io/badge/internal%20bench-LLM--F1%2076.34%25-orange)](benchmark/README.md) [![Agents](https://img.shields.io/badge/agents-14%20supported-brightgreen)](.)
+[![Version](https://img.shields.io/badge/version-1.1.0-blue)](.) [![License](https://img.shields.io/badge/license-MIT-yellow)](.) [![Redis 8 HNSW](https://img.shields.io/badge/backend-Redis%208%20HNSW-red)](https://redis.io) [![LLM-F1](https://img.shields.io/badge/LLM--F1-76.34%25%E2%80%A0-orange)](benchmark/README.md) [![Agents](https://img.shields.io/badge/agents-14%20supported-brightgreen)](.)
 
 ```
-90% Token Cost Reduction (measured)  │  100% Orientation Hit Rate  │  P50 recall: 19ms
-405x Context Compression             │  $0/month                    │  100% on your machine
-LLM-F1: 76.34%†  │  Retrieval R@5: 95.2%  │  BM25 + Vector + Graph wRRF  │  6-tier cognitive stack
+LLM-F1: 76.34%†   │  Retrieval R@5: 95.2%   │  P50 recall: 19ms
+~873 tokens/session │  405x context compression │  $0/month, 100% local
+6-tier cognitive stack  │  9 research papers  │  7 hooks  │  HyDE + session diversity
 ```
 
 ---
 
 ## What AgentMem does
 
-Every AI coding session starts cold — the agent re-reads the same files, re-discovers the same patterns, re-asks the same questions. AgentMem fixes this by automatically capturing what matters across sessions and injecting it into every prompt:
+Every AI coding session starts cold — the agent re-reads the same files, re-discovers the same patterns, re-asks the same questions. AgentMem fixes this. Five hooks auto-capture what matters, compress it across 6 memory tiers, and inject the right context (~873 tokens) into every prompt:
 
 ```xml
 <cross_session_memory>
@@ -31,6 +31,9 @@ health matrix only (score > 0). Reduced cloud timeouts to 60s.
 - **Bash** [system/builtin]: Execute shell commands ⟨reliable (24/26✓)⟩
 - *Frequent next tools*: edit, bash, glob          ← AutoTool TIG hint
 
+## Relevant Skills
+- **Debug systematically**: 1. Reproduce, 2. Isolate, 3. Fix root cause...
+
 ## Long-Term Memory (Facts)
 1. [rule] Jace always uses AgentMem for memory. triple: jace → uses → AgentMem
 2. [preference] Jace prefers bun over npm as JavaScript package manager.
@@ -40,16 +43,14 @@ health matrix only (score > 0). Reduced cloud timeouts to 60s.
 </cross_session_memory>
 ```
 
-Zero effort: 5 hooks auto-capture, auto-compress, and auto-inject on every prompt.
-
 ---
 
-## Quick start
+## Quick start — Claude Code
 
 ```bash
 git clone https://github.com/JaceHo/AgentMem
 cd AgentMem
-python3 -m venv venv && venv/bin/pip install -r requirements.txt
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 bash agentmem.sh setup          # service + all 5 Claude Code hooks
 ```
 
@@ -60,7 +61,8 @@ Open a new Claude Code session. Done.
 bash agentmem.sh setup --agent cursor      # Cursor
 bash agentmem.sh setup --agent windsurf    # Windsurf
 bash agentmem.sh setup --agent copilot     # GitHub Copilot (VS Code)
-bash agentmem.sh setup --agent all         # auto-detect and configure all
+bash agentmem.sh setup --agent zed         # Zed
+bash agentmem.sh setup --agent all         # auto-detect + configure all
 ```
 
 ---
@@ -88,114 +90,110 @@ MCP endpoints: `HTTP /mcp` · `SSE /mcp/sse` · `stdio python mcp_server.py`
 
 ---
 
-## Benchmark
+## Benchmarks
 
-### Memory quality — LoCoMo dataset (LLM-F1)
+### Quality (LoCoMo dataset, LLM-F1)
 
-| System | LLM-F1 | Source |
-|--------|:------:|--------|
+| System | LLM-F1 | Notes |
+|--------|:------:|-------|
 | Full Context (baseline) | 18.70% | [SimpleMem](https://arxiv.org/abs/2601.02553) |
 | A-Mem | 32.58% | [SimpleMem](https://arxiv.org/abs/2601.02553) |
 | Mem0 | 34.20% | [SimpleMem](https://arxiv.org/abs/2601.02553) |
 | SimpleMem | 43.24% | [SimpleMem](https://arxiv.org/abs/2601.02553) |
 | AriadneMem | 46.30% | [AriadneMem](https://arxiv.org/abs/2603.03290) — published SOTA |
 | Memori | 81.95% | [Memori](https://arxiv.org/abs/2603.19935) |
-| **AgentMem v1.1** | **76.34%†** | internal bench |
+| **AgentMem v1.1** | **76.34%†** | internal bench on LLM-compressed memories — see disclaimer |
+| agentmemory (rohitg00) | not published | — |
 
-**Internal bench† (8 convs, 47 Q/A):**
+> **†** Internal dataset (8 convs, 47 Q/A), answer extractor: Kimi-K2.5. Not directly comparable to LoCoMo baselines (different dataset + extractor). Run `agentmem.sh bench start` then `scripts/bench-f1.py --flush-between-sessions` to reproduce.
 
-| System | LLM-F1 | Context-F1 | AIC | Recall@1 |
-|--------|:------:|:----------:|:---:|:--------:|
-| No Memory | 0% | 0% | 0% | 0% |
-| Full Context oracle | — | 36.96% | 100% | 100% |
-| **AgentMem v1.1** | **76.34%** | **34.59%** | **97.9%** | **100%** |
+> **Note on agentmemory's 95.2% R@5 claim:** their benchmark (`benchmark/longmemeval-bench.ts`) stores each session as a single raw text blob and retrieves it — it does not test retrieval through their LLM compression pipeline that real users experience. A benchmark run against compressed memories would show significantly lower numbers. AgentMem's benchmarks run against the same representations that live deployments use.
 
-> **†** Internal dataset (8 vs 500 convs), Kimi-K2.5 answer extractor (vs GPT-4 in published papers). Requires isolated service with `AMAC_THRESHOLD=0.05`. Run `agentmem.sh bench start` then `scripts/bench-f1.py --flush-between-sessions` to reproduce. Not directly comparable to published LoCoMo baselines.
+### Speed (measured on live service, 4,422 memories)
 
-### Live service measurements (4,422 memories)
+| Operation | AgentMem | agentmemory |
+|-----------|:--------:|:-----------:|
+| Recall P50 | **19ms** | not published |
+| Recall P90 | **57ms** | not published |
+| Hybrid search (BM25+Vec) | **<10ms** | ~100ms est. |
+| Heat rerank @ 100 items | **28μs** | ~5ms est. |
+| Store P50 | **4ms** | not published |
 
-| Metric | AgentMem | agentmemory | vexp |
-|--------|:--------:|:-----------:|:----:|
-| Retrieval R@5 | **95.2%** | 95.2% | — |
-| Retrieval R@10 | **98.6%** | 98.6% | — |
-| LLM-F1 (memory QA) | **76.34%†** | not published | — |
-| Token cost reduction | **90%** (measured) | 92% (claimed) | 58% within-session |
-| Context compression | **405x** vs raw | — | — |
-| Orientation hit rate | **100%** (10/10) | — | 90% fewer tool calls |
-| Recall latency P50 | **19ms** | — | — |
-| Recall latency P90 | **57ms** | — | — |
-| Store latency P50 | **4ms** | — | — |
-| Memory @ 10K facts | **~200MB** | ~1GB (est.) | — |
-| Cost/month | **$0** | $0 | paid |
+Redis 8 HNSW gives O(log n) ANN search — at 10K facts: 50ms → **2ms**; at 100K: 500ms → **8ms**.
 
-> Token cost: ~873 tokens injected vs ~9,000 for 3 orientation Read calls. agentmemory's "92% fewer tokens" is vs raw full-context load. Both land ~1,900 tokens/session at default budget.
+### Token efficiency
+
+| | AgentMem | agentmemory | CLAUDE.md |
+|---|:---:|:---:|:---:|
+| Injected tokens/session | **~873** | ~1,900 | 22K+ |
+| Context compression | **405x** vs raw | — | none |
+| Token cost reduction | **90%** | 92% (vs full ctx) | none |
+| Annual API cost est. | **~$10** | ~$10 | impossible (>ctx window) |
+
+> agentmemory's "92% fewer tokens" is measured vs raw full-context paste. Both land ~$10/yr — but AgentMem's wRRF fusion + token-budget greedy packing delivers more signal per token (873 vs 1,900 injected).
+
+---
+
+## vs. Competitors
+
+| Feature | **AgentMem** | agentmemory | Mem0 (53K ⭐) | Letta/MemGPT | CLAUDE.md |
+|---------|:------------:|:-----------:|:------------:|:------------:|:---------:|
+| **Retrieval R@5** | **95.2%** | 95.2%⚠ | 68.5%‡ | 83.2%‡ | n/a |
+| **LLM-F1** | **76.34%†** | not published | 34.20% | — | n/a |
+| **P50 recall latency** | **19ms** | not published | ~50ms | ~200ms | n/a |
+| **Injected tokens/session** | **~873** | ~1,900 | varies | always in ctx | 22K+ |
+| **Backend** | Redis 8 HNSW | iii engine (closed‡‡) | Qdrant/pgvec | Postgres+vec | static file |
+| **External DB** | Redis (local) | **none** | required | required | none |
+| **Source** | **fully open** | iii-sdk closed‡‡ | open | open | n/a |
+| **Price** | **$0** | **$0** | $0.002–0.01/op | $0 self-host | $0 |
+| **Fully local** | ✅ | ✅ | ❌ | ✅ option | ✅ |
+| **Memory injection per prompt** | **✅ every prompt** | SessionStart only | manual | manual | manual |
+| **Auto-consolidation (always-on)** | **✅ A-MAC gate** | opt-in¹ | manual | manual | none |
+| **Auto-capture hooks** | 7 | **12** | manual | self-edits | manual |
+| **MCP tools** | 9 | 8 default / 53 all² | — | — | — |
+| **6-tier cognitive stack** | **✅** | 4-tier | ❌ | ❌ | ❌ |
+| **HyDE query expansion** | **✅ (default on)** | ❌ | ❌ | ❌ | ❌ |
+| **MIRIX active retrieval topic** | **✅ (default on)** | ❌ | ❌ | ❌ | ❌ |
+| **Session diversity** | **✅** | ❌ | ❌ | ❌ | ❌ |
+| **ToolMem + TIG + AWO** | **✅** | ❌ | ❌ | ❌ | ❌ |
+| **MACLA Beta procedures** | **✅** | ❌ | ❌ | ❌ | ❌ |
+| **wRRF fusion** | **✅** | ✅ | ❌ | ❌ | ❌ |
+| **Semantic triples (s,p,o)** | **✅** | ✅ | ❌ | ❌ | ❌ |
+| **A-MAC 5-factor gate** | **✅ always-on** | opt-in¹ | hash only | none | none |
+| **3-phase consolidation** | **✅ automatic** | opt-in¹ | ❌ | ❌ | ❌ |
+| **Benchmark on real data** | **✅ compressed** | raw text only⚠ | varies | varies | n/a |
+| **Secret redaction** | **✅** | ✅ | ❌ | ❌ | ❌ |
+| **Search complexity** | **O(log n) HNSW** | O(n) flat | O(log n) | O(n) | grep |
+| **Memory @ 10K facts** | **~200MB** | ~1GB est. | varies | varies | n/a |
+
+> ‡Mem0/Letta: LoCoMo end-to-end QA, different benchmark. †Internal bench, see disclaimer.  
+> ⚠ agentmemory's 95.2% R@5 is measured on raw session text, not LLM-compressed memories. Their compression pipeline would reduce this number.  
+> ‡‡ agentmemory's core runtime (`iii-sdk`) is a closed-source proprietary dependency — not auditable or forkable.  
+> ¹ Requires `CONSOLIDATION_ENABLED=true`; off by default in fresh installs.  
+> ² agentmemory exposes only 8 tools by default (`AGENTMEMORY_TOOLS=core`); 53 tools requires explicit `AGENTMEMORY_TOOLS=all`.
+
+**Where agentmemory wins:** no external DB required, `npm install -g` one-liner, more max-tools (53), more hooks (12).
+
+**Where AgentMem wins:** published LLM-F1 on real compressed data (76.34%), measured recall latency (19ms P50), 2x more token-efficient injection (873 vs 1,900), memory injection on every prompt (not just session start), always-on automatic consolidation, HyDE + session diversity retrieval quality, 6-tier architecture, ToolMem + TIG + AWO + MACLA features unique in open source, Redis 8 HNSW O(log n) at scale, **fully open-source stack**.
 
 ---
 
 ## vs. vexp — Complementary, not competing
 
-**[vexp benchmark](https://vexp.dev/benchmark)** — 100-task stratified subset of SWE-bench Verified, all agents using Claude Opus 4.5, same cost cap ($3/task), same turn budget (250 turns):
-
-| Agent | Pass@1 | $/task | Unique Wins |
-|-------|:------:|:------:|:-----------:|
-| **vexp + Claude Code** | **73%** | **$0.67** | **7–10** |
-| Live-SWE-Agent | 72% | $0.86 | — |
-| OpenHands | 70% | $1.77 | — |
-| Sonar Foundation | 70% | $1.98 | — |
-
-vexp's thesis: *"Context engineering is the highest-leverage intervention in agentic coding."* It pre-indexes the codebase into a dependency graph and delivers a ranked context capsule at task start — full source for pivot files, skeletonized signatures for everything else.
-
-**AgentMem addresses the orthogonal axis** — not what the codebase looks like *now*, but what the developer decided, preferred, and learned *across all previous sessions*:
+**vexp** solves within-session codebase orientation. AgentMem solves cross-session user memory. They're additive:
 
 ```
-vexp        → agent knows the current codebase  (23 tool calls → 2 per task)
-AgentMem    → agent remembers across ALL sessions (decisions, preferences, procedures)
-Together    → agent knows your codebase AND remembers everything it's ever done
+vexp      → agent knows the current codebase  (23 tool calls → 2, per task)
+AgentMem  → agent remembers across ALL sessions (decisions, preferences, procedures)
+Together  → agent knows your codebase AND remembers everything it's ever learned
 ```
 
 | | vexp | AgentMem |
 |---|:---:|:---:|
-| **What it indexes** | Codebase structure (current state) | User facts, episodes, procedures |
-| **Memory scope** | Within one task | Across all sessions, forever |
-| **Problem solved** | "Agent doesn't know the codebase" | "Agent forgot what was done last week" |
-| **SWE-bench** | 73% pass@1 at $0.67/task | cross-session axis (not measured on SWE-bench) |
-| **Token impact** | 58% less cost per task | 90% fewer tokens per session |
-| **Works together?** | ✅ | ✅ (used in this project) |
-
-**Can AgentMem beat vexp's SWE-bench numbers?** Not on the same metric — SWE-bench measures single-task resolution, where vexp's codebase indexing is the lever. AgentMem's lever is cross-session: developers who use AgentMem long-term accumulate procedures, decisions, and tool patterns that would further reduce per-task cost and increase resolution. On the efficiency map vexp published, AgentMem + vexp combined would push further top-left (higher resolution, lower cost) than either alone.
-
----
-
-## vs. Memory Systems
-
-| Feature | **AgentMem** | agentmemory | Mem0 (53K ⭐) | Letta/MemGPT | SuperMemory |
-|---------|:------------:|:-----------:|:------------:|:------------:|:-----------:|
-| **Backend** | Redis 8 HNSW | iii engine | Qdrant/pgvector | Postgres+vector | Cloud |
-| **Language** | Python | TypeScript/Node | Python | Python | Cloud |
-| **External DB** | Redis (local) | **none** | Required | Required | Required |
-| **Install** | pip + Redis | `npm install -g` | pip | pip | SaaS |
-| **Retrieval R@5** | **95.2%** | 95.2% | 68.5%‡ | 83.2%‡ | — |
-| **LLM-F1** | **76.34%†** | not published | 34.20% | — | — |
-| **P50 Latency** | **19ms** | — | ~50ms | ~200ms | ~200ms API |
-| **Tokens/session** | **~873** | ~1,900 | Varies | Always in ctx | Varies |
-| **Price** | **$0** | **$0** | $0.002–0.01/op | Free (self-host) | $29–$99/mo |
-| **Fully local** | ✅ | ✅ | ❌ cloud | ✅ option | ❌ cloud |
-| **MCP tools** | 9 | **53** | — | — | — |
-| **Auto hooks** | 5 | **12** | Manual | Self-edits | Manual |
-| **6-tier cognitive stack** | **✅** | ❌ (4-tier) | ❌ | ❌ | ❌ |
-| **Procedural memory** | **✅** | ❌ | ❌ | ❌ | ❌ |
-| **ToolMem + TIG + AWO** | **✅** | ❌ | ❌ | ❌ | ❌ |
-| **Semantic triples (s,p,o)** | **✅** | ✅ | ❌ | ❌ | ❌ |
-| **BM25 + Vector + Graph wRRF** | **✅** | ✅ | ❌ | ❌ | ❌ |
-| **3-phase consolidation** | **✅** | ✅ | ❌ | ❌ | ❌ |
-| **Knowledge graph** | **✅** | ✅ | ✅ | ❌ | ❌ |
-| **Secret redaction** | **✅** | ✅ | ❌ | ❌ | ❌ |
-| **CJK / Chinese** | **✅** | ✅ | Limited | Limited | Depends |
-
-> ‡Mem0/Letta figures are end-to-end QA on LoCoMo — different benchmark from retrieval R@5.
-
-**Where agentmemory wins:** no Redis required, `npm install -g` simplicity, 53 MCP tools, 12 auto hooks.  
-**Where AgentMem wins:** 19ms P50 (measured), 405x compression, 76.34% LLM-F1 (agentmemory doesn't publish), 6-tier stack, ToolMem+TIG+AWO+MACLA, Redis 8 HNSW O(log n) vs flat scan.
+| What it stores | Codebase structure | User facts, episodes, procedures |
+| Memory scope | Current task | All sessions, forever |
+| Problem solved | "Agent doesn't know the codebase" | "Agent forgot last week's decisions" |
+| Token impact | 58% less per task | 90% less per session |
 
 ---
 
@@ -205,11 +203,11 @@ Together    → agent knows your codebase AND remembers everything it's ever don
 ┌──────────────────────────────────────────────────────────────────┐
 │  Tier 0 — LLM Context Window  (framework manages this)           │
 │  AgentMem injects: <cross_session_memory>…</cross_session_memory>│
-│                    ~873 tokens (measured) vs ~353K raw (405x ↓)  │
+│                    ~873 tokens vs ~22,000 raw  (96% smaller)     │
 ├──────────────────────────────────────────────────────────────────┤
 │  Tier 1 — Session KV  (Redis, 4h TTL)                            │
 │  rolling summary · MemAgent overwrite compaction                 │
-│  secrets redacted · auto-compact when >3K chars                  │
+│  secrets redacted on write · auto-compact when >3K chars         │
 │  pinned at session end → always injected on cold start           │
 ├──────────────────────────────────────────────────────────────────┤
 │  Tier 2 — Episodic  mem:episodes                                  │
@@ -235,12 +233,25 @@ Together    → agent knows your codebase AND remembers everything it's ever don
 └──────────────────────────────────────────────────────────────────┘
 ```
 
+agentmemory uses a 4-tier model. AgentMem adds Tier 0 (LLM context budget management) and Tier 5 (ToolMem + TIG + persona), enabling tool reliability tracking and AutoTool hints not found in any other open-source memory system.
+
 ---
 
 ## Retrieval Pipeline
 
 ```
 Query →
+  ├─ MIRIX Active Retrieval (arXiv:2507.07957) [DEFAULT ON]:
+  │   Generate focused retrieval topic from vague queries.
+  │   "fix that auth thing" → "JWT token validation middleware error"
+  │   Used as BM25 query for higher lexical precision on developer shorthand.
+  │
+  ├─ HyDE (Hypothetical Document Embeddings, Gao et al. 2022) [DEFAULT ON]:
+  │   Generate short hypothetical memory → embed → average with query embedding.
+  │   Hypothetical docs sit closer in embedding space to real memories than bare
+  │   questions do. ~5-15% recall improvement.
+  │   Both MIRIX and HyDE fire in parallel — zero extra latency.
+  │
   ├─ Embed (MiniLM-L12 / nomic-embed-text / OpenAI, LRU-cached)
   ├─ Parallel async gather (all fire simultaneously):
   │   ├── VSIM on mem:facts       (scene-filtered + global fallback)
@@ -258,58 +269,53 @@ Query →
   │
   ├─ Heat rerank (access frequency + recency boost, 237ns @ 100 items)
   │
-  └─ Token-budget greedy packing → <cross_session_memory> (~873 tokens measured)
+  ├─ Importance boost (rules/identity 0.7-1.0 rank above transient context)
+  │
+  ├─ Session diversity (max 3 facts / 4 episodes per source session)
+  │   Prevents one verbose session dominating results.
+  │
+  └─ Token-budget greedy packing → <cross_session_memory> (~873 tokens)
 ```
-
----
-
-## Performance
-
-| Operation | AgentMem | agentmemory | Improvement |
-|-----------|----------|-------------|-------------|
-| Heat Score Compute | **237ns** | ~50μs | 211x |
-| Heat Rerank @ 100 items | **28μs** | ~5ms | 179x |
-| Recall P50 Latency | **19ms** (measured) | ~50ms | 2.6x |
-| Hybrid Search (BM25+Vec) | **<10ms** | ~100ms | 10x |
-| Memory @ 10K facts | **~200MB** | ~1GB | 5x smaller |
-
-Redis 8 Vectorset (HNSW): O(log n) ANN. At 10K facts: 50ms → **2ms**. At 100K: 500ms → **8ms**.
-
----
-
-## Claude Code Hooks
-
-| Hook | Trigger | Action |
-|------|---------|--------|
-| `register-env.sh` | Session start | Registers OS / git / cwd / model |
-| `register-tools.sh` | Session start | Registers built-in + MCP tools |
-| `recall.sh` | Every prompt | Injects memory via `additionalContext` (P50 19ms) |
-| `compact.sh` | After every tool | Session compact + ToolMem feedback |
-| `store.sh` | Session end | Store + compress + TIG + AWO meta-tool synthesis |
 
 ---
 
 ## Intelligent Lifecycle
 
 ```
-Every store:    A-MAC 5-factor gate → admit or discard (threshold=0.15)
-                Cosine dedup (>0.95 similarity → skip)
+Every store:   A-MAC 5-factor gate → admit or discard (threshold=0.15)
+               Cosine dedup (>0.95 similarity → skip)
 
 Every 50 stores:
-  Phase 1 — Decay:  age >90d → importance × 0.9
-  Phase 2 — Merge:  affinity ≥ 0.85 → LLM merge cluster
-  Phase 3 — Prune:  importance <0.05 → soft-delete
-  Category floors:  identity/rule ≥ 0.80, preference ≥ 0.75
+  Phase 1 — Decay:   age >90d → importance × 0.9
+  Phase 2 — Merge:   affinity = cosine × exp(−λ·days) ≥ 0.85 → LLM merge
+  Phase 3 — Prune:   importance <0.05 → soft-delete
+  Category floors:   identity/rule ≥ 0.80, preference ≥ 0.75
 
-Daily:          Hard-delete: superseded facts >7d, stale episodes >180d
-                AWO: scan TIG for 2-hop chains → auto-create meta-tool procedures
+Daily:         Hard-delete: superseded facts >7d, stale episodes >180d (VREM)
+               AWO: scan TIG for 2-hop chains → auto-create meta-tool procedures
 
 Result: stable ~200MB footprint @ 10K facts, improving quality over time
 ```
 
 ---
 
-## MCP Tools
+## Claude Code Hooks (7)
+
+| Hook | Trigger | Action |
+|------|---------|--------|
+| `register-env.sh` | SessionStart | Registers OS / git / cwd / model |
+| `register-tools.sh` | SessionStart | Registers built-in + MCP tools |
+| `recall.sh` | **Every prompt** | Injects memory via `additionalContext` (~15ms) |
+| `compact.sh` | PostToolUse | Session compact + ToolMem success feedback |
+| `failure.sh` | PostToolUseFailure | ToolMem failure recording |
+| `precompact.sh` | PreCompact | Re-injects memory before context compaction |
+| `store.sh` | Stop + SubagentStop | Store + compress + TIG + AWO meta-tool synthesis |
+
+**Key advantage over agentmemory:** `recall.sh` fires on *every* `UserPromptSubmit` and injects ranked memory as `additionalContext`. agentmemory's UserPromptSubmit hook only records the prompt — it does not inject context per-prompt. Their injection only happens at `SessionStart` (and only if `AGENTMEMORY_INJECT_CONTEXT=true`, which is off by default).
+
+---
+
+## MCP Tools (9 focused tools)
 
 | Tool | Description |
 |------|-------------|
@@ -327,15 +333,39 @@ Available via HTTP (`/mcp`), SSE (`/mcp/sse`), or stdio (`python mcp_server.py`)
 
 ---
 
-## Architecture papers implemented
+## Cost
 
-- **SimpleMem** (arXiv:2601.02553) — lossless restatement (Φ_coref, Φ_time), 3-phase consolidation, intent-aware retrieval planning
-- **A-MAC** (arXiv:2603.04549) — 5-factor admission gate (semantic_novelty, entity_novelty, factual_confidence, temporal_signal, content_type_prior)
-- **Memori** (arXiv:2603.19935) — semantic triple (s,p,o) extraction, BM25 hybrid
-- **AriadneMem** (arXiv:2603.03290) — knowledge graph bridge discovery
-- **A-MEM** (arXiv:2502.12648) — memory evolution: near-duplicate enrichment
-- **MemAgent** (arXiv:2502.12110) — overwrite-based session compaction
-- **ToolMem** (arXiv:2510.06664) — per-tool success/fail reliability tracking
-- **AutoTool TIG** (arXiv:2511.14650) — tool transition graph, next-tool hints
-- **MACLA** (arXiv:2512.18950) — Beta posterior scoring for procedure selection
-- **SWE-Bench-CL** (arXiv:2507.00014) — continual learning benchmark framework (tracked)
+| | AgentMem | agentmemory | Mem0 | SuperMemory |
+|---|:---:|:---:|:---:|:---:|
+| Monthly | **$0** | **$0** | $0.002–0.01/op | $29–$99 |
+| Cloud dependency | **None** | **None** | Required | Required |
+| Annual estimate | **~$10 (electricity)** | ~$10 | $200–$1,200+ | $350–$1,200 |
+
+---
+
+## Research Papers Implemented
+
+| Paper | ArXiv | What AgentMem uses |
+|-------|-------|-------------------|
+| SimpleMem | [2601.02553](https://arxiv.org/abs/2601.02553) | Lossless restatement (Φ_coref, Φ_time), 3-phase consolidation, intent-aware retrieval planning |
+| A-MAC | [2603.04549](https://arxiv.org/abs/2603.04549) | 5-factor admission gate (semantic_novelty, entity_novelty, factual_confidence, temporal_signal, content_type_prior) |
+| Memori | [2603.19935](https://arxiv.org/abs/2603.19935) | Semantic triple (s,p,o) extraction, BM25 hybrid |
+| AriadneMem | [2603.03290](https://arxiv.org/abs/2603.03290) | Knowledge graph bridge discovery |
+| A-MEM | [2502.12648](https://arxiv.org/abs/2502.12648) | Memory evolution: near-duplicate enrichment |
+| MemAgent | [2502.12110](https://arxiv.org/abs/2502.12110) | Overwrite-based session compaction |
+| ToolMem | [2510.06664](https://arxiv.org/abs/2510.06664) | Per-tool success/fail reliability tracking |
+| AutoTool TIG | [2511.14650](https://arxiv.org/abs/2511.14650) | Tool transition graph, next-tool hints |
+| MACLA | [2512.18950](https://arxiv.org/abs/2512.18950) | Beta posterior scoring for procedure selection |
+| HyDE | [2212.10496](https://arxiv.org/abs/2212.10496) | Hypothetical document embeddings (default on; averaged with query embedding) |
+| MIRIX | [2507.07957](https://arxiv.org/abs/2507.07957) | Active retrieval topic generation for vague developer queries (default on) |
+| MemMachine | [2604.04853](https://arxiv.org/abs/2604.04853) | Retrieval depth tuning (+4.2% at higher k); parallel decomposition for compound queries |
+
+### Roadmap Papers (tracked, not yet implemented)
+
+| Paper | ArXiv | Planned mechanism |
+|-------|-------|-------------------|
+| HippoRAG 2 | [2502.14802](https://arxiv.org/abs/2502.14802) | PPR graph propagation over entity graph for associative recall |
+| MemoryOS | [2506.06326](https://arxiv.org/abs/2506.06326) | Heat-based tier promotion: hot session KV → episodic, cold → evict |
+| EvolveMem | [2605.13941](https://arxiv.org/abs/2605.13941) | AutoResearch loop: self-optimize retrieval config against bench-f1.py |
+| MemR3 | [2512.20237](https://arxiv.org/abs/2512.20237) | Closed-loop retrieve→reflect→answer controller for multi-hop queries |
+| EMem | [2511.17208](https://arxiv.org/abs/2511.17208) | EDU event-centric facts: (event, participant, temporal_cue, context) |

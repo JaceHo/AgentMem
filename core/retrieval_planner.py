@@ -33,8 +33,8 @@ from .extractor import (
 
 log = logging.getLogger("mem")
 
-_PLAN_TIMEOUT_S = 5.0
-_PLAN_MAX_RETRIES = 2
+_PLAN_TIMEOUT_S = 4.0               # tight: broken models fail in 4s not 15s
+_PLAN_MAX_RETRIES = 1               # one retry only — keeps recall fast
 
 
 async def _llm_call(prompt: str, system: str, max_tokens: int = 300) -> str | None:
@@ -44,10 +44,19 @@ async def _llm_call(prompt: str, system: str, max_tokens: int = 300) -> str | No
     """
     exclude = None
     tried = []
+    # Try role-routed model first, then fall back to direct GLM-4.7-Flash
+    models_to_try = []
     for _ in range(_PLAN_MAX_RETRIES):
         model, _ = await _resolve_nlp_model(exclude=exclude)
+        if model not in models_to_try:
+            models_to_try.append(model)
+        exclude = model
+    if AISERV_FALLBACK_MODEL not in models_to_try:
+        models_to_try.append(AISERV_FALLBACK_MODEL)
+
+    for model in models_to_try:
         if model in tried:
-            model = AISERV_FALLBACK_MODEL
+            continue
         tried.append(model)
         data = await async_post_json(
             AISERV_URL,
@@ -65,9 +74,10 @@ async def _llm_call(prompt: str, system: str, max_tokens: int = 300) -> str | No
         if data is not None:
             choices = data.get("choices", [])
             if choices:
-                return choices[0]["message"]["content"].strip()
+                content = choices[0]["message"]["content"].strip()
+                if content:
+                    return content
         log.warning("[planner] %s returned no usable response", model)
-        exclude = model
     log.warning("[planner] All models exhausted (%s)", ", ".join(tried))
     return None
 
@@ -221,3 +231,57 @@ Return JSON only:
         return {**default, **data}
     except Exception:
         return default
+
+
+async def generate_retrieval_topic(query: str) -> str | None:
+    """
+    MIRIX Active Retrieval (arXiv:2507.07957 §3.2):
+    Generate a focused information-retrieval topic from a vague or conversational query.
+
+    Instead of searching with the raw query, generate a clean factual topic statement
+    that the memory system should retrieve. Especially valuable for coding agent queries
+    like "that auth bug" → "JWT token validation error in authentication middleware".
+
+    Returns a refined topic string or None on failure.
+    Timeout: 2s (faster than HyDE — shorter output).
+    """
+    prompt = (
+        f"Convert this query into a focused information-retrieval topic for a developer memory system.\n"
+        f"Output only the topic phrase (5-15 words), no explanation.\n\n"
+        f"Query: {query}\n\nTopic:"
+    )
+    system = (
+        "Convert developer queries to focused retrieval topics. "
+        "Output only the topic phrase. Be specific and technical."
+    )
+    result = await _llm_call(prompt, system, max_tokens=40)
+    if result:
+        topic = result.strip().strip('"').strip("'")
+        log.debug(f"[mirix] retrieval topic: {topic!r} for query: {query[:60]!r}")
+        return topic if len(topic) > 4 else None
+    return None
+
+
+async def generate_hyde_doc(query: str) -> str | None:
+    """
+    HyDE (Hypothetical Document Embeddings, Gao et al. 2022):
+    Generate a short hypothetical memory entry that would answer the query.
+    Embedding the hypothetical doc is closer to actual stored memories than
+    embedding the bare question, improving retrieval recall.
+
+    Returns the hypothetical text or None on failure.
+    Timeout: 3s. Fails silently so recall stays fast.
+    """
+    prompt = (
+        f"Write a single concise factual statement (1-2 sentences) that would "
+        f"be the ideal memory entry to answer this question:\n\n{query}\n\n"
+        "Write only the memory statement, no preamble."
+    )
+    system = (
+        "You generate hypothetical memory entries. Be concise and factual. "
+        "Write as if this is a stored fact in a personal memory system."
+    )
+    result = await _llm_call(prompt, system, max_tokens=80)
+    if result:
+        log.debug(f"[hyde] hypothetical doc: {result[:80]!r}")
+    return result
