@@ -1,0 +1,5 @@
+name: agentmem
+version: 1.0.0
+description: "AgentMem — local persistent agent memory with heat-tiered recall, episodic/semantic/procedural tiers, and auto-consolidation via Redis HNSW."
+hooks:
+  - on_session_end

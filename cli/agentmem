@@ -76,6 +76,12 @@ def cmd_root() -> None:
     print("  agentmem demo                                  quick demo")
     print("  agentmem version                               print version")
     print()
+    print("Agent install commands (one-shot setup):")
+    print("  agentmem hermes [--force]     install memory plugin for Hermes Agent")
+    print("  agentmem openclaw [--force]   install lifecycle plugin for OpenClaw")
+    print("  agentmem trae [--force]       configure MCP server for Trae IDE")
+    print("  agentmem trae-cn [--force]    configure MCP server for Trae CN IDE")
+    print()
     print("Tip: stored memories survive across all chats.")
 
 
@@ -199,6 +205,9 @@ def cmd_start(args: list[str]) -> None:
 
 
 def cmd_connect(args: list[str]) -> None:
+    _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _project_root not in sys.path:
+        sys.path.insert(0, _project_root)
     from connect import run_connect
 
     agent_name = ""
@@ -249,13 +258,20 @@ def cmd_doctor(args: list[str]) -> None:
         issues.append(f"Redis unreachable: {e}")
 
     print()
-    # Add project root to path so core module is importable
+    # Check embedder via uv run (ensures all deps are available)
     _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    if _project_root not in sys.path:
-        sys.path.insert(0, _project_root)
     try:
-        from core import embedder
-        print("  ✓ Embedder module loaded")
+        import subprocess
+        result = subprocess.run(
+            ["uv", "run", "--project", _project_root, "python", "-c", "from core import embedder; print('ok')"],
+            capture_output=True, text=True, timeout=10, cwd=_project_root
+        )
+        if result.returncode == 0 and "ok" in result.stdout:
+            print("  ✓ Embedder module loaded")
+        else:
+            err = result.stderr.strip().split("\n")[-1] if result.stderr.strip() else "unknown error"
+            print(f"  ❌ Embedder module: {err}")
+            issues.append(f"Embedder: {err}")
     except Exception as e:
         print(f"  ❌ Embedder module: {e}")
         issues.append(f"Embedder: {e}")
@@ -284,6 +300,14 @@ def cmd_doctor(args: list[str]) -> None:
         agents.append("cursor")
     if os.path.isfile(os.path.expanduser("~/.gemini/settings.json")):
         agents.append("gemini-cli")
+    if os.path.isdir(os.path.expanduser("~/.hermes")):
+        agents.append("hermes")
+    if os.path.isdir(os.path.expanduser("~/.openclaw")):
+        agents.append("openclaw")
+    if os.path.isdir(os.path.expanduser("~/.trae")):
+        agents.append("trae")
+    if os.path.isdir(os.path.expanduser("~/.trae-cn")):
+        agents.append("trae-cn")
 
     if agents:
         print(f"  Detected agents: {', '.join(agents)}")
@@ -581,9 +605,81 @@ def cmd_version(args: list[str]) -> None:
         print("agentmem v0.9.6")
 
 
+def cmd_hermes(args: list[str]) -> None:
+    """Install agentmem as Hermes Agent memory provider plugin."""
+    force = "--force" in args
+    dry_run = "--dry-run" in args
+
+    _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _project_root not in sys.path:
+        sys.path.insert(0, _project_root)
+
+    from connect import detect_hermes, connect_hermes
+
+    if not detect_hermes():
+        die("Hermes Agent not detected (no ~/.hermes directory). Install with: pip install hermes-agent && hermes postinstall")
+
+    result = connect_hermes(dry_run=dry_run, force=force)
+    print(result)
+
+
+def cmd_openclaw(args: list[str]) -> None:
+    """Install agentmem as OpenClaw lifecycle plugin."""
+    force = "--force" in args
+    dry_run = "--dry-run" in args
+
+    _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _project_root not in sys.path:
+        sys.path.insert(0, _project_root)
+
+    from connect import detect_openclaw, connect_openclaw
+
+    if not detect_openclaw():
+        die("OpenClaw not detected (no ~/.openclaw directory). Install with: npm install -g openclaw")
+
+    result = connect_openclaw(dry_run=dry_run, force=force)
+    print(result)
+
+
+def cmd_trae(args: list[str]) -> None:
+    """Configure agentmem MCP server for Trae IDE."""
+    force = "--force" in args
+    dry_run = "--dry-run" in args
+
+    _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _project_root not in sys.path:
+        sys.path.insert(0, _project_root)
+
+    from connect import detect_trae, connect_trae
+
+    if not detect_trae():
+        die("Trae IDE not detected (no ~/.trae directory). Install from: https://trae.ai")
+
+    result = connect_trae(dry_run=dry_run, force=force)
+    print(result)
+
+
+def cmd_trae_cn(args: list[str]) -> None:
+    """Configure agentmem MCP server for Trae CN IDE."""
+    force = "--force" in args
+    dry_run = "--dry-run" in args
+
+    _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _project_root not in sys.path:
+        sys.path.insert(0, _project_root)
+
+    from connect import detect_trae_cn, connect_trae_cn
+
+    if not detect_trae_cn():
+        die("Trae CN IDE not detected (no ~/.trae-cn directory). Install from: https://trae.ai")
+
+    result = connect_trae_cn(dry_run=dry_run, force=force)
+    print(result)
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-SERVICE_COMMANDS = {"start", "connect", "doctor", "demo", "version", "migrate-embeddings"}
+SERVICE_COMMANDS = {"start", "connect", "doctor", "demo", "version", "migrate-embeddings", "hermes", "openclaw", "trae", "trae-cn"}
 MEMORY_COMMANDS = {"recall", "store", "procedures", "graph", "stats", "health"}
 
 
@@ -605,6 +701,10 @@ def main(argv: list[str]) -> None:
     if cmd == "demo":       cmd_demo(rest);       return
     if cmd == "version":    cmd_version(rest);    return
     if cmd == "migrate-embeddings": cmd_migrate_embeddings(rest); return
+    if cmd == "hermes":     cmd_hermes(rest);     return
+    if cmd == "openclaw":   cmd_openclaw(rest);   return
+    if cmd == "trae":       cmd_trae(rest);       return
+    if cmd == "trae-cn":    cmd_trae_cn(rest);    return
 
     die(f"unknown command '{cmd}' (try: agentmem help)")
 

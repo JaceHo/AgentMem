@@ -884,7 +884,13 @@ print('      Plist updated.')
         echo "  setup --agent NAME   Configure a specific agent:"
         echo "                         claude, cursor, windsurf, copilot, zed,"
         echo "                         continue, augment, codex, cline, kilo,"
-        echo "                         kiro, antigravity, opencode"
+        echo "                         kiro, antigravity, opencode, hermes, openclaw, trae, trae-cn"
+        echo ""
+        echo "Agent install (one-shot):"
+        echo "  hermes         Install memory plugin for Hermes Agent"
+        echo "  openclaw       Install lifecycle plugin for OpenClaw"
+        echo "  trae           Configure MCP server for Trae IDE"
+        echo "  trae-cn        Configure MCP server for Trae CN IDE"
         echo ""
         echo "Benchmarking:"
         echo "  bench start    Start isolated benchmark instance (:$BENCH_PORT, redis db=$BENCH_DB)"
@@ -899,6 +905,70 @@ print('      Plist updated.')
         echo "  System prompt: http://localhost:$PORT/system-prompt"
         echo "  UI:            http://localhost:$PORT/static/index.html"
         echo ""
+        ;;
+
+    hermes)
+        print_banner
+        echo "Installing agentmem for Hermes Agent..."
+        echo ""
+        uv run python -c "
+import sys; sys.path.insert(0, '$SCRIPT_DIR')
+from connect import detect_hermes, connect_hermes
+if not detect_hermes():
+    print('Hermes Agent not detected (no ~/.hermes directory).')
+    print('Install with: pip install hermes-agent && hermes postinstall')
+    sys.exit(1)
+result = connect_hermes(force='--force' in sys.argv)
+print(result)
+" "$@"
+        ;;
+
+    openclaw)
+        print_banner
+        echo "Installing agentmem for OpenClaw..."
+        echo ""
+        uv run python -c "
+import sys; sys.path.insert(0, '$SCRIPT_DIR')
+from connect import detect_openclaw, connect_openclaw
+if not detect_openclaw():
+    print('OpenClaw not detected (no ~/.openclaw directory).')
+    print('Install with: npm install -g openclaw')
+    sys.exit(1)
+result = connect_openclaw(force='--force' in sys.argv)
+print(result)
+" "$@"
+        ;;
+
+    trae)
+        print_banner
+        echo "Configuring agentmem MCP for Trae IDE..."
+        echo ""
+        uv run python -c "
+import sys; sys.path.insert(0, '$SCRIPT_DIR')
+from connect import detect_trae, connect_trae
+if not detect_trae():
+    print('Trae IDE not detected (no ~/.trae directory).')
+    print('Install from: https://trae.ai')
+    sys.exit(1)
+result = connect_trae(force='--force' in sys.argv)
+print(result)
+" "$@"
+        ;;
+
+    trae-cn)
+        print_banner
+        echo "Configuring agentmem MCP for Trae CN IDE..."
+        echo ""
+        uv run python -c "
+import sys; sys.path.insert(0, '$SCRIPT_DIR')
+from connect import detect_trae_cn, connect_trae_cn
+if not detect_trae_cn():
+    print('Trae CN IDE not detected (no ~/.trae-cn directory).')
+    print('Install from: https://trae.ai')
+    sys.exit(1)
+result = connect_trae_cn(force='--force' in sys.argv)
+print(result)
+" "$@"
         ;;
 
     *)

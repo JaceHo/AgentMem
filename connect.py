@@ -13,6 +13,9 @@ Supported agents:
   - cline         (MCP via VS Code settings)
   - windsurf      (MCP via config)
   - roo-code      (MCP via VS Code settings)
+  - hermes        (Memory provider plugin)
+  - openclaw      (Lifecycle plugin)
+  - trae          (MCP via ~/.trae/mcp.json)
 """
 
 from __future__ import annotations
@@ -296,6 +299,217 @@ def connect_cline(dry_run: bool = False, force: bool = False) -> str:
     return result
 
 
+# ── Hermes Agent ──────────────────────────────────────────────────────────────
+
+def detect_hermes() -> bool:
+    return os.path.isdir(os.path.expanduser("~/.hermes"))
+
+
+def connect_hermes(dry_run: bool = False, force: bool = False) -> str:
+    """Install agentmem as a Hermes memory provider plugin + configure."""
+    hermes_home = os.path.expanduser("~/.hermes")
+    plugins_dir = os.path.join(hermes_home, "plugins", "agentmem")
+    config_yaml = os.path.join(hermes_home, "config.yaml")
+    project_plugins = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plugins", "hermes")
+
+    # 1. Copy plugin files
+    src_init = os.path.join(project_plugins, "__init__.py")
+    src_yaml = os.path.join(project_plugins, "plugin.yaml")
+
+    if not os.path.isfile(src_init):
+        return f"❌ hermes: plugin source not found at {project_plugins}"
+
+    already = os.path.isfile(os.path.join(plugins_dir, "__init__.py"))
+    if already and not force:
+        plugin_ok = "✓"
+    else:
+        if dry_run:
+            return f"[dry-run] Would copy agentmem plugin to {plugins_dir}"
+        os.makedirs(plugins_dir, exist_ok=True)
+        shutil.copy2(src_init, os.path.join(plugins_dir, "__init__.py"))
+        shutil.copy2(src_yaml, os.path.join(plugins_dir, "plugin.yaml"))
+        plugin_ok = "✓"
+
+    # 2. Write agentmem.json config
+    agentmem_json = os.path.join(hermes_home, "agentmem.json")
+    am_cfg = {"base_url": AGENTMEM_URL}
+    if not os.path.exists(agentmem_json) or force:
+        if not dry_run:
+            with open(agentmem_json, "w") as f:
+                json.dump(am_cfg, f, indent=2)
+
+    # 3. Set memory.provider in config.yaml
+    provider_set = False
+    if os.path.isfile(config_yaml):
+        with open(config_yaml) as f:
+            content = f.read()
+        # Check if already set
+        for line in content.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("provider:") and "agentmem" in stripped:
+                provider_set = True
+                break
+
+        if not provider_set and not dry_run:
+            # Replace empty provider line
+            import re
+            new_content = re.sub(
+                r"(\s+provider:\s*)(['\"]?)(\2)",
+                r"\1agentmem",
+                content,
+            )
+            # If the regex didn't match (provider: '' or provider: ""), try broader
+            if new_content == content:
+                new_content = re.sub(
+                    r"(\s+provider:\s*).*",
+                    r"\1agentmem",
+                    content,
+                )
+            with open(config_yaml, "w") as f:
+                f.write(new_content)
+            provider_set = True
+
+    result = f"{plugin_ok} hermes → {plugins_dir}"
+    if provider_set:
+        result += "\n  config.yaml: memory.provider = agentmem"
+    result += f"\n  config: {agentmem_json}"
+    result += "\n  Restart Hermes (or run `hermes memory setup`) to activate."
+    return result
+
+
+# ── OpenClaw ──────────────────────────────────────────────────────────────────
+
+def detect_openclaw() -> bool:
+    return os.path.isdir(os.path.expanduser("~/.openclaw"))
+
+
+def connect_openclaw(dry_run: bool = False, force: bool = False) -> str:
+    """Install agentmem as an OpenClaw lifecycle plugin + configure."""
+    openclaw_home = os.path.expanduser("~/.openclaw")
+    config_path = os.path.join(openclaw_home, "openclaw.json")
+    project_plugin = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plugin")
+
+    src_index = os.path.join(project_plugin, "index.js")
+    src_manifest = os.path.join(project_plugin, "openclaw.plugin.json")
+    src_package = os.path.join(project_plugin, "package.json")
+
+    if not os.path.isfile(src_index):
+        return f"❌ openclaw: plugin source not found at {project_plugin}"
+
+    # 1. Copy plugin to ~/.openclaw/plugins/agentmem/
+    plugin_dir = os.path.join(openclaw_home, "plugins", "agentmem")
+    already = os.path.isfile(os.path.join(plugin_dir, "index.js"))
+    if already and not force:
+        plugin_ok = "✓"
+    else:
+        if dry_run:
+            return f"[dry-run] Would copy agentmem plugin to {plugin_dir}"
+        os.makedirs(plugin_dir, exist_ok=True)
+        shutil.copy2(src_index, os.path.join(plugin_dir, "index.js"))
+        shutil.copy2(src_manifest, os.path.join(plugin_dir, "openclaw.plugin.json"))
+        shutil.copy2(src_package, os.path.join(plugin_dir, "package.json"))
+        plugin_ok = "✓"
+
+    # 2. Configure openclaw.json: enable plugin + set config
+    if os.path.isfile(config_path):
+        with open(config_path) as f:
+            cfg = json.load(f)
+
+        plugins = cfg.setdefault("plugins", {})
+        entries = plugins.setdefault("entries", {})
+        allow = plugins.setdefault("allow", [])
+
+        plugin_id = "memos-local-openclaw-plugin"
+
+        # Add to allow list
+        if plugin_id not in allow:
+            allow.append(plugin_id)
+
+        # Set plugin entry
+        entries[plugin_id] = {
+            "enabled": True,
+            "config": {
+                "baseUrl": AGENTMEM_URL,
+                "memoryLimitNumber": 8,
+            },
+        }
+
+        if not dry_run:
+            backup = _backup(config_path)
+            with open(config_path, "w") as f:
+                json.dump(cfg, f, indent=2, ensure_ascii=False)
+
+    result = f"{plugin_ok} openclaw → {plugin_dir}"
+    result += f"\n  config: {config_path} (plugin enabled)"
+    result += "\n  Restart OpenClaw to activate."
+    return result
+
+
+# ── Trae IDE ──────────────────────────────────────────────────────────────────
+
+def detect_trae() -> bool:
+    return os.path.isdir(os.path.expanduser("~/.trae"))
+
+
+def _connect_trae_variant(trae_dir: str, label: str, dry_run: bool = False, force: bool = False) -> str:
+    """Shared logic for Trae IDE and Trae CN — both use ~/.trae/mcp.json or ~/.trae-cn/mcp.json."""
+    mcp_path = os.path.join(trae_dir, "mcp.json")
+    project_root = os.path.dirname(os.path.abspath(__file__))
+    mcp_script = os.path.join(project_root, "mcp_server.py")
+
+    os.makedirs(trae_dir, exist_ok=True)
+
+    config = {}
+    if os.path.exists(mcp_path):
+        with open(mcp_path) as f:
+            config = json.load(f)
+
+    mcp_servers = config.get("mcpServers", {})
+    already = "agentmem" in mcp_servers
+
+    # Use stdio transport — most reliable, no HTTP mount dependency
+    mcp_entry = {
+        "command": "uv",
+        "args": ["run", "--project", project_root, "python", mcp_script],
+    }
+    if AGENTMEM_SECRET:
+        mcp_entry["env"] = {"AGENTMEM_SECRET": AGENTMEM_SECRET}
+
+    if already and not force:
+        return f"✓ {label} (already wired in {mcp_path})"
+
+    if dry_run:
+        return f"[dry-run] Would add mcpServers.agentmem to {mcp_path}"
+
+    backup = _backup(mcp_path)
+    mcp_servers["agentmem"] = mcp_entry
+    config["mcpServers"] = mcp_servers
+    with open(mcp_path, "w") as f:
+        json.dump(config, f, indent=2)
+
+    result = f"✓ {label} → {mcp_path}"
+    if backup:
+        result += f" (backup: {backup})"
+    result += "\n  Restart Trae IDE (or reload MCP in Settings) to activate."
+    return result
+
+
+def connect_trae(dry_run: bool = False, force: bool = False) -> str:
+    """Configure AgentMem MCP server for Trae IDE via ~/.trae/mcp.json."""
+    return _connect_trae_variant(os.path.expanduser("~/.trae"), "trae", dry_run, force)
+
+
+# ── Trae CN IDE ───────────────────────────────────────────────────────────────
+
+def detect_trae_cn() -> bool:
+    return os.path.isdir(os.path.expanduser("~/.trae-cn"))
+
+
+def connect_trae_cn(dry_run: bool = False, force: bool = False) -> str:
+    """Configure AgentMem MCP server for Trae CN IDE via ~/.trae-cn/mcp.json."""
+    return _connect_trae_variant(os.path.expanduser("~/.trae-cn"), "trae-cn", dry_run, force)
+
+
 # ── Adapter registry ──────────────────────────────────────────────────────────
 
 ADAPTERS = [
@@ -304,6 +518,10 @@ ADAPTERS = [
     {"name": "cursor",      "display": "Cursor",      "detect": detect_cursor,       "connect": connect_cursor},
     {"name": "gemini-cli",  "display": "Gemini CLI",  "detect": detect_gemini_cli,   "connect": connect_gemini_cli},
     {"name": "cline",       "display": "Cline",       "detect": detect_cline,        "connect": connect_cline},
+    {"name": "hermes",      "display": "Hermes Agent", "detect": detect_hermes,      "connect": connect_hermes},
+    {"name": "openclaw",    "display": "OpenClaw",     "detect": detect_openclaw,    "connect": connect_openclaw},
+    {"name": "trae",        "display": "Trae IDE",     "detect": detect_trae,        "connect": connect_trae},
+    {"name": "trae-cn",     "display": "Trae CN IDE",  "detect": detect_trae_cn,     "connect": connect_trae_cn},
 ]
 
 
