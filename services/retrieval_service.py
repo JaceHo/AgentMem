@@ -81,7 +81,7 @@ class RetrievalService:
         filter_expr = self._build_time_filter(time_from, time_to)
         
         try:
-            query_vec = self._embedder.embed(query)
+            query_vec = await asyncio.to_thread(self._embedder.embed, query)
             
             # Parallel retrieval from multiple sources
             vector_facts_task = self._vector_search(query_vec, num_facts, filter_expr)
@@ -228,8 +228,8 @@ class RetrievalService:
     
     async def _get_persona_context(self) -> str:
         try:
-            persona_raw = await self._redis.get("mem:pinned:session_summary")
-            return persona_raw.decode() if persona_raw else ""
+            from core.persona import get_context
+            return await get_context(self._redis)
         except Exception as e:
             self._log.warning(f"[retrieval] failed to get persona context: {e}")
             return ""

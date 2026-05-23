@@ -155,6 +155,7 @@ from services.consolidation_service import (
 )
 
 logging.basicConfig(level=getattr(logging, settings.log_level), format=settings.log_format)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("mem")
 APP_VERSION = settings.app_version
 
@@ -309,6 +310,16 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="AgentMem — Local Agent Memory Service", version=APP_VERSION, lifespan=lifespan)
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Log full traceback for unhandled exceptions instead of silently returning 500."""
+    import traceback
+    tb = traceback.format_exception(type(exc), exc, exc.__traceback__)
+    log.error("[unhandled] %s %s → %s\n%s", request.method, request.url.path, exc, "".join(tb))
+    from fastapi.responses import JSONResponse
+    return JSONResponse(status_code=500, content={"detail": str(exc), "type": type(exc).__name__})
 
 
 @app.middleware("http")
@@ -1936,7 +1947,7 @@ async def recall(req: RecallRequest):
         facts, episodes, session_ctx, persona_ctx,
         env_ctx=env_ctx_formatted, tool_ctx=tool_ctx,
         proc_ctx=proc_ctx or None,
-        token_budget=req.token_budget,
+        token_budget=req.token_budget or settings.default_token_budget,
         last_session_summary=_handoff,
         crystal_digests=crystal_digests or None,  # Auto-crystallized lessons learned
     )

@@ -22,8 +22,8 @@ def compute_heat(attrs: dict) -> float:
     - Accessed 10 times, stored yesterday: ~1.5
     - Stored 90 days ago, never accessed: ~0.05
     """
-    access_count: int = attrs.get("access_count", 0)
-    ts_ms: int = attrs.get("ts", int(time.time() * 1000))
+    access_count: int = attrs.get("access_count") or 0
+    ts_ms: int = attrs.get("ts") or int(time.time() * 1000)
 
     days_old = (time.time() * 1000 - ts_ms) / (1000 * 86400)
     recency_decay = math.exp(-days_old / 30)          # 30-day half-life
