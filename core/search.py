@@ -57,6 +57,8 @@ def _zero_vec() -> np.ndarray:
     the next call picks up the new DIMS value automatically.
     """
     global _zero_vec_cache
+    # Ensure provider is initialized so DIMS reflects the actual provider
+    embedder._get_provider()
     dims = embedder.DIMS
     if _zero_vec_cache is None or _zero_vec_cache[0] != dims:
         _zero_vec_cache = (dims, np.zeros(dims, dtype=np.float32))
@@ -76,7 +78,8 @@ async def vscan(r, vset_key: str, max_count: int = 200) -> list[dict]:
             "VSIM", vset_key, "FP32", _zero_vec().tobytes(),
             "COUNT", min(int(card), max_count), "WITHSCORES", "WITHATTRIBS"
         )
-    except Exception:
+    except Exception as e:
+        log.warning("vscan VSIM failed on %s (%d elements): %s", vset_key, card, e)
         return []
     items = []
     i = 0
@@ -241,5 +244,5 @@ async def populate_bm25_from_redis(r, bm25_index: BM25Index) -> None:
             if item["attrs"].get("content") and not item["attrs"].get("superseded_by")
         ]
         await bm25_index.populate_from_items(items)
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning("populate_bm25_from_redis failed: %s", e)

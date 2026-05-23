@@ -39,7 +39,7 @@ async def load_all_procedures(r):
     dims = 384
     try:
         from core import embedder
-        dims = embedder.DIMS
+        dims = embedder._get_provider().dims
     except ImportError:
         pass
     zero = np.zeros(dims, dtype=np.float32).tobytes()

@@ -48,7 +48,7 @@ async def admin_delete_facts_by_content(pattern: str = "Always send a report"):
     if not card or int(card) <= 1:
         return {"deleted": 0, "message": "no facts to scan"}
 
-    seed = np.zeros(embedder.DIMS, dtype=np.float32)
+    seed = np.zeros(embedder._get_provider().dims, dtype=np.float32)
     results = await r.execute_command(
         "VSIM", mem_store.FACT_KEY, "FP32", seed.tobytes(),
         "COUNT", min(int(card), 5000), "WITHSCORES", "WITHATTRIBS"
@@ -221,7 +221,7 @@ async def lifecycle_stats():
     if not card or int(card) <= 1:
         return {"total": 0}
 
-    seed = np.zeros(embedder.DIMS, dtype=np.float32)
+    seed = np.zeros(embedder._get_provider().dims, dtype=np.float32)
     results = await r.execute_command(
         "VSIM", mem_store.FACT_KEY, "FP32", seed.tobytes(),
         "COUNT", min(int(card), 5000), "WITHSCORES", "WITHATTRIBS"

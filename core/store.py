@@ -240,7 +240,7 @@ def _get_pool() -> aioredis.ConnectionPool:
         _pool = aioredis.ConnectionPool.from_url(
             REDIS_URL,
             decode_responses=False,
-            max_connections=20,
+            max_connections=50,
         )
     return _pool
 
@@ -360,10 +360,19 @@ async def knn_search(
         }
         items.append(item)
 
-        if bump_heat:
-            import asyncio
-            from .heat import bump_heat as _bump
-            asyncio.create_task(_bump(r, vset_key, elem_str, attrs))
+    # Batch heat bumps into a single async task to avoid connection pool exhaustion
+    if bump_heat and items:
+        import asyncio
+        from .heat import atomic_bump
+
+        async def _batch_bump():
+            for item in items:
+                try:
+                    await atomic_bump(r, vset_key, item["_element"], "access_count", "last_accessed")
+                except Exception:
+                    pass  # non-critical
+
+        asyncio.create_task(_batch_bump())
 
     return items
 

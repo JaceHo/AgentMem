@@ -466,7 +466,7 @@ async def compat_sessions(limit: int = 20):
 @router.get("/observations")
 async def compat_observations(sessionId: str = "", limit: int = 20):
     r = state.redis
-    seed = np.zeros(embedder.DIMS, dtype=np.float32)
+    seed = np.zeros(embedder._get_provider().dims, dtype=np.float32)
     card = await r.execute_command("VCARD", mem_store.EPISODE_KEY)
     if not card or int(card) <= 1:
         return {"observations": []}
@@ -580,7 +580,7 @@ async def compat_timeline(req: TimelineRequest, request: Request):
         return auth_err
 
     r = state.redis
-    seed = np.zeros(embedder.DIMS, dtype=np.float32)
+    seed = np.zeros(embedder._get_provider().dims, dtype=np.float32)
     card = await r.execute_command("VCARD", mem_store.EPISODE_KEY)
     if not card or int(card) <= 1:
         return {"timeline": []}
@@ -638,7 +638,7 @@ async def compat_export():
         card = await r.execute_command("VCARD", key)
         if not card or int(card) <= 1:
             continue
-        seed = np.zeros(embedder.DIMS, dtype=np.float32)
+        seed = np.zeros(embedder._get_provider().dims, dtype=np.float32)
         results = await r.execute_command(
             "VSIM", key, "FP32", seed.astype("float32").tobytes(),
             "COUNT", min(int(card), 5000), "WITHSCORES", "WITHATTRIBS"
@@ -706,7 +706,7 @@ async def compat_import(req: ImportRequest, request: Request):
 async def _list_memories(limit: int = 50, category: str = "") -> dict:
     """Shared logic for listing memories."""
     r = state.redis
-    seed = np.zeros(embedder.DIMS, dtype=np.float32)
+    seed = np.zeros(embedder._get_provider().dims, dtype=np.float32)
     card = await r.execute_command("VCARD", mem_store.FACT_KEY)
     if not card or int(card) <= 1:
         return {"memories": []}
@@ -769,7 +769,7 @@ async def compat_semantic(limit: int = 50):
 @router.get("/procedural")
 async def compat_procedural(limit: int = 50):
     r = state.redis
-    seed = np.zeros(embedder.DIMS, dtype=np.float32)
+    seed = np.zeros(embedder._get_provider().dims, dtype=np.float32)
     card = await r.execute_command("VCARD", mem_store.PROC_KEY)
     if not card or int(card) <= 1:
         return {"procedures": []}

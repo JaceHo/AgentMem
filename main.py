@@ -156,6 +156,7 @@ from services.consolidation_service import (
 
 logging.basicConfig(level=getattr(logging, settings.log_level), format=settings.log_format)
 logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("mem")
 APP_VERSION = settings.app_version
 
@@ -279,16 +280,18 @@ async def lifespan(app: FastAPI):
     # Dimension guard: if existing vectorset has different dims than current
     # provider, force local (384-dim) to avoid corrupting vector search.
     try:
-        info = await _redis.execute_command("VINFO", mem_store.FACT_KEY)
-        if info:
-            # VINFO returns flat list: [key, val, key, val, ...]
+        for vset_key in (mem_store.FACT_KEY, mem_store.EPISODE_KEY, mem_store.PROC_KEY):
+            info = await _redis.execute_command("VINFO", vset_key)
+            if not info:
+                continue
             info_dict = dict(zip(info[::2], info[1::2]))
             existing_dims = int(info_dict.get(b"vector-dim", info_dict.get("vector-dim", 0)))
-            if existing_dims and existing_dims != embedder.DIMS:
-                log.warning("Dimension mismatch: existing vectors=%d, provider=%s dims=%d — forcing local provider",
-                            existing_dims, embedder._get_provider().name, embedder.DIMS)
+            provider_dims = embedder._get_provider().dims
+            if existing_dims and existing_dims != provider_dims:
+                log.warning("Dimension mismatch in %s: existing=%d, provider=%s dims=%d — forcing local provider",
+                            vset_key, existing_dims, embedder._get_provider().name, provider_dims)
                 embedder._reset_provider("local")
-                pass  # _dims() in store.py resolves lazily from embedder
+                break  # no need to check further
     except Exception:
         pass  # no existing vectorset, safe to use any provider
 

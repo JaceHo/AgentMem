@@ -20,8 +20,11 @@ router = APIRouter(tags=["graph"])
 @router.get("/graph/stats")
 async def graph_stats_endpoint():
     """Return knowledge graph statistics: node count and edge count."""
+    r = state.redis
+    if r is None:
+        return {"nodes": 0, "edges": 0, "total_nodes": 0, "total_edges": 0, "error": "Redis not ready"}
     try:
-        return await graph_mod.graph_stats(state.redis)
+        return await graph_mod.graph_stats(r)
     except Exception as e:
         log.error(f"[graph/stats] {e}")
         return {"nodes": 0, "edges": 0, "total_nodes": 0, "total_edges": 0, "error": str(e)}
