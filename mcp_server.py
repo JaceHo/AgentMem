@@ -39,7 +39,7 @@ Zed (~/.config/zed/settings.json):
     {"context_servers": {"agentmem": {"url": "http://localhost:18800/mcp/sse"}}}
 
 Opencode (opencode.json):
-    {"mcp": {"agentmem": {"type": "sse", "url": "http://localhost:18800/mcp/sse"}}}
+    {"mcp": {"agentmem": {"type": "remote", "url": "http://localhost:18800/mcp/sse"}}}
 
 Stdio (all others — Cline, Continue, Kilo Code, Kiro, etc.):
     {"mcpServers": {"agentmem": {"command": "python", "args": ["/path/to/agentmem/mcp_server.py"]}}}

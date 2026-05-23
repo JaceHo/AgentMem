@@ -206,7 +206,7 @@ const AGENTS = [
     setup: 'agentmem.sh setup --agent opencode',
     note: 'SSE MCP. Key is "mcp" (not "mcpServers").',
     cfgPath: '~/.config/opencode/opencode.json',
-    snippet: '{"mcp":{"agentmem":{"type":"sse","url":"http://localhost:18800/mcp/sse","enabled":true}}}',
+    snippet: '{"mcp":{"agentmem":{"type":"remote","url":"http://localhost:18800/mcp/sse","enabled":true}}}',
   },
   {
     id: 'aider',    label: 'Aider',          transport: '—',             color: 'var(--text3)',

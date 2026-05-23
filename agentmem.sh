@@ -700,7 +700,7 @@ else:
     cfg = {}
 if "mcp" not in cfg or not isinstance(cfg["mcp"], dict):
     cfg["mcp"] = {}
-cfg["mcp"]["agentmem"] = {"type": "sse", "url": f"{mcp_url}/mcp/sse", "enabled": True}
+cfg["mcp"]["agentmem"] = {"type": "remote", "url": f"{mcp_url}/mcp/sse", "enabled": True}
 with open(cfg_path, "w") as f:
     json.dump(cfg, f, indent=2)
 print(f"      Wrote mcp.agentmem to {cfg_path}")
