@@ -2,9 +2,9 @@
 
 **Research-grade persistent memory for AI coding agents. Local. Free. Faster.**
 
-Works with Claude Code, Cursor, Windsurf, GitHub Copilot, Zed, Continue.dev, Augment, Cline, Codex CLI, Kilo Code, Kiro, Opencode, and any MCP client.
+Works with Claude Code, Cursor, Windsurf, GitHub Copilot, Zed, Continue.dev, Augment, Cline, Codex CLI, Kilo Code, Kiro, Opencode, Hermes Agent, OpenClaw, Trae IDE, Trae CN IDE, and any MCP client.
 
-[![Version](https://img.shields.io/badge/version-1.1.0-blue)](.) [![License](https://img.shields.io/badge/license-MIT-yellow)](.) [![Redis 8 HNSW](https://img.shields.io/badge/backend-Redis%208%20HNSW-red)](https://redis.io) [![LLM-F1](https://img.shields.io/badge/LLM--F1-76.69%25%E2%80%A0-orange)](benchmark/README.md) [![Agents](https://img.shields.io/badge/agents-14%20supported-brightgreen)](.)
+[![Version](https://img.shields.io/badge/version-1.1.0-blue)](.) [![License](https://img.shields.io/badge/license-MIT-yellow)](.) [![Redis 8 HNSW](https://img.shields.io/badge/backend-Redis%208%20HNSW-red)](https://redis.io) [![LLM-F1](https://img.shields.io/badge/LLM--F1-76.69%25%E2%80%A0-orange)](benchmark/README.md) [![Agents](https://img.shields.io/badge/agents-17%20supported-brightgreen)](.)
 
 ```
 LLM-F1: 76.69%†   │  Retrieval R@5: 95.2%   │  P50 recall: 19ms
@@ -65,9 +65,17 @@ bash agentmem.sh setup --agent zed         # Zed
 bash agentmem.sh setup --agent all         # auto-detect + configure all
 ```
 
+**One-shot agent installs (plugin-based):**
+```bash
+bash agentmem.sh hermes         # Hermes Agent — memory provider plugin
+bash agentmem.sh openclaw       # OpenClaw — lifecycle plugin
+bash agentmem.sh trae           # Trae IDE — MCP server config
+bash agentmem.sh trae-cn        # Trae CN IDE — MCP server config
+```
+
 ---
 
-## 14 agents supported
+## 17 agents supported
 
 | Agent | Transport | Auto-config |
 |-------|-----------|:-----------:|
@@ -84,7 +92,10 @@ bash agentmem.sh setup --agent all         # auto-detect + configure all
 | Kiro | stdio MCP | ✅ |
 | Opencode | SSE MCP | ✅ |
 | Antigravity | SSE MCP | ✅ |
-| Aider | — | (no native MCP) |
+| Hermes Agent | Memory provider plugin | ✅ |
+| OpenClaw | Lifecycle plugin | ✅ |
+| Trae IDE | stdio MCP | ✅ |
+| Trae CN IDE | stdio MCP | ✅ |
 
 MCP endpoints: `HTTP /mcp` · `SSE /mcp/sse` · `stdio python mcp_server.py`
 
