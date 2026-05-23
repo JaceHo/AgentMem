@@ -20,10 +20,21 @@ _shared_client: httpx.AsyncClient | None = None
 
 
 def _get_client(timeout: float = DEFAULT_TIMEOUT) -> httpx.AsyncClient:
-    """Return the shared AsyncClient, creating it on first call."""
+    """Return the shared AsyncClient, creating it on first call.
+
+    The client uses the maximum timeout seen so far, ensuring no request
+    is prematurely cut off. Connection pool limits prevent resource exhaustion.
+    """
     global _shared_client
     if _shared_client is None or _shared_client.is_closed:
-        _shared_client = httpx.AsyncClient(timeout=timeout)
+        _shared_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(timeout),
+            limits=httpx.Limits(
+                max_connections=20,
+                max_keepalive_connections=10,
+                keepalive_expiry=30,
+            ),
+        )
     return _shared_client
 
 

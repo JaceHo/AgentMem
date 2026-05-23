@@ -32,6 +32,7 @@ from abc import ABC, abstractmethod
 from typing import Optional
 
 import numpy as np
+import httpx
 
 # ── Public API (unchanged) ──────────────────────────────────────────
 
@@ -131,18 +132,23 @@ class OllamaProvider(BaseProvider):
         dims_override = os.environ.get("EMBEDDING_DIMS")
         if dims_override:
             self.dims = int(dims_override)
+        # Shared sync client — reused across encode calls to avoid per-call
+        # TCP+TLS handshake overhead. Created lazily on first use.
+        self._client: httpx.Client | None = None
+
+    def _get_client(self) -> httpx.Client:
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.Client(timeout=60)
+        return self._client
 
     def encode(self, text: str) -> np.ndarray:
         return self.encode_batch([text])[0]
 
     def encode_batch(self, texts: list[str]) -> list[np.ndarray]:
-        import httpx
-
         results = []
-        r = httpx.post(
+        r = self._get_client().post(
             f"{self.base_url}/api/embed",
             json={"model": self.model, "input": texts},
-            timeout=60,
         )
         r.raise_for_status()
         data = r.json()
@@ -181,22 +187,26 @@ class OpenAIProvider(BaseProvider):
             self.dims = int(dims_override)
         else:
             self.dims = self._MODEL_DIMS.get(self.model, 1536)
+        # Shared sync client — reused across encode calls
+        self._client: httpx.Client | None = None
+
+    def _get_client(self) -> httpx.Client:
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.Client(timeout=60)
+        return self._client
 
     def encode(self, text: str) -> np.ndarray:
         return self.encode_batch([text])[0]
 
     def encode_batch(self, texts: list[str]) -> list[np.ndarray]:
-        import httpx
-
         url = f"{self.base_url}/embeddings"
-        r = httpx.post(
+        r = self._get_client().post(
             url,
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
             },
             json={"model": self.model, "input": texts},
-            timeout=60,
         )
         r.raise_for_status()
         data = r.json()
@@ -224,13 +234,18 @@ class GeminiProvider(BaseProvider):
         dims_override = os.environ.get("EMBEDDING_DIMS")
         if dims_override:
             self.dims = int(dims_override)
+        # Shared sync client — reused across encode calls
+        self._client: httpx.Client | None = None
+
+    def _get_client(self) -> httpx.Client:
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.Client(timeout=60)
+        return self._client
 
     def encode(self, text: str) -> np.ndarray:
         return self.encode_batch([text])[0]
 
     def encode_batch(self, texts: list[str]) -> list[np.ndarray]:
-        import httpx
-
         url = (
             f"https://generativelanguage.googleapis.com/v1beta/"
             f"{self.model}:batchEmbedContents?key={self.api_key}"
@@ -242,11 +257,10 @@ class GeminiProvider(BaseProvider):
             }
             for t in texts
         ]
-        r = httpx.post(
+        r = self._get_client().post(
             url,
             headers={"Content-Type": "application/json"},
             json={"requests": requests},
-            timeout=60,
         )
         r.raise_for_status()
         data = r.json()

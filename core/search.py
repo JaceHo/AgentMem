@@ -45,8 +45,23 @@ def encode_batch(texts: list[str]) -> list[np.ndarray]:
 
 
 # ── Zero-vector for VSIM scan-all ─────────────────────────────────────────────
+# Lazily computed to avoid stale dimensions if provider changes at runtime
+# (dimension guard in lifespan can reset provider, changing DIMS).
 
-_ZERO_VEC = np.zeros(embedder.DIMS, dtype=np.float32)
+_zero_vec_cache: tuple[int, np.ndarray] | None = None
+
+
+def _zero_vec() -> np.ndarray:
+    """Return a zero vector matching the current embedding dimensions.
+
+    Lazily computed and cached — if the provider changes (dimension guard),
+    the next call picks up the new DIMS value automatically.
+    """
+    global _zero_vec_cache
+    dims = embedder.DIMS
+    if _zero_vec_cache is None or _zero_vec_cache[0] != dims:
+        _zero_vec_cache = (dims, np.zeros(dims, dtype=np.float32))
+    return _zero_vec_cache[1]
 
 
 async def vscan(r, vset_key: str, max_count: int = 200) -> list[dict]:
@@ -59,7 +74,7 @@ async def vscan(r, vset_key: str, max_count: int = 200) -> list[dict]:
         return []
     try:
         results = await r.execute_command(
-            "VSIM", vset_key, "FP32", _ZERO_VEC.tobytes(),
+            "VSIM", vset_key, "FP32", _zero_vec().tobytes(),
             "COUNT", min(int(card), max_count), "WITHSCORES", "WITHATTRIBS"
         )
     except Exception:

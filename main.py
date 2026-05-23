@@ -195,12 +195,9 @@ async def _encode_batch_async(texts: list[str]) -> list[np.ndarray]:
     """Batch-encode texts off the event loop using a single model forward pass.
 
     Uses asyncio.to_thread so the CPU-bound inference doesn't block the event loop.
-    For a single text falls through to _encode() to use the LRU cache.
     """
     if not texts:
         return []
-    if len(texts) == 1:
-        return [_encode(texts[0])]
     return list(await asyncio.to_thread(embedder.encode_batch, texts))
 
 # ── Session handoff: pinned last-session summary ───────────────────────────────
