@@ -147,6 +147,7 @@ from core import retrieval_planner
 from core import scene as scene_mod
 from core import store as mem_store
 from core import summarizer
+from core.http import async_post_json
 from services.consolidation_service import (
     do_consolidate as _do_consolidate,
     do_hard_prune as _do_hard_prune,
@@ -1252,7 +1253,7 @@ async def _do_compress_session(session_id: str) -> dict:
     session_summary = await summarizer.summarize(ctx)
 
     # Save as a session-summary episode (labelled so recall can distinguish)
-    ep_emb  = _encode(session_summary[:500])
+    ep_emb  = await asyncio.to_thread(_encode, session_summary[:500])
     similar = await mem_store.knn_search(_redis, mem_store.EPISODE_KEY, ep_emb, k=1)
     ep_saved = 0
     if not similar or similar[0].get("score", 0.0) < 0.95:
@@ -1268,10 +1269,18 @@ async def _do_compress_session(session_id: str) -> dict:
         [{"role": "user", "content": ctx}], ctx
     )
     fact_saved = 0
+    # Batch-encode all fact contents off the event loop
+    non_secret_facts = [f for f in facts if not _contains_secret(f.content)]
+    if non_secret_facts:
+        fact_contents = [f.content for f in non_secret_facts]
+        fact_embs = await _encode_batch_async(fact_contents)
+        emb_iter = iter(fact_embs)
+    else:
+        emb_iter = iter([])
     for fact in facts:
         if _contains_secret(fact.content):
             continue
-        f_emb    = _encode(fact.content)
+        f_emb = next(emb_iter)
         existing = await mem_store.knn_search(_redis, mem_store.FACT_KEY, f_emb, k=1)
         if existing and existing[0].get("score", 0.0) > 0.95:
             if fact.keywords and existing[0].get("score", 0.0) > 0.80:
@@ -1440,22 +1449,22 @@ async def answer(req: AnswerRequest):
             break
         tried.append(model)
         try:
-            async with httpx.AsyncClient(timeout=20.0) as client:
-                resp = await client.post(
-                    _AISERV_OAI,
-                    json={
-                        "model": model,
-                        "messages": [
-                            {"role": "system", "content": system_msg},
-                            {"role": "user",   "content": prompt},
-                        ],
-                        "temperature": 0.0,
-                        "max_tokens": 80,
-                    },
-                    headers={"Authorization": f"Bearer {_AISERV_KEY}"},
-                )
-            if resp.status_code == 200:
-                raw = resp.json()["choices"][0]["message"]["content"].strip()
+            data = await async_post_json(
+                _AISERV_OAI,
+                payload={
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": system_msg},
+                        {"role": "user",   "content": prompt},
+                    ],
+                    "temperature": 0.0,
+                    "max_tokens": 80,
+                },
+                headers={"Authorization": f"Bearer {_AISERV_KEY}"},
+                timeout=20.0,
+            )
+            if data is not None:
+                raw = data["choices"][0]["message"]["content"].strip()
                 answer = _parse_answer_raw(raw)
                 if answer:
                     _spawn(extractor._report_quality(model, +1), "quality")
@@ -1506,7 +1515,7 @@ async def recall(req: RecallRequest):
     # Detect scene of incoming query
     query_scene = scene_mod.detect(req.query)
     q_lang, q_domain = query_scene["language"], query_scene["domain"]
-    emb = _encode(req.query)
+    emb = await asyncio.to_thread(_encode, req.query)
 
     # HyDE + MIRIX Active Retrieval Topic — run both in parallel for zero extra latency.
     #
@@ -1532,7 +1541,7 @@ async def recall(req: RecallRequest):
     _mirix_topic = _augment_results[1] if isinstance(_augment_results[1], str) else None
 
     if _hyde_doc:
-        hyde_emb = _encode(_hyde_doc)
+        hyde_emb = await asyncio.to_thread(_encode, _hyde_doc)
         merged = (emb * 0.5 + hyde_emb * 0.5).astype(np.float32)
         norm = np.linalg.norm(merged)
         emb = merged / norm if norm > 0 else merged
@@ -1733,10 +1742,12 @@ async def recall(req: RecallRequest):
         if len(targeted_queries) > 1:
             # Run targeted queries in parallel (exclude original already fetched above)
             extra_queries = [q for q in targeted_queries if q != req.query]
+            # Batch-encode all planning queries off the event loop
+            extra_embs = await _encode_batch_async(extra_queries)
             extra_tasks = [
-                mem_store.knn_search(_redis, mem_store.FACT_KEY, _encode(q), n_facts,
+                mem_store.knn_search(_redis, mem_store.FACT_KEY, emb, n_facts,
                                      filter_expr=lang_filter_sym or None, bump_heat=True)
-                for q in extra_queries
+                for emb in extra_embs
             ]
             extra_results = await asyncio.gather(*extra_tasks)
             seen_extra = {f["content"] for f in facts_scene}
@@ -1829,7 +1840,7 @@ async def recall(req: RecallRequest):
                 f"Find additional information about: {req.query}"
             )
             if extra_q:
-                reflection_emb = _encode(extra_q[0])
+                reflection_emb = await asyncio.to_thread(_encode, extra_q[0])
                 reflection_facts = await mem_store.knn_search(
                     _redis, mem_store.FACT_KEY, reflection_emb,
                     k=max(3, n_facts // 2), bump_heat=True

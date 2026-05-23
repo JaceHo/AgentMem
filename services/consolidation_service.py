@@ -23,6 +23,7 @@ import numpy as np
 
 from core import extractor
 from core import store as mem_store
+from core.http import async_post_json
 from core.search import BM25Index, encode, encode_batch, vscan, populate_bm25_from_redis
 
 log = logging.getLogger("mem")
@@ -294,21 +295,21 @@ async def llm_merge_facts(contents: list[str], spawn_fn=None) -> str | None:
     )
 
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.post(
-                _AISERV_OAI,
-                json={
-                    "model": model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 150,
-                    "temperature": 0.1,
-                },
-                headers={"Authorization": f"Bearer {_AISERV_KEY}"},
-            )
-            if resp.status_code == 200:
-                if spawn_fn:
-                    spawn_fn(extractor._report_quality(model, +1), "quality")
-                return resp.json()["choices"][0]["message"]["content"].strip()
+        data = await async_post_json(
+            _AISERV_OAI,
+            payload={
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 150,
+                "temperature": 0.1,
+            },
+            headers={"Authorization": f"Bearer {_AISERV_KEY}"},
+            timeout=5.0,
+        )
+        if data is not None:
+            if spawn_fn:
+                spawn_fn(extractor._report_quality(model, +1), "quality")
+            return data["choices"][0]["message"]["content"].strip()
     except httpx.TimeoutException:
         log.warning("[consolidate] %s timed out", model)
         if spawn_fn:
