@@ -27,8 +27,7 @@ import logging
 
 from .http import async_post_json
 from .extractor import (
-    AISERV_URL, AISERV_KEY, LLM_TIMEOUT_S, LLM_MAX_RETRIES,
-    _resolve_nlp_model, AISERV_FALLBACK_MODEL, _parse_llm_json,
+    AISERV_URL, AISERV_KEY, _resolve_nlp_model, AISERV_FALLBACK_MODEL, _parse_llm_json,
 )
 
 log = logging.getLogger("mem")
@@ -36,12 +35,24 @@ log = logging.getLogger("mem")
 _PLAN_TIMEOUT_S = 8.0               # match extractor timeout for working models
 _PLAN_MAX_RETRIES = 1               # one retry only — keeps recall fast
 
+# Simple circuit breaker: models that failed recently are skipped for 5 minutes
+_model_fail_times: dict[str, float] = {}
+_CIRCUIT_BREAKER_TTL = 300  # seconds
+
 
 async def _llm_call(prompt: str, system: str, max_tokens: int = 300) -> str | None:
     """Call LLM via aiserv role-based routing. Returns raw text or None on failure.
 
     Uses /v1/role/nlp for dynamic model selection with exclude-rotation on failure.
+    Skips models that failed recently (circuit breaker).
     """
+    import time as _time
+    now = _time.time()
+    # Prune expired circuit breaker entries
+    expired = [m for m, t in _model_fail_times.items() if now - t > _CIRCUIT_BREAKER_TTL]
+    for m in expired:
+        del _model_fail_times[m]
+
     exclude = None
     tried = []
     # Try role-routed model first, then fall back to direct GLM-4.7-Flash
@@ -53,6 +64,13 @@ async def _llm_call(prompt: str, system: str, max_tokens: int = 300) -> str | No
         exclude = model
     if AISERV_FALLBACK_MODEL not in models_to_try:
         models_to_try.append(AISERV_FALLBACK_MODEL)
+
+    # Filter out circuit-broken models
+    models_to_try = [m for m in models_to_try if m not in _model_fail_times]
+
+    if not models_to_try:
+        log.debug("[planner] all models circuit-broken, skipping planning")
+        return None
 
     for model in models_to_try:
         if model in tried:
@@ -78,6 +96,7 @@ async def _llm_call(prompt: str, system: str, max_tokens: int = 300) -> str | No
                 if content:
                     return content
         log.warning("[planner] %s returned no usable response", model)
+        _model_fail_times[model] = _time.time()  # trip circuit breaker
     log.warning("[planner] All models exhausted (%s)", ", ".join(tried))
     return None
 

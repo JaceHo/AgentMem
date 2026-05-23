@@ -109,26 +109,36 @@ async def do_consolidate(
         f["element"]: vec for f, vec in zip(all_facts, fact_vecs)
     }
 
+    # Pre-compute normalized embedding matrix for fast cosine similarity
+    # (avoids O(n) knn_search calls — uses numpy vectorized ops instead)
+    elem_order = [f["element"] for f in all_facts]
+    emb_matrix = np.stack([fact_embeddings[e] for e in elem_order]).astype(np.float32)
+    norms = np.linalg.norm(emb_matrix, axis=1, keepdims=True)
+    norms = np.maximum(norms, 1e-8)  # avoid division by zero
+    emb_normed = emb_matrix / norms
+
     fact_by_element: dict[str, dict] = {f["element"]: f for f in all_facts}
 
-    for fact in all_facts:
+    for idx, fact in enumerate(all_facts):
         if fact["element"] in superseded_elements:
             continue
 
-        f_emb = fact_embeddings[fact["element"]]
-        similar = await mem_store.knn_search(redis, mem_store.FACT_KEY, f_emb, k=5)
-
+        # In-memory cosine similarity (vectorized) — no Redis VSIM needed
+        sims = emb_normed @ emb_normed[idx]
+        # Get top-k similar indices (excluding self)
+        top_indices = np.argsort(sims)[::-1]
         cluster = [fact]
         fact_ts = fact["attrs"].get("ts", 0)
 
-        for s in similar:
-            if s["_element"] == fact["element"]:
+        for sim_idx in top_indices[:10]:  # check top 10 candidates
+            if sim_idx == idx:
                 continue
-            if s["_element"] in superseded_elements:
+            sim_elem = elem_order[sim_idx]
+            if sim_elem in superseded_elements:
                 continue
 
-            cosine_sim = s.get("score", 0.0)
-            s_fact = fact_by_element.get(s["_element"])
+            cosine_sim = float(sims[sim_idx])
+            s_fact = fact_by_element.get(sim_elem)
             s_ts = s_fact["attrs"].get("ts", 0) if s_fact else 0
 
             days_between = abs(fact_ts - s_ts) / 86_400_000
@@ -283,9 +293,6 @@ async def do_hard_prune(redis, bm25_index: BM25Index, spawn_fn) -> dict:
 
 async def llm_merge_facts(contents: list[str], spawn_fn=None) -> str | None:
     """Use role-based routing to merge multiple similar facts into one."""
-    _AISERV_OAI = "http://127.0.0.1:4000/v1/chat/completions"
-    _AISERV_KEY = "sk-aiserv-local-dev"
-
     model, _ = await extractor._resolve_nlp_model()
 
     facts_text = "\n".join(f"- {c}" for c in contents)
@@ -296,14 +303,14 @@ async def llm_merge_facts(contents: list[str], spawn_fn=None) -> str | None:
 
     try:
         data = await async_post_json(
-            _AISERV_OAI,
+            extractor.AISERV_URL,
             payload={
                 "model": model,
                 "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": 150,
                 "temperature": 0.1,
             },
-            headers={"Authorization": f"Bearer {_AISERV_KEY}"},
+            headers={"Authorization": f"Bearer {extractor.AISERV_KEY}"},
             timeout=5.0,
         )
         if data is not None:

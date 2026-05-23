@@ -31,6 +31,10 @@ import threading
 from abc import ABC, abstractmethod
 from typing import Optional
 
+# Prevent sentence-transformers from phoning home to HuggingFace Hub
+# when using Ollama or other non-local providers. Avoids 30s+ timeouts.
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+
 import numpy as np
 import httpx
 

@@ -59,6 +59,17 @@ local confidence = tonumber(ARGV[3])
 local now_ms = tonumber(ARGV[4])
 local source = ARGV[5]
 
+-- Migrate legacy Set keys to Hash: if key is a Set, convert members to Hash fields
+local key_type = redis.call('TYPE', key)
+if key_type == 'set' then
+    local members = redis.call('SMEMBERS', key)
+    redis.call('DEL', key)
+    for _, m in ipairs(members) do
+        local legacy_edge = {type='related_to', confidence=0.5, source_count=1, last_seen=now_ms, sources={}}
+        redis.call('HSET', key, m, cjson.encode(legacy_edge))
+    end
+end
+
 local raw = redis.call('HGET', key, field)
 if raw then
     local ok, edge = pcall(cjson.decode, raw)

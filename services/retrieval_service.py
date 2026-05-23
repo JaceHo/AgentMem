@@ -294,10 +294,10 @@ class RetrievalService:
     
     def _has_named_entities(self, query: str) -> bool:
         import re
-        words = query.split()
-        for i, word in enumerate(words):
-            if i > 0 and word and word[0].isupper():
-                return True
+        # Match multi-word capitalized sequences (e.g., "New York", "Redis Cache")
+        # or dates — skip single common capitalized words like "I", "The"
+        if re.search(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b", query):
+            return True
         return bool(re.search(r"\b\d{4}-\d{2}-\d{2}\b", query))
     
     def _format_context(

@@ -171,6 +171,7 @@ _sse_handler.setFormatter(logging.Formatter("%(message)s"))
 logging.getLogger().addHandler(_sse_handler)
 
 _redis = None  # backward compat — delegates to state.redis via property-like access
+_shutting_down = False  # set during lifespan shutdown to prevent new bg operations
 
 # ── Task manager and counters — delegate to api.state (single source of truth) ─
 _task_manager = state.task_manager
@@ -306,6 +307,8 @@ async def lifespan(app: FastAPI):
     log.info("AgentMem v%s ready (session-handoff+hard-prune+auto-graph+batch-MCP+compat+auto-crystallize)", APP_VERSION)
     yield
     # Cancel tracked background tasks before closing Redis
+    global _shutting_down
+    _shutting_down = True
     await state.task_manager.shutdown(timeout=settings.bg_task_shutdown_timeout)
     from core.http import close_client
     await close_client()
@@ -995,6 +998,8 @@ async def _check_contradiction(existing_fact: dict, new_fact) -> None:
 # ── Background store ──────────────────────────────────────────────────────────
 async def _do_store(messages: list[Message], session_id: str) -> None:
     global _store_attempts, _store_successes, _store_skips, _store_errors, _store_latency_sum_ms
+    if _shutting_down:
+        return
     await _store_attempts.increment()
     t0 = time.time()
     outcome = "error"
