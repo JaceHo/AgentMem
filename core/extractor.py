@@ -398,7 +398,7 @@ async def _llm_extract(conversation_text: str) -> list[ExtractedFact]:
     # Build candidate list: up to LLM_MAX_RETRIES role-routed models, then fallback
     # Store (model, tier) pairs so timeout uses the correct tier
     candidate_models: list[tuple[str, str]] = []
-    for _ in range(min(LLM_MAX_RETRIES, 2)):
+    for _ in range(LLM_MAX_RETRIES):
         m, t = await _resolve_nlp_model(exclude=exclude)
         if m not in [c[0] for c in candidate_models]:
             candidate_models.append((m, t))

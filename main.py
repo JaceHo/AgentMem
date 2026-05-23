@@ -351,6 +351,9 @@ try:
     from mcp_server import build_mcp_app, build_sse_app
     app.mount("/mcp",     build_mcp_app(), name="mcp_http")
     app.mount("/mcp/sse", build_sse_app(), name="mcp_sse")
+except ImportError as _mcp_err:
+    import logging as _logging
+    _logging.getLogger(__name__).info("MCP server not available (install 'mcp' package): %s", _mcp_err)
 except Exception as _mcp_err:
     import logging as _logging
     _logging.getLogger(__name__).warning("MCP HTTP mount failed: %s", _mcp_err)

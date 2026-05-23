@@ -60,7 +60,7 @@ async def do_consolidate(
     now_ms = int(time.time() * 1000)
     NINETY_DAYS_MS = 90 * 86_400_000
 
-    scanned = await vscan(redis, mem_store.FACT_KEY, max_count=500)
+    scanned = await vscan(redis, mem_store.FACT_KEY, max_count=5000)
     if not scanned:
         return {"merged": 0, "decayed": 0, "pruned": 0, "ms": 0}
 
@@ -142,7 +142,7 @@ async def do_consolidate(
             continue
 
         contents = [c["attrs"]["content"] for c in cluster]
-        merged_content = await llm_merge_facts(contents)
+        merged_content = await llm_merge_facts(contents, spawn_fn=spawn_fn)
         if not merged_content:
             continue
 
@@ -333,7 +333,7 @@ async def crystallize_session(
     LLM Wiki v2: distills completed work into structured digest:
     question, findings, entities, lessons.
     """
-    scanned = await vscan(redis, mem_store.FACT_KEY, max_count=200)
+    scanned = await vscan(redis, mem_store.FACT_KEY, max_count=5000)
 
     facts = []
     all_entities: set[str] = set()
@@ -385,7 +385,7 @@ async def crystallize_session_inline(
     Returns digest dict or None if crystallization fails.
     """
     try:
-        scanned = await vscan(redis, mem_store.FACT_KEY, max_count=200)
+        scanned = await vscan(redis, mem_store.FACT_KEY, max_count=5000)
 
         facts = []
         all_entities: set[str] = set()

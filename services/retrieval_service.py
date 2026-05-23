@@ -213,7 +213,7 @@ class RetrievalService:
         if not self._bm25:
             return []
         try:
-            return await self._bm25.search(query, top_k=settings.bm25_top_k)
+            return await self._bm25.search(query, k=settings.bm25_top_k)
         except Exception as e:
             self._log.warning(f"[retrieval] BM25 search failed: {e}")
             return []

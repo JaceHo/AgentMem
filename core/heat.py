@@ -9,7 +9,6 @@ Stored per-element in Redis VSETATTR JSON:
   { "access_count": int, "last_accessed": unix_ms, ... }
 """
 
-import json
 import math
 import time
 
@@ -64,6 +63,8 @@ if not ok or type(attrs) ~= 'table' then return 0 end
 
 attrs[count_field] = (attrs[count_field] or 0) + 1
 attrs[time_field] = tonumber(now_ms)
+-- Reinforce Ebbinghaus confidence: recall counts as confirmation
+attrs['last_confirmed_ts'] = tonumber(now_ms)
 
 local new_json = cjson.encode(attrs)
 redis.call('VSETATTR', key, elem, new_json)

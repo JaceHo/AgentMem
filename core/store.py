@@ -158,7 +158,9 @@ _CATEGORY_STABILITY_DAYS = {
     "identity": 365, "rule": 365, "preference": 180, "decision": 180,
     "work": 120, "personal": 120, "location": 120,
     "procedure": 90, "context": 60, "tool_use": 60,
-    "entity": 90, "warning": 30, "reminder": 30,
+    "entity": 90, "warning": 30, "reminder": 60,
+    "general": 90, "capability_gained": 90, "env_change": 60,
+    "env_context": 45, "deadline": 30,
 }
 
 _DEFAULT_STABILITY_DAYS = 90
@@ -169,10 +171,12 @@ def confidence_decay(attrs: dict) -> float:
     Compute current effective confidence using Ebbinghaus forgetting curve.
 
     R(t) = e^(-t/S)  where t = days since last confirmation, S = stability.
-    effective_confidence = base_confidence × R(t) × min(1, source_count/3)
+    effective_confidence = base_confidence × R(t) × source_multiplier
 
-    - source_count ≥ 3 → full multiplier (well-supported fact)
-    - source_count = 1 → 0.33× (single source, less reliable)
+    source_multiplier:
+      - source_count ≥ 3 → 1.0 (well-supported fact)
+      - source_count = 2 → 0.8 (corroborated)
+      - source_count = 1 → 0.6 (single source, less reliable but not penalized to 0.33)
     - Reinforcement resets last_confirmed_ts → R(t) → 1.0 again
     - Superseded facts return 0.0 (no decay computation needed)
     """
@@ -188,7 +192,12 @@ def confidence_decay(attrs: dict) -> float:
 
     stability = _CATEGORY_STABILITY_DAYS.get(category, _DEFAULT_STABILITY_DAYS)
     retention = math.exp(-days_since / stability)
-    source_multiplier = min(1.0, source_count / 3.0)
+    if source_count >= 3:
+        source_multiplier = 1.0
+    elif source_count == 2:
+        source_multiplier = 0.8
+    else:
+        source_multiplier = 0.6
 
     return round(base * retention * source_multiplier, 4)
 

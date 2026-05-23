@@ -51,7 +51,7 @@ async def admin_delete_facts_by_content(pattern: str = "Always send a report"):
     seed = np.zeros(embedder.DIMS, dtype=np.float32)
     results = await r.execute_command(
         "VSIM", mem_store.FACT_KEY, "FP32", seed.tobytes(),
-        "COUNT", min(int(card), 500), "WITHSCORES", "WITHATTRIBS"
+        "COUNT", min(int(card), 5000), "WITHSCORES", "WITHATTRIBS"
     )
     deleted = 0
     i = 0
@@ -224,7 +224,7 @@ async def lifecycle_stats():
     seed = np.zeros(embedder.DIMS, dtype=np.float32)
     results = await r.execute_command(
         "VSIM", mem_store.FACT_KEY, "FP32", seed.tobytes(),
-        "COUNT", min(int(card), 500), "WITHSCORES", "WITHATTRIBS"
+        "COUNT", min(int(card), 5000), "WITHSCORES", "WITHATTRIBS"
     )
 
     active = 0
@@ -245,7 +245,16 @@ async def lifecycle_stats():
 
         if attrs.get("superseded_by"):
             superseded += 1
-            reason = attrs.get("superseded_reason", "unknown")
+            reason = attrs.get("superseded_reason", "")
+            # Infer reason from superseded_by value when reason field is missing (pre-v1.1 facts)
+            if not reason:
+                sb = attrs.get("superseded_by", "")
+                if sb == "pruned":
+                    reason = "pruned"
+                elif sb:
+                    reason = "merged"
+                else:
+                    reason = "unknown"
             reason_counts[reason] = reason_counts.get(reason, 0) + 1
             continue
 

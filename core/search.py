@@ -5,7 +5,6 @@ Extracted from main.py to provide reusable search primitives across route module
 """
 
 import asyncio
-import json
 import re
 from functools import lru_cache
 
@@ -117,7 +116,7 @@ class BM25Index:
         self._built_at_len: int = 0
         self._rebuild_threshold: int = 10
         self._add_lock = asyncio.Lock()      # protects list append only
-        self._rebuilding: bool = False       # prevents duplicate concurrent rebuilds
+        self._rebuild_lock = asyncio.Lock()  # prevents duplicate concurrent rebuilds
 
     async def add(self, uid: str, content: str, attrs: dict) -> None:
         """Add a fact to the corpus. Triggers a background rebuild if threshold crossed."""
@@ -126,7 +125,7 @@ class BM25Index:
         # Kick off a non-blocking rebuild if enough new docs have accumulated
         n = len(self._docs)
         if (self._bm25 is None or (n - self._built_at_len) >= self._rebuild_threshold) \
-                and not self._rebuilding:
+                and not self._rebuild_lock.locked():
             asyncio.create_task(self._rebuild_async())
 
     def _tokenize(self, text: str) -> list[str]:
@@ -137,7 +136,9 @@ class BM25Index:
         return en + zh
 
     def _build_corpus(self, docs: list[tuple[str, str, dict]]):
-        """CPU-bound corpus construction \u2014 runs in thread pool via asyncio.to_thread."""
+        """CPU-bound corpus construction — runs in thread pool via asyncio.to_thread."""
+        if not BM25_AVAILABLE:
+            return None, 0
         corpus = []
         for _, content, attrs in docs:
             if attrs.get("superseded_by"):
@@ -152,19 +153,18 @@ class BM25Index:
 
     async def _rebuild_async(self) -> None:
         """Rebuild BM25 index in a thread pool without blocking reads or the event loop."""
-        if self._rebuilding:
+        if self._rebuild_lock.locked():
             return
-        self._rebuilding = True
-        try:
+        async with self._rebuild_lock:
             docs_snapshot = list(self._docs)  # snapshot avoids holding add_lock during build
             if not docs_snapshot:
                 return
             new_bm25, n = await asyncio.to_thread(self._build_corpus, docs_snapshot)
-            # Atomic reference swap \u2014 readers see either old or new, never partial
+            if new_bm25 is None:
+                return
+            # Atomic reference swap — readers see either old or new, never partial
             self._bm25 = new_bm25
             self._built_at_len = n
-        finally:
-            self._rebuilding = False
 
     async def search(self, query: str, k: int = 10) -> list[dict]:
         """Return top-k facts by BM25 score. Non-blocking: reads current index snapshot."""
@@ -173,9 +173,9 @@ class BM25Index:
         n = len(self._docs)
         if n == 0:
             return []
-        # Trigger rebuild if needed, but don't wait \u2014 use whatever index is current
+        # Trigger rebuild if needed, but don't wait — use whatever index is current
         if (self._bm25 is None or (n - self._built_at_len) >= self._rebuild_threshold) \
-                and not self._rebuilding:
+                and not self._rebuild_lock.locked():
             asyncio.create_task(self._rebuild_async())
         bm25 = self._bm25  # atomic reference read (GIL guarantees this)
         if bm25 is None:
@@ -223,9 +223,9 @@ class BM25Index:
     async def reset(self) -> None:
         async with self._add_lock:
             self._docs.clear()
+        async with self._rebuild_lock:
             self._bm25 = None
             self._built_at_len = 0
-            self._rebuilding = False
 
 
 async def populate_bm25_from_redis(r, bm25_index: BM25Index) -> None:
