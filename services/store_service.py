@@ -68,7 +68,7 @@ def format_prepend(
     env_ctx: str = "",
     tool_ctx: str = "",
     proc_ctx: list[dict] | None = None,
-    token_budget: int = 1500,
+    token_budget: int | None = 1500,
     last_session_summary: str | None = None,
     crystal_digests: list[dict] | None = None,
 ) -> str:
@@ -80,6 +80,8 @@ def format_prepend(
     Greedy packing: stop adding items when token_budget is exhausted.
     Output wrapped in <cross_session_memory> XML tags (SimpleMem convention).
     """
+    if token_budget is None:
+        token_budget = settings.default_token_budget
     sections: list[str] = []
     tokens_used = 0
 
