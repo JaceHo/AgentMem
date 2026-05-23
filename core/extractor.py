@@ -160,8 +160,8 @@ AISERV_KEY   = "sk-aiserv-local"
 AISERV_ROLE  = "nlp"                    # maps to /v1/role/nlp
 AISERV_FALLBACK_MODEL = "ZhipuAI/GLM-4.7-Flash"  # direct fallback if /v1/role/nlp returns broken models
 AISERV_MODEL_CASCADE = []               # populated dynamically; kept for import compat
-FAST_LLM_TIMEOUT_S = 8.0               # same as ROLE — fallback also needs time
-ROLE_LLM_TIMEOUT_S = 8.0               # reduced from 15s — broken models fail fast
+FAST_LLM_TIMEOUT_S = 6.0               # fast models: fail fast, move on
+ROLE_LLM_TIMEOUT_S = 6.0               # premium models: same — fail fast, don't block stores
 LLM_TIMEOUT_S = ROLE_LLM_TIMEOUT_S
 LLM_MAX_RETRIES = 3
 LLM_MAX_INPUT = 3000   # chars of conversation to send to LLM
@@ -398,19 +398,19 @@ async def _llm_extract(conversation_text: str) -> list[ExtractedFact]:
     exclude = None
     tried_models = []
     # Build candidate list: up to LLM_MAX_RETRIES role-routed models, then fallback
-    candidate_models = []
+    # Store (model, tier) pairs so timeout uses the correct tier
+    candidate_models: list[tuple[str, str]] = []
     for _ in range(min(LLM_MAX_RETRIES, 2)):
         m, t = await _resolve_nlp_model(exclude=exclude)
-        if m not in candidate_models:
-            candidate_models.append(m)
+        if m not in [c[0] for c in candidate_models]:
+            candidate_models.append((m, t))
         exclude = m
-    if AISERV_FALLBACK_MODEL not in candidate_models:
-        candidate_models.append(AISERV_FALLBACK_MODEL)
+    if AISERV_FALLBACK_MODEL not in [c[0] for c in candidate_models]:
+        candidate_models.append((AISERV_FALLBACK_MODEL, "fast"))
 
-    for model in candidate_models:
+    for model, tier in candidate_models:
         if model in tried_models:
             continue
-        tier = "fast" if model == AISERV_FALLBACK_MODEL else "premium"
         tried_models.append(model)
         timeout_s = _timeout_for(model, tier)
         try:
