@@ -215,17 +215,20 @@ async def _periodic_consolidate() -> None:
     global _periodic_prune_counter
     while True:
         await asyncio.sleep(3600)
+        r = _redis
+        if r is None:
+            continue
         try:
-            card = await _redis.execute_command("VCARD", mem_store.FACT_KEY)
+            card = await r.execute_command("VCARD", mem_store.FACT_KEY)
             if int(card or 0) > 5:
-                await _do_consolidate(_redis, _bm25_index, _spawn)
+                await _do_consolidate(r, _bm25_index, _spawn)
         except Exception as e:
             log.warning(f"[periodic_consolidate] error: {e}")
         prune_count = await _periodic_prune_counter.increment()
         if prune_count >= 24:
             await _periodic_prune_counter.reset()
             try:
-                await _do_hard_prune(_redis, _bm25_index, _spawn)
+                await _do_hard_prune(r, _bm25_index, _spawn)
             except Exception as e:
                 log.warning(f"[periodic_consolidate] hard-prune error: {e}")
 
@@ -302,6 +305,8 @@ async def lifespan(app: FastAPI):
     yield
     # Cancel tracked background tasks before closing Redis
     await state.task_manager.shutdown(timeout=settings.bg_task_shutdown_timeout)
+    from core.http import close_client
+    await close_client()
     await mem_store.close_pool()
 
 
@@ -357,16 +362,20 @@ _ws_clients: set[WebSocket] = set()
 
 
 async def _ws_broadcast(event: str, data: dict) -> None:
-    """Push an event to all connected WebSocket clients."""
+    """Push an event to all connected WebSocket clients in parallel."""
     if not _ws_clients:
         return
     msg = json.dumps({"event": event, **data, "ts": time.time()})
-    dead = set()
-    for ws in _ws_clients:
+
+    async def _send(ws: WebSocket) -> WebSocket | None:
         try:
             await ws.send_text(msg)
+            return None
         except Exception:
-            dead.add(ws)
+            return ws
+
+    results = await asyncio.gather(*[_send(ws) for ws in _ws_clients])
+    dead = {ws for ws in results if ws is not None}
     _ws_clients.difference_update(dead)
 
 
@@ -652,7 +661,8 @@ async def _admission_gate(user_text: str) -> bool:
     text = user_text[:400]
 
     # F1 — Semantic novelty (w=0.25)
-    emb = _encode(text)
+    # Offload CPU-bound embedding to thread pool so it doesn't block the event loop
+    emb = await asyncio.to_thread(_encode, text)
     recent = await mem_store.knn_search(_redis, mem_store.EPISODE_KEY, emb, k=3)
     if recent:
         max_sim = max(r.get("score", 0.0) for r in recent)
@@ -1026,7 +1036,7 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
         summary = await summarizer.summarize(turn_text)
 
         # 4. Embed + dedup-check + save episode (with type taxonomy + causal chain)
-        ep_emb = _encode(summary[:500])
+        ep_emb = await asyncio.to_thread(_encode, summary[:500])
         similar = await mem_store.knn_search(_redis, mem_store.EPISODE_KEY, ep_emb, k=1)
         is_dup = bool(similar and similar[0].get("score", 0.0) > 0.95)
         ep_saved = 0
@@ -1048,10 +1058,17 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
         raw_msgs = [{"role": m.role, "content": _msg_text(m)} for m in clean if _msg_text(m)]
         facts = await extractor.extract_hybrid(raw_msgs, turn_text)
         fact_saved = 0
+
+        # Batch-encode all fact contents off the event loop in one pass
+        # instead of calling _encode() per fact (N sequential MiniLM inferences)
+        fact_contents = [f.content for f in facts if not _contains_secret(f.content)]
+        fact_embs = await _encode_batch_async(fact_contents)
+        emb_iter = iter(fact_embs)
+
         for fact in facts:
             if _contains_secret(fact.content):
                 continue
-            f_emb = _encode(fact.content)
+            f_emb = next(emb_iter)
             existing = await mem_store.knn_search(_redis, mem_store.FACT_KEY, f_emb, k=1)
             if existing and existing[0].get("score", 0.0) > 0.95:
                 # A-MEM memory evolution: similar fact exists → async-update its keywords/topic
@@ -1122,18 +1139,20 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
             "bash", "glob", "grep", "read", "edit", "write", "websearch", "webfetch",
             "agent", "task", "notebook", "notebookedit", "mcp", "skill",
         }
-        for pf in proc_facts:
-            p_emb = _encode(pf.content)
-            existing = await mem_store.knn_search(_redis, mem_store.PROC_KEY, p_emb, k=1)
-            if not existing or existing[0].get("score", 0.0) < 0.90:
-                # Match only known tool names mentioned in the procedure text
-                content_lower = pf.content.lower()
-                tools_in_proc = [t for t in _KNOWN_TOOLS if t in content_lower]
-                await mem_store.save_procedure(
-                    _redis, task=pf.content, procedure=pf.content,
-                    embedding=p_emb, tools_used=tools_in_proc[:8],
-                    domain=domain, language=lang,
-                )
+        # Batch-encode procedure contents off the event loop
+        if proc_facts:
+            proc_contents = [pf.content for pf in proc_facts]
+            proc_embs = await _encode_batch_async(proc_contents)
+            for pf, p_emb in zip(proc_facts, proc_embs):
+                existing = await mem_store.knn_search(_redis, mem_store.PROC_KEY, p_emb, k=1)
+                if not existing or existing[0].get("score", 0.0) < 0.90:
+                    content_lower = pf.content.lower()
+                    tools_in_proc = [t for t in _KNOWN_TOOLS if t in content_lower]
+                    await mem_store.save_procedure(
+                        _redis, task=pf.content, procedure=pf.content,
+                        embedding=p_emb, tools_used=tools_in_proc[:8],
+                        domain=domain, language=lang,
+                    )
 
         # 7. Record knowledge graph edges from persons + entities co-occurrences
         for fact in facts:

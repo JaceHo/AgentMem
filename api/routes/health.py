@@ -11,12 +11,16 @@ router = APIRouter(tags=["health"])
 @router.get("/health")
 async def health():
     r = state.redis
+    if r is None:
+        return {"status": "degraded", "redis": "not_connected",
+                "version": settings.app_version}
     try:
         await r.ping()
         return {"status": "ok", "redis": "ok", "version": settings.app_version,
                 "embedding": state.embedder.get_provider_info()}
     except Exception as e:
-        return {"status": "degraded", "error": str(e)}
+        return {"status": "degraded", "redis": "error", "error": str(e),
+                "version": settings.app_version}
 
 
 @router.get("/livez")
@@ -27,6 +31,8 @@ async def livez():
 @router.get("/stats")
 async def stats():
     r = state.redis
+    if r is None:
+        return {"error": "Redis not connected"}
     try:
         counts = await state.mem_store.vcard(r)
         persona_raw = await r.hgetall("mem:persona")

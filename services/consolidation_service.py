@@ -12,6 +12,7 @@ Also handles:
   - Session crystallization
 """
 
+import asyncio
 import json
 import logging
 import math
@@ -22,7 +23,7 @@ import numpy as np
 
 from core import extractor
 from core import store as mem_store
-from core.search import BM25Index, encode, vscan, populate_bm25_from_redis
+from core.search import BM25Index, encode, encode_batch, vscan, populate_bm25_from_redis
 
 log = logging.getLogger("mem")
 
@@ -100,9 +101,12 @@ async def do_consolidate(
     merged_count = 0
     superseded_elements: set[str] = set()
 
-    fact_embeddings: dict[str, np.ndarray] = {}
-    for fact in all_facts:
-        fact_embeddings[fact["element"]] = encode(fact["attrs"]["content"])
+    # Batch-encode all fact contents off the event loop to avoid blocking
+    fact_contents = [f["attrs"]["content"] for f in all_facts]
+    fact_vecs = await asyncio.to_thread(encode_batch, fact_contents)
+    fact_embeddings: dict[str, np.ndarray] = {
+        f["element"]: vec for f, vec in zip(all_facts, fact_vecs)
+    }
 
     fact_by_element: dict[str, dict] = {f["element"]: f for f in all_facts}
 
@@ -171,7 +175,7 @@ async def do_consolidate(
         if all_entities:
             new_attrs["entities"] = list(all_entities)[:5]
 
-        m_emb = encode(merged_content)
+        m_emb = await asyncio.to_thread(encode, merged_content)
         try:
             await redis.execute_command(
                 "VADD", mem_store.FACT_KEY, "FP32", m_emb.tobytes(),

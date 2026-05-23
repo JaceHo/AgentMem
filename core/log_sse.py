@@ -131,12 +131,43 @@ class LogSSEHandler(logging.Handler):
     """
     Python logging handler that:
       1. Appends each record to the in-memory ring buffer
-      2. Mirrors it to ~/.agentmem/logs/dashboard.jsonl
+      2. Mirrors it to ~/.agentmem/logs/dashboard.jsonl (buffered)
       3. Broadcasts it to all live SSE clients
+
+    Disk writes are buffered — entries accumulate in _disk_buffer and are
+    flushed periodically (~every 2s or when buffer reaches 50 entries).
+    This avoids a synchronous file I/O syscall per log record, which adds
+    significant latency under high log volume.
     """
+
+    _DISK_FLUSH_INTERVAL = 2.0   # seconds between flushes
+    _DISK_FLUSH_THRESHOLD = 50   # entries before immediate flush
 
     def __init__(self, level: int = logging.INFO):
         super().__init__(level)
+        self._disk_buffer: list[str] = []
+        self._last_flush: float = time.monotonic()
+
+    def _flush_disk(self) -> None:
+        """Write buffered entries to disk in a single I/O operation."""
+        if not self._disk_buffer:
+            return
+        try:
+            _LOG_DIR.mkdir(parents=True, exist_ok=True)
+            if _LOG_FILE.exists() and _LOG_FILE.stat().st_size > _MAX_DISK_BYTES:
+                rot = _LOG_FILE.with_suffix(".jsonl.1")
+                try:
+                    if rot.exists():
+                        rot.unlink()
+                    _LOG_FILE.rename(rot)
+                except Exception:
+                    pass
+            with _LOG_FILE.open("a", encoding="utf-8") as f:
+                f.writelines(self._disk_buffer)
+            self._disk_buffer.clear()
+            self._last_flush = time.monotonic()
+        except Exception:
+            pass  # never let log persistence kill the process
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
@@ -149,7 +180,12 @@ class LogSSEHandler(logging.Handler):
                 "msg":   self.format(record),
             }
             _buffer.append(entry)
-            _append_disk(entry)
+            # Buffer disk write instead of per-record I/O
+            self._disk_buffer.append(json.dumps(entry, ensure_ascii=False) + "\n")
+            now = time.monotonic()
+            if (len(self._disk_buffer) >= self._DISK_FLUSH_THRESHOLD
+                    or now - self._last_flush >= self._DISK_FLUSH_INTERVAL):
+                self._flush_disk()
             payload = json.dumps(entry, ensure_ascii=False)
             for q in list(_connections.values()):
                 try:

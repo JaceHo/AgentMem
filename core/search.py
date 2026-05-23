@@ -34,6 +34,16 @@ def encode(text: str) -> np.ndarray:
     return np.frombuffer(cached_encode(text), dtype=np.float32).copy()
 
 
+def encode_batch(texts: list[str]) -> list[np.ndarray]:
+    """Return mutable float32 embedding vectors for a batch of texts.
+
+    Uses the embedder's native batch encoding which is significantly faster
+    than calling encode() one-by-one (single forward pass vs N passes).
+    """
+    vecs = embedder.encode_batch(texts)
+    return [np.asarray(v, dtype=np.float32) for v in vecs]
+
+
 # ── Zero-vector for VSIM scan-all ─────────────────────────────────────────────
 
 _ZERO_VEC = np.zeros(embedder.DIMS, dtype=np.float32)

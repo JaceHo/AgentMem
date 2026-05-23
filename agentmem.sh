@@ -189,7 +189,7 @@ case "${1:-help}" in
             launchctl stop "$SERVICE_LABEL"
             echo "Stopped (launchd; KeepAlive will restart — use 'disable' to prevent)"
         elif pgrep -f "uvicorn main:app" >/dev/null 2>&1; then
-            pkill -f "uvicorn main:app"
+            pkill -f "uvicorn main:app" || true
             echo "Stopped"
         else
             echo "Not running"

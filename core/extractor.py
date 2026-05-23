@@ -30,6 +30,8 @@ import datetime
 
 import httpx
 
+from .http import async_get_json, async_post_json
+
 log = logging.getLogger("mem")
 
 
@@ -173,11 +175,9 @@ async def _resolve_nlp_model(exclude: Optional[str] = None) -> tuple[str, str]:
         url = f"{AISERV_BASE}/v1/role/{AISERV_ROLE}"
         if exclude:
             url += f"?exclude={exclude}"
-        async with httpx.AsyncClient(timeout=2.0) as client:
-            resp = await client.get(url, headers={"Authorization": f"Bearer {AISERV_KEY}"})
-            if resp.status_code == 200:
-                d = resp.json()
-                return d.get("model", AISERV_FALLBACK_MODEL), d.get("tier", "fast")
+        data = await async_get_json(url, headers={"Authorization": f"Bearer {AISERV_KEY}"}, timeout=2.0)
+        if data is not None:
+            return data.get("model", AISERV_FALLBACK_MODEL), data.get("tier", "fast")
     except Exception as e:
         log.debug("[extractor] role API failed: %s", e)
     return AISERV_FALLBACK_MODEL, "fast"
@@ -193,11 +193,9 @@ async def _resolve_qa_model(exclude: Optional[str] = None) -> tuple[str, str]:
         url = f"{AISERV_BASE}/v1/role/qa"
         if exclude:
             url += f"?exclude={exclude}"
-        async with httpx.AsyncClient(timeout=2.0) as client:
-            resp = await client.get(url, headers={"Authorization": f"Bearer {AISERV_KEY}"})
-            if resp.status_code == 200:
-                d = resp.json()
-                return d.get("model", AISERV_FALLBACK_MODEL), d.get("tier", "fast")
+        data = await async_get_json(url, headers={"Authorization": f"Bearer {AISERV_KEY}"}, timeout=2.0)
+        if data is not None:
+            return data.get("model", AISERV_FALLBACK_MODEL), data.get("tier", "fast")
     except Exception as e:
         log.debug("[extractor] qa role API failed: %s", e)
     return AISERV_FALLBACK_MODEL, "fast"
@@ -215,17 +213,17 @@ async def _report_quality(model: str, score: int, reason: str = "") -> None:
             quality scores (slow signal).
     """
     try:
-        async with httpx.AsyncClient(timeout=2.0) as client:
-            payload: dict = {"model": model, "score": score, "task_type": "language"}
-            if reason:
-                payload["reason"] = reason
-            await client.post(
-                f"{AISERV_BASE}/v1/quality-feedback",
-                json=payload,
-                headers={"Authorization": f"Bearer {AISERV_KEY}"},
-            )
-            log.debug("[extractor] quality-feedback: %s score=%+d reason=%s",
-                      model, score, reason or "n/a")
+        payload: dict = {"model": model, "score": score, "task_type": "language"}
+        if reason:
+            payload["reason"] = reason
+        await async_post_json(
+            f"{AISERV_BASE}/v1/quality-feedback",
+            payload=payload,
+            headers={"Authorization": f"Bearer {AISERV_KEY}"},
+            timeout=2.0,
+        )
+        log.debug("[extractor] quality-feedback: %s score=%+d reason=%s",
+                  model, score, reason or "n/a")
     except Exception:
         pass  # best-effort; never block the caller
 
@@ -414,120 +412,117 @@ async def _llm_extract(conversation_text: str) -> list[ExtractedFact]:
         tried_models.append(model)
         timeout_s = _timeout_for(model, tier)
         try:
-            async with httpx.AsyncClient(timeout=timeout_s) as client:
-                resp = await client.post(
-                    AISERV_URL,
-                    json={
-                        "model":      model,
-                        "max_tokens": 1500,
-                        "messages": [
-                            {"role": "system", "content": (
-                                "You are a professional memory extraction assistant. "
-                                "You extract structured, unambiguous information from conversations. "
-                                "Output valid JSON only."
-                            )},
-                            {"role": "user", "content": prompt},
-                        ],
-                    },
-                    headers={"Authorization": f"Bearer {AISERV_KEY}"},
+            data = await async_post_json(
+                AISERV_URL,
+                payload={
+                    "model":      model,
+                    "max_tokens": 1500,
+                    "messages": [
+                        {"role": "system", "content": (
+                            "You are a professional memory extraction assistant. "
+                            "You extract structured, unambiguous information from conversations. "
+                            "Output valid JSON only."
+                        )},
+                        {"role": "user", "content": prompt},
+                    ],
+                },
+                headers={"Authorization": f"Bearer {AISERV_KEY}"},
+                timeout=timeout_s,
+            )
+            if data is None:
+                log.warning("[extractor] %s returned no data", model)
+                exclude = model
+                continue
+
+            raw = data["choices"][0]["message"]["content"].strip()
+            items = _parse_llm_json(raw)
+
+            if not isinstance(items, list):
+                log.warning("[extractor] %s returned non-list, trying next", model)
+                exclude = model
+                continue
+
+            facts: list[ExtractedFact] = []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                # SimpleMem uses "lossless_restatement" as the primary content field
+                content = (
+                    item.get("lossless_restatement")
+                    or item.get("content")
+                    or ""
                 )
-                if resp.status_code != 200:
-                    log.warning(
-                        "[extractor] %s returned %d: %s",
-                        model, resp.status_code, resp.text[:200],
-                    )
-                    exclude = model
+                if not content or len(content.strip()) < 10:
                     continue
 
-                raw = resp.json()["choices"][0]["message"]["content"].strip()
-                items = _parse_llm_json(raw)
-
-                if not isinstance(items, list):
-                    log.warning("[extractor] %s returned non-list, trying next", model)
-                    exclude = model
+                category = item.get("category", "general")
+                # Never store credentials from LLM extraction for safety
+                if category == "credential":
                     continue
 
-                facts: list[ExtractedFact] = []
-                for item in items:
-                    if not isinstance(item, dict):
-                        continue
-                    # SimpleMem uses "lossless_restatement" as the primary content field
-                    content = (
-                        item.get("lossless_restatement")
-                        or item.get("content")
-                        or ""
-                    )
-                    if not content or len(content.strip()) < 10:
-                        continue
+                importance = float(item.get("importance", 0.5))
+                importance = max(0.0, min(1.0, importance))
 
-                    category = item.get("category", "general")
-                    # Never store credentials from LLM extraction for safety
-                    if category == "credential":
-                        continue
+                # A-MAC content type prior (arXiv:2603.04549):
+                # Category-based importance floors ensure high-value facts
+                # survive consolidation pruning. The LLM score is the ceiling;
+                # the floor prevents systematic under-scoring of critical facts.
+                _IMPORTANCE_FLOOR = {
+                    "identity":   0.80,
+                    "rule":       0.80,
+                    "preference": 0.75,
+                    "work":       0.65,
+                    "personal":   0.65,
+                    "reminder":   0.65,
+                    "decision":   0.60,
+                    "procedure":  0.55,
+                    "location":   0.55,
+                    "capability_gained": 0.55,
+                    "env_change": 0.50,
+                    "tool_use":   0.45,
+                    "env_context":0.40,
+                    "context":    0.35,
+                    "general":    0.30,
+                }
+                floor = _IMPORTANCE_FLOOR.get(category, 0.35)
+                importance = max(importance, floor)
 
-                    importance = float(item.get("importance", 0.5))
-                    importance = max(0.0, min(1.0, importance))
+                # Memori-style semantic triple (arXiv:2603.19935)
+                triple = item.get("triple") or {}
+                triple_s = triple.get("s") or None
+                triple_p = triple.get("p") or None
+                triple_o = triple.get("o") or None
+                # Validate triple: all three parts must be non-empty strings
+                if triple_s and triple_p and triple_o:
+                    triple_s = str(triple_s).strip()[:100]
+                    triple_p = str(triple_p).strip()[:100]
+                    triple_o = str(triple_o).strip()[:200]
+                else:
+                    triple_s = triple_p = triple_o = None
 
-                    # A-MAC content type prior (arXiv:2603.04549):
-                    # Category-based importance floors ensure high-value facts
-                    # survive consolidation pruning. The LLM score is the ceiling;
-                    # the floor prevents systematic under-scoring of critical facts.
-                    _IMPORTANCE_FLOOR = {
-                        "identity":   0.80,
-                        "rule":       0.80,
-                        "preference": 0.75,
-                        "work":       0.65,
-                        "personal":   0.65,
-                        "reminder":   0.65,
-                        "decision":   0.60,
-                        "procedure":  0.55,
-                        "location":   0.55,
-                        "capability_gained": 0.55,
-                        "env_change": 0.50,
-                        "tool_use":   0.45,
-                        "env_context":0.40,
-                        "context":    0.35,
-                        "general":    0.30,
-                    }
-                    floor = _IMPORTANCE_FLOOR.get(category, 0.35)
-                    importance = max(importance, floor)
+                facts.append(ExtractedFact(
+                    content=str(content).strip()[:500],
+                    category=category,
+                    confidence=0.9,   # LLM-extracted = higher confidence
+                    source="llm",
+                    keywords=item.get("keywords") or None,
+                    persons=item.get("persons") or None,
+                    entities=item.get("entities") or None,
+                    topic=item.get("topic") or None,
+                    location=item.get("location") or None,
+                    importance=importance,
+                    triple_s=triple_s,
+                    triple_p=triple_p,
+                    triple_o=triple_o,
+                ))
 
-                    # Memori-style semantic triple (arXiv:2603.19935)
-                    triple = item.get("triple") or {}
-                    triple_s = triple.get("s") or None
-                    triple_p = triple.get("p") or None
-                    triple_o = triple.get("o") or None
-                    # Validate triple: all three parts must be non-empty strings
-                    if triple_s and triple_p and triple_o:
-                        triple_s = str(triple_s).strip()[:100]
-                        triple_p = str(triple_p).strip()[:100]
-                        triple_o = str(triple_o).strip()[:200]
-                    else:
-                        triple_s = triple_p = triple_o = None
-
-                    facts.append(ExtractedFact(
-                        content=str(content).strip()[:500],
-                        category=category,
-                        confidence=0.9,   # LLM-extracted = higher confidence
-                        source="llm",
-                        keywords=item.get("keywords") or None,
-                        persons=item.get("persons") or None,
-                        entities=item.get("entities") or None,
-                        topic=item.get("topic") or None,
-                        location=item.get("location") or None,
-                        importance=importance,
-                        triple_s=triple_s,
-                        triple_p=triple_p,
-                        triple_o=triple_o,
-                    ))
-
-                log.info(
-                    f"[extractor] LLM produced {len(facts)} lossless entries "
-                    f"(SimpleMem Φ_gate)"
-                )
-                # Report success to aiserv so health matrix tracks working models.
-                asyncio.create_task(_report_quality(model, +1))
-                return facts
+            log.info(
+                f"[extractor] LLM produced {len(facts)} lossless entries "
+                f"(SimpleMem Φ_gate)"
+            )
+            # Report success to aiserv so health matrix tracks working models.
+            asyncio.create_task(_report_quality(model, +1))
+            return facts
 
         except json.JSONDecodeError as e:
             log.warning("[extractor] %s returned non-JSON: %s", model, e)
