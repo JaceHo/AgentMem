@@ -51,6 +51,21 @@ _kill_stale() {
     fi
 }
 
+_start_direct() {
+    """Start uvicorn directly (no launchd). Used by 'start' and 'restart' fallback."""
+    _kill_stale
+    _register_capabilities &
+    if ! $NO_AUTO; then
+        _auto_connect &
+    fi
+    uv run uvicorn main:app \
+        --host 0.0.0.0 \
+        --port "$PORT" \
+        --log-level info \
+        --timeout-graceful-shutdown 0 &
+    echo "  Started (PID: $!)"
+}
+
 _wait_ready() {
     local port="${1:-$PORT}"
     local max="${2:-80}"
@@ -142,19 +157,7 @@ case "${1:-help}" in
             echo "  Starting AgentMem on :$PORT (no launchd — run 'enable' for auto-start)"
             echo "  API:  http://localhost:$PORT"
             echo ""
-            _kill_stale
-            _register_capabilities &
-            if ! $NO_AUTO; then
-                _auto_connect &
-            else
-                echo "  (--no-auto: skipping agent auto-connect)"
-            fi
-            uv run uvicorn main:app \
-                --host 0.0.0.0 \
-                --port "$PORT" \
-                --log-level info \
-                --timeout-graceful-shutdown 0 &
-            echo "  Started (PID: $!)"
+            _start_direct
         fi
         ;;
 
@@ -226,15 +229,17 @@ case "${1:-help}" in
         fi
 
         # ── 2. kickstart -k: launchd owns the lifecycle, start fresh ──────────
-        if ! launchctl print "gui/$uid/$SERVICE_LABEL" &>/dev/null 2>&1; then
-            echo "  ERROR: launchd service not loaded — run 'enable' first"
-            exit 1
+        if launchctl print "gui/$uid/$SERVICE_LABEL" &>/dev/null 2>&1; then
+            mkdir -p "$LOG_DIR" && touch "$LOG_STDOUT" "$LOG_STDERR"
+            LOG_POS=$(wc -l < "$LOG_STDOUT" | tr -d ' ')
+            ERR_POS=$(wc -l < "$LOG_STDERR" | tr -d ' ')
+            echo "  Kicking launchd..."
+            launchctl kickstart -k "gui/$uid/$SERVICE_LABEL" || true
+        else
+            # launchd not managing — fall back to direct start
+            echo "  launchd service not loaded — starting directly..."
+            _start_direct
         fi
-        mkdir -p "$LOG_DIR" && touch "$LOG_STDOUT" "$LOG_STDERR"
-        LOG_POS=$(wc -l < "$LOG_STDOUT" | tr -d ' ')
-        ERR_POS=$(wc -l < "$LOG_STDERR" | tr -d ' ')
-        echo "  Kicking launchd..."
-        launchctl kickstart -k "gui/$uid/$SERVICE_LABEL" || true
 
         # ── 3. Stream new log lines while polling /health ──────────────────────
         echo "  Waiting for /health:"
