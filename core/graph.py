@@ -27,6 +27,7 @@ import time
 from collections import deque
 
 import redis.asyncio as aioredis
+from redis.exceptions import ResponseError
 
 from .utils import decode_json, decode_bytes, force_str
 
@@ -297,8 +298,13 @@ async def traverse(
         if depth >= max_depth:
             continue
 
-        # Get neighbours from hash
-        raw_edges = await r.hgetall(_key_from_slug(slug))
+        # Get neighbours from hash; legacy keys are Sets (hgetall → WRONGTYPE).
+        # Synthesise empty edge payloads so they decode to the default edge type.
+        try:
+            raw_edges = await r.hgetall(_key_from_slug(slug))
+        except ResponseError:
+            members_raw = await r.smembers(_key_from_slug(slug))
+            raw_edges = {m: b"" for m in members_raw}
         for neighbour_raw, edge_raw in raw_edges.items():
             n_slug = force_str(neighbour_raw)
             if n_slug in visited:
@@ -344,8 +350,12 @@ async def get_related(
     for _ in range(depth):
         next_frontier: set[str] = set()
         for slug in frontier:
-            # Try Hash-based typed edges first (v1.1)
-            raw_edges = await r.hgetall(_key_from_slug(slug))
+            # Try Hash-based typed edges first (v1.1); legacy keys are Sets,
+            # and hgetall raises WRONGTYPE on a Set rather than returning {}.
+            try:
+                raw_edges = await r.hgetall(_key_from_slug(slug))
+            except ResponseError:
+                raw_edges = {}
             if raw_edges:
                 members = {
                     decode_bytes(k)
