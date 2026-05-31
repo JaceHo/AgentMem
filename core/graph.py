@@ -306,7 +306,7 @@ async def traverse(
             members_raw = await r.smembers(_key_from_slug(slug))
             raw_edges = {m: b"" for m in members_raw}
         for neighbour_raw, edge_raw in raw_edges.items():
-            n_slug = force_str(neighbour_raw)
+            n_slug = decode_bytes(neighbour_raw)
             if n_slug in visited:
                 continue
             try:
