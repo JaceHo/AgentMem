@@ -1438,7 +1438,12 @@ async def get_system_prompt() -> str:
 # ── ASGI app factories (used by main.py for HTTP/SSE mounting) ────────────────
 
 def build_mcp_app():
-    """Return a Starlette ASGI app for Streamable HTTP (MCP 2025-03-26)."""
+    """Return a Starlette ASGI app for Streamable HTTP (MCP 2025-03-26).
+
+    The app is mounted at ``/mcp`` in main.py, so the internal route must be
+    ``/`` — otherwise the default ``/mcp`` route doubles to ``/mcp/mcp``.
+    """
+    mcp.settings.streamable_http_path = "/"
     return mcp.streamable_http_app()
 
 

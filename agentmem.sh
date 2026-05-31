@@ -567,14 +567,14 @@ PYEOF
             fi
             # Also write project .mcp.json with HTTP transport
             _write_mcp_json "$HOME/.claude.json" "mcpServers" \
-                "{\"type\":\"http\",\"url\":\"$MCP_URL/mcp\"}"
+                "{\"type\":\"http\",\"url\":\"$MCP_URL/mcp/\"}"
             echo "      → Restart Claude Code to activate."
         }
 
         _setup_cursor() {
             echo "  [cursor] Writing .cursor/mcp.json (HTTP transport)..."
             _write_mcp_json "$HOME/.cursor/mcp.json" "mcpServers" \
-                "{\"url\":\"$MCP_URL/mcp\"}"
+                "{\"url\":\"$MCP_URL/mcp/\"}"
             echo "      → Reload Cursor MCP settings (Cmd+Shift+P → MCP: Reload)."
         }
 
@@ -588,7 +588,7 @@ PYEOF
         _setup_copilot() {
             echo "  [copilot] Writing ~/.config/Code/User/mcp.json (HTTP transport)..."
             _write_mcp_json "$HOME/.config/Code/User/mcp.json" "servers" \
-                "{\"type\":\"http\",\"url\":\"$MCP_URL/mcp\"}"
+                "{\"type\":\"http\",\"url\":\"$MCP_URL/mcp/\"}"
             echo "      → Run 'MCP: Enable Server (agentmem)' in VS Code Command Palette."
         }
 

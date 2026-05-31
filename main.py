@@ -305,7 +305,24 @@ async def lifespan(app: FastAPI):
     # Backfill crystallized sorted-set index from existing keys (idempotent, skips if populated)
     _spawn(_backfill_crystallized_index(_redis), "crystallize-index-backfill")
     log.info("AgentMem v%s ready (session-handoff+hard-prune+auto-graph+batch-MCP+compat+auto-crystallize)", APP_VERSION)
-    yield
+
+    # The MCP Streamable-HTTP transport is mounted as an ASGI sub-app, whose
+    # own lifespan is NOT propagated by Starlette/FastAPI mounts. Run its
+    # session manager here so the StreamableHTTPSessionManager task group is
+    # initialized — otherwise every /mcp request 500s ("Task group is not initialized").
+    _mcp_session_mgr = None
+    try:
+        from mcp_server import mcp as _mcp_srv
+        _mcp_session_mgr = getattr(_mcp_srv, "session_manager", None)
+    except Exception as _e:
+        log.info("MCP session manager unavailable: %s", _e)
+
+    if _mcp_session_mgr is not None:
+        async with _mcp_session_mgr.run():
+            log.info("MCP Streamable-HTTP session manager started")
+            yield
+    else:
+        yield
     # Cancel tracked background tasks before closing Redis
     global _shutting_down
     _shutting_down = True
