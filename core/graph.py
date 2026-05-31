@@ -605,15 +605,17 @@ async def get_entity_neighbors_with_counts(
                 edge = {"type": "related_to", "confidence": 0.5, "source_count": 1}
             parsed.append((slug, edge))
 
-        # Batch connection count lookups via pipeline
+        # Batch connection count lookups via pipeline. A neighbour key may be a
+        # legacy Set, so hlen raises WRONGTYPE; raise_on_error=False keeps the
+        # exception in the results list instead of aborting the whole batch.
         pipe = r.pipeline(transaction=False)
         for slug, _ in parsed:
             pipe.hlen(_key_from_slug(slug))
-        counts = await pipe.execute()
+        counts = await pipe.execute(raise_on_error=False)
 
         results = []
         for (slug, edge), n_edges in zip(parsed, counts):
-            if not n_edges:
+            if isinstance(n_edges, Exception) or not n_edges:
                 # Fallback: try legacy Set-based count
                 n_edges = await r.scard(_key_from_slug(slug))
             results.append({
