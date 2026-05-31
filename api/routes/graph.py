@@ -94,7 +94,7 @@ async def graph_neighbors(entity: str):
 async def graph_recall(req: GraphRecallRequest):
     """Retrieve facts from the knowledge graph neighbourhood of an entity."""
     emb = encode(req.entity)
-    facts = await graph_mod.entity_recall(state.redis, req.entity, emb, k=req.k)
+    facts = await graph_mod.entity_recall(state.redis, req.entity, emb, k=req.max_facts)
     return {
         "entity": req.entity,
         "facts": [{"content": f["content"], "score": f.get("score", 0.0)} for f in facts],
