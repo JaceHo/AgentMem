@@ -119,10 +119,11 @@ async def add_graph_edge(req: TypedEdgeRequest):
 async def graph_traverse(req: TraverseRequest):
     """Walk outward through typed edges for impact analysis."""
     results = await graph_mod.traverse(
-        state.redis, req.entity, req.relationship_types,
+        state.redis, req.start_entity,
+        [req.relation] if req.relation else None,
         req.max_depth, req.max_nodes,
     )
-    return {"entity": req.entity, "nodes": results, "count": len(results)}
+    return {"entity": req.start_entity, "nodes": results, "count": len(results)}
 
 
 @router.post("/facts/{element_id}/reinforce")
