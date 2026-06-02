@@ -3,8 +3,13 @@
 Uses a lazily-initialized shared httpx.AsyncClient to avoid creating and
 destroying a connection pool on every request. The client is created on
 first use and reused across all calls, reducing TCP/TLS handshake overhead.
+
+v1.1: Per-request timeout via asyncio.wait_for instead of shared client timeout.
+The shared client uses a generous max timeout; individual requests enforce
+their own deadline via asyncio.wait_for.
 """
 
+import asyncio
 import logging
 from typing import Any
 
@@ -13,22 +18,21 @@ import httpx
 log = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT = 10.0
+_MAX_CLIENT_TIMEOUT = 30.0
 
-# Shared client — lazily created on first use, reused across all calls.
-# Avoids per-request connection pool creation (TCP handshake + TLS for HTTPS).
 _shared_client: httpx.AsyncClient | None = None
 
 
-def _get_client(timeout: float = DEFAULT_TIMEOUT) -> httpx.AsyncClient:
+def _get_client() -> httpx.AsyncClient:
     """Return the shared AsyncClient, creating it on first call.
 
-    The client uses the maximum timeout seen so far, ensuring no request
-    is prematurely cut off. Connection pool limits prevent resource exhaustion.
+    The client uses a generous timeout (_MAX_CLIENT_TIMEOUT) as the upper bound.
+    Individual requests enforce their own deadline via asyncio.wait_for.
     """
     global _shared_client
     if _shared_client is None or _shared_client.is_closed:
         _shared_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(timeout),
+            timeout=httpx.Timeout(_MAX_CLIENT_TIMEOUT),
             limits=httpx.Limits(
                 max_connections=20,
                 max_keepalive_connections=10,
@@ -52,12 +56,21 @@ async def async_post_json(
     headers: dict | None = None,
     timeout: float = DEFAULT_TIMEOUT,
 ) -> dict | None:
-    """POST JSON and return parsed JSON result, or None on failure."""
+    """POST JSON and return parsed JSON result, or None on failure.
+
+    Uses asyncio.wait_for to enforce per-request timeout independently
+    of the shared client's timeout setting.
+    """
     try:
-        client = _get_client(timeout)
-        resp = await client.post(url, json=payload or {}, headers=headers)
+        client = _get_client()
+        resp = await asyncio.wait_for(
+            client.post(url, json=payload or {}, headers=headers),
+            timeout=timeout,
+        )
         resp.raise_for_status()
         return resp.json()
+    except asyncio.TimeoutError:
+        log.debug("[http] POST %s timed out (%.1fs)", url, timeout)
     except httpx.HTTPStatusError as exc:
         log.warning("[http] POST %s failed: %s", url, exc)
     except Exception as exc:
@@ -70,12 +83,21 @@ async def async_get_json(
     headers: dict | None = None,
     timeout: float = DEFAULT_TIMEOUT,
 ) -> dict | None:
-    """GET JSON and return parsed JSON result, or None on failure."""
+    """GET JSON and return parsed JSON result, or None on failure.
+
+    Uses asyncio.wait_for to enforce per-request timeout independently
+    of the shared client's timeout setting.
+    """
     try:
-        client = _get_client(timeout)
-        resp = await client.get(url, headers=headers)
+        client = _get_client()
+        resp = await asyncio.wait_for(
+            client.get(url, headers=headers),
+            timeout=timeout,
+        )
         resp.raise_for_status()
         return resp.json()
+    except asyncio.TimeoutError:
+        log.debug("[http] GET %s timed out (%.1fs)", url, timeout)
     except httpx.HTTPStatusError as exc:
         log.warning("[http] GET %s failed: %s", url, exc)
     except Exception as exc:

@@ -27,13 +27,14 @@ import logging
 
 from .http import async_post_json
 from .extractor import (
-    AISERV_URL, AISERV_KEY, _resolve_nlp_model, AISERV_FALLBACK_MODEL, _parse_llm_json,
+    AISERV_URL, AISERV_KEY, _resolve_nlp_model, _resolve_qa_model,
+    AISERV_FALLBACK_MODEL, _parse_llm_json,
 )
 
 log = logging.getLogger("mem")
 
 _PLAN_TIMEOUT_S = 8.0               # match extractor timeout for working models
-_PLAN_MAX_RETRIES = 1               # one retry only — keeps recall fast
+_PLAN_MAX_RETRIES = 3               # try up to 3 distinct models before giving up
 
 # Simple circuit breaker: models that failed recently are skipped for 5 minutes
 _model_fail_times: dict[str, float] = {}
@@ -55,13 +56,16 @@ async def _llm_call(prompt: str, system: str, max_tokens: int = 300) -> str | No
 
     exclude = None
     tried = []
-    # Try role-routed model first, then fall back to direct GLM-4.7-Flash
     models_to_try = []
     for _ in range(_PLAN_MAX_RETRIES):
         model, _ = await _resolve_nlp_model(exclude=exclude)
         if model not in models_to_try:
             models_to_try.append(model)
         exclude = model
+    # Also try QA role as additional fallback
+    qa_model, _ = await _resolve_qa_model()
+    if qa_model not in models_to_try:
+        models_to_try.append(qa_model)
     if AISERV_FALLBACK_MODEL not in models_to_try:
         models_to_try.append(AISERV_FALLBACK_MODEL)
 

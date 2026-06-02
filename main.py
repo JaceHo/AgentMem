@@ -222,7 +222,12 @@ async def _periodic_consolidate() -> None:
         try:
             card = await r.execute_command("VCARD", mem_store.FACT_KEY)
             if int(card or 0) > 5:
-                await _do_consolidate(r, _bm25_index, _spawn)
+                await asyncio.wait_for(
+                    _do_consolidate(r, _bm25_index, _spawn),
+                    timeout=180.0,
+                )
+        except asyncio.TimeoutError:
+            log.warning("[periodic_consolidate] timed out (180s limit)")
         except Exception as e:
             log.warning(f"[periodic_consolidate] error: {e}")
         prune_count = await _periodic_prune_counter.increment()

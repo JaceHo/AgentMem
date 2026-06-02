@@ -56,15 +56,25 @@ async def do_consolidate(
     Returns:
         Dict with decayed, merged, pruned counts and timing.
     """
+    _OVERALL_TIMEOUT_S = 120.0
+    _MAX_LLM_MERGES = 10
+
     t0 = time.time()
     now_ms = int(time.time() * 1000)
     NINETY_DAYS_MS = 90 * 86_400_000
 
-    scanned = await vscan(redis, mem_store.FACT_KEY, max_count=5000)
+    try:
+        scanned = await asyncio.wait_for(
+            vscan(redis, mem_store.FACT_KEY, max_count=5000),
+            timeout=30.0,
+        )
+    except asyncio.TimeoutError:
+        log.warning("[consolidate] vscan timed out")
+        return {"merged": 0, "decayed": 0, "pruned": 0, "ms": int((time.time() - t0) * 1000)}
+
     if not scanned:
         return {"merged": 0, "decayed": 0, "pruned": 0, "ms": 0}
 
-    # Filter only active (non-superseded) facts with content
     all_facts = [
         {"element": item["element"], "attrs": item["attrs"]}
         for item in scanned
@@ -122,6 +132,13 @@ async def do_consolidate(
     for idx, fact in enumerate(all_facts):
         if fact["element"] in superseded_elements:
             continue
+
+        if merged_count >= _MAX_LLM_MERGES:
+            break
+
+        if time.time() - t0 > _OVERALL_TIMEOUT_S:
+            log.warning("[consolidate] overall timeout reached, stopping merge phase")
+            break
 
         # In-memory cosine similarity (vectorized) — no Redis VSIM needed
         sims = emb_normed @ emb_normed[idx]
@@ -292,39 +309,51 @@ async def do_hard_prune(redis, bm25_index: BM25Index, spawn_fn) -> dict:
 
 
 async def llm_merge_facts(contents: list[str], spawn_fn=None) -> str | None:
-    """Use role-based routing to merge multiple similar facts into one."""
-    model, _ = await extractor._resolve_nlp_model()
+    """Use role-based routing to merge multiple similar facts into one.
 
-    facts_text = "\n".join(f"- {c}" for c in contents)
-    prompt = (
-        f"以下是关于同一主题的多条记忆，请合并为一条完整、准确的事实陈述。"
-        f"保留所有不同的细节，去除重复。输出仅包含合并后的一句话，不要解释。\n\n{facts_text}"
-    )
+    Tries up to 2 models with circuit-breaker awareness.
+    Falls back to longest content if all models fail.
+    """
+    tried = []
+    for attempt in range(2):
+        model, _ = await extractor._resolve_nlp_model(exclude=tried[-1] if tried else None)
+        if model in tried:
+            break
+        tried.append(model)
 
-    try:
-        data = await async_post_json(
-            extractor.AISERV_URL,
-            payload={
-                "model": model,
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 150,
-                "temperature": 0.1,
-            },
-            headers={"Authorization": f"Bearer {extractor.AISERV_KEY}"},
-            timeout=5.0,
+        if model in extractor._model_fail_times:
+            if time.time() - extractor._model_fail_times[model] < extractor._CIRCUIT_BREAKER_TTL:
+                continue
+            else:
+                del extractor._model_fail_times[model]
+
+        facts_text = "\n".join(f"- {c}" for c in contents)
+        prompt = (
+            f"以下是关于同一主题的多条记忆，请合并为一条完整、准确的事实陈述。"
+            f"保留所有不同的细节，去除重复。输出仅包含合并后的一句话，不要解释。\n\n{facts_text}"
         )
-        if data is not None:
+
+        try:
+            data = await async_post_json(
+                extractor.AISERV_URL,
+                payload={
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 150,
+                    "temperature": 0.1,
+                },
+                headers={"Authorization": f"Bearer {extractor.AISERV_KEY}"},
+                timeout=8.0,
+            )
+            if data is not None:
+                if spawn_fn:
+                    spawn_fn(extractor._report_quality(model, +1), "quality")
+                return data["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            log.warning(f"[consolidate] LLM merge {model} failed: {e}")
+            extractor._model_fail_times[model] = time.time()
             if spawn_fn:
-                spawn_fn(extractor._report_quality(model, +1), "quality")
-            return data["choices"][0]["message"]["content"].strip()
-    except httpx.TimeoutException:
-        log.warning("[consolidate] %s timed out", model)
-        if spawn_fn:
-            spawn_fn(extractor._report_quality(model, -1, reason="timeout"), "quality")
-    except Exception as e:
-        log.warning(f"[consolidate] LLM merge failed: {e}")
-        if spawn_fn:
-            spawn_fn(extractor._report_quality(model, -1, reason="other"), "quality")
+                spawn_fn(extractor._report_quality(model, -1, reason="other"), "quality")
 
     return max(contents, key=len)
 
