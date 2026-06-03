@@ -3,8 +3,8 @@
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>AgentMem</title>
-<link rel="stylesheet" href="/css/base.css">
-<link rel="stylesheet" href="/css/components.css">
+<link rel="stylesheet" href="/css/base.css?v=3">
+<link rel="stylesheet" href="/css/components.css?v=3">
 </head>
 <body>
 
@@ -69,23 +69,33 @@
 
   <!-- GRAPH -->
   <section id="p-graph" class="pane">
-    <div class="card" style="position:relative">
-      <div class="ch">Knowledge Graph <span id="ginfo" style="font-size:10px;color:var(--text3)"></span>
-        <div style="float:right;display:flex;gap:4px">
-          <input id="gq" placeholder="Search entities..." style="font-size:11px;padding:2px 6px;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);color:var(--text);width:160px">
-          <button class="btn sm pri" onclick="loadGraph()">Go</button>
-          <button class="btn sm" onclick="gZoom(1.2)">+</button>
-          <button class="btn sm" onclick="gZoom(.8)">-</button>
-          <button class="btn sm" onclick="gReset()">Reset</button>
-          <button class="btn sm" onclick="toggleGSidebar()">Filters</button>
-        </div>
+    <div class="card" style="position:relative;padding:0;overflow:hidden;border-radius:12px">
+      <!-- Header overlay -->
+      <div style="position:absolute;top:0;left:0;right:0;z-index:3;padding:12px 16px;background:linear-gradient(to bottom,var(--bg2) 0%,transparent 100%);pointer-events:none">
+        <span style="font-size:14px;font-weight:800;letter-spacing:.02em">Knowledge Graph</span>
+        <span id="ginfo" style="font-size:10px;color:var(--text3);margin-left:10px"></span>
       </div>
-      <canvas id="gcanvas" width="900" height="500" style="width:100%;border-radius:var(--radius);cursor:grab"></canvas>
-      <div id="glegend" style="display:flex;gap:12px;padding:6px 0;font-size:10px"></div>
+      <!-- Floating controls -->
+      <div class="g-float-controls">
+        <input id="gq" placeholder="Search entities..." onkeydown="if(event.key==='Enter')loadGraph()">
+        <button class="btn sm pri" onclick="loadGraph()">Go</button>
+        <div class="g-float-sep"></div>
+        <button class="btn sm" onclick="gZoom(1.3)" title="Zoom in (+)">+</button>
+        <button class="btn sm" onclick="gZoom(0.7)" title="Zoom out (-)">−</button>
+        <button class="btn sm" onclick="gFitAll()" title="Fit all (F)">Fit</button>
+        <button class="btn sm" onclick="gReset()" title="Reset view (R)">Reset</button>
+        <div class="g-float-sep"></div>
+        <button class="btn sm" onclick="toggleGSidebar()" title="Details panel">Panel</button>
+      </div>
+      <canvas id="gcanvas" width="900" height="550" style="width:100%;cursor:grab;display:block"></canvas>
+      <!-- Sidebar -->
       <div id="g-sidebar" class="sidebar">
-        <div style="font-size:10px;font-weight:bold;margin-bottom:6px;color:var(--text3);text-transform:uppercase;letter-spacing:.1em">Filters</div>
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+          <span style="font-size:10px;font-weight:800;color:var(--text2);text-transform:uppercase;letter-spacing:.1em">Details</span>
+          <button class="btn sm" onclick="toggleGSidebar()" style="padding:1px 6px;font-size:12px">&times;</button>
+        </div>
         <div id="g-filters"></div>
-        <div id="g-sidebar-info" style="margin-top:10px"></div>
+        <div id="g-sidebar-info" style="margin-top:8px"></div>
       </div>
     </div>
   </section>
@@ -242,20 +252,20 @@
 </div>
 
 <!-- ═══ JS MODULES ═══ -->
-<script src="/js/app.js"></script>
-<script src="/js/ws.js"></script>
-<script src="/js/dashboard.js"></script>
-<script src="/js/graph.js"></script>
-<script src="/js/memories.js"></script>
-<script src="/js/timeline.js"></script>
-<script src="/js/sessions.js"></script>
-<script src="/js/procedures.js"></script>
-<script src="/js/search.js"></script>
-<script src="/js/audit.js"></script>
-<script src="/js/activity.js"></script>
-<script src="/js/profile.js"></script>
-<script src="/js/replay.js"></script>
-<script src="/js/logs.js"></script>
-<script src="/js/api-ref.js"></script>
+<script src="/js/app.js?v=3"></script>
+<script src="/js/ws.js?v=3"></script>
+<script src="/js/dashboard.js?v=3"></script>
+<script src="/js/graph.js?v=3"></script>
+<script src="/js/memories.js?v=3"></script>
+<script src="/js/timeline.js?v=3"></script>
+<script src="/js/sessions.js?v=3"></script>
+<script src="/js/procedures.js?v=3"></script>
+<script src="/js/search.js?v=3"></script>
+<script src="/js/audit.js?v=3"></script>
+<script src="/js/activity.js?v=3"></script>
+<script src="/js/profile.js?v=3"></script>
+<script src="/js/replay.js?v=3"></script>
+<script src="/js/logs.js?v=3"></script>
+<script src="/js/api-ref.js?v=3"></script>
 </body>
 </html>

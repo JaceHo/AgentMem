@@ -32,7 +32,8 @@ async def graph_stats_endpoint():
 
 @router.get("/graph/nodes")
 async def graph_nodes_endpoint(limit: int = 60):
-    """Return top N most-connected entities with their edges for graph visualization."""
+    """Return top N most-connected entities with their edges for graph visualization.
+    Handles both Hash-based typed edges (v1.1) and legacy Set-based edges (v0.9.0)."""
     r = state.redis
     try:
         prefix = graph_mod.GRAPH_PREFIX
@@ -43,39 +44,78 @@ async def graph_nodes_endpoint(limit: int = 60):
         if not all_keys:
             return {"nodes": [], "edges": []}
 
+        # Get sizes — try hlen first (v1.1 Hash), fall back to scard (legacy Set)
         pipe = r.pipeline(transaction=False)
         for k in all_keys:
-            pipe.scard(k)
-        scards = await pipe.execute(raise_on_error=False)
+            pipe.hlen(k)
+        hlens = await pipe.execute(raise_on_error=False)
+
+        # For any key where hlen failed (WRONGTYPE) or returned 0, try scard
+        fallback_idx = [i for i, v in enumerate(hlens) if not isinstance(v, int) or v == 0]
+        if fallback_idx:
+            pipe = r.pipeline(transaction=False)
+            for i in fallback_idx:
+                pipe.scard(all_keys[i])
+            scards = await pipe.execute(raise_on_error=False)
+            for i, sc in zip(fallback_idx, scards):
+                if isinstance(sc, int) and sc > 0:
+                    hlens[i] = sc
 
         ranked = sorted(
-            [(k, int(sc) if isinstance(sc, int) else 0) for k, sc in zip(all_keys, scards)],
+            [(k, int(v) if isinstance(v, int) else 0) for k, v in zip(all_keys, hlens)],
             key=lambda x: x[1], reverse=True
         )[:limit]
 
         top_keys = [k for k, _ in ranked]
+
+        # Fetch edges — try hgetall (v1.1 Hash), fall back to smembers (legacy Set)
         pipe = r.pipeline(transaction=False)
         for k in top_keys:
-            pipe.smembers(k)
-        members_list = await pipe.execute(raise_on_error=False)
+            pipe.hgetall(k)
+        hgetall_results = await pipe.execute(raise_on_error=False)
+
+        # For any key where hgetall failed, try smembers
+        fallback_idx2 = [i for i, v in enumerate(hgetall_results) if not isinstance(v, (dict, set, list))]
+        if fallback_idx2:
+            pipe = r.pipeline(transaction=False)
+            for i in fallback_idx2:
+                pipe.smembers(top_keys[i])
+            smembers_results = await pipe.execute(raise_on_error=False)
+            for i, sm in zip(fallback_idx2, smembers_results):
+                hgetall_results[i] = sm
+
+        import json as _json
 
         nodes_out = []
         edges_out = []
         seen_edges: set[tuple] = set()
 
-        for (k, conn_count), members in zip(ranked, members_list):
+        for (k, conn_count), raw_edges in zip(ranked, hgetall_results):
             slug = k[len(prefix):]
             label = slug.replace("_", " ")
             nodes_out.append({"id": slug, "label": label, "connections": conn_count})
 
-            if not isinstance(members, (set, list)):
-                continue
-            for m in members:
-                nb = decode_bytes(m)
-                pair = (min(slug, nb), max(slug, nb))
-                if pair not in seen_edges:
-                    seen_edges.add(pair)
-                    edges_out.append({"source": slug, "target": nb, "type": "related_to"})
+            if isinstance(raw_edges, dict):
+                # Hash-based typed edges (v1.1)
+                for neighbour_raw, edge_raw in raw_edges.items():
+                    nb = decode_bytes(neighbour_raw)
+                    try:
+                        edge_data = _json.loads(decode_bytes(edge_raw))
+                        edge_type = edge_data.get("type", "related_to")
+                    except (ValueError, TypeError):
+                        edge_type = "related_to"
+                    pair = (min(slug, nb), max(slug, nb))
+                    if pair not in seen_edges:
+                        seen_edges.add(pair)
+                        edges_out.append({"source": slug, "target": nb, "type": edge_type})
+            elif isinstance(raw_edges, (set, list)):
+                # Legacy Set-based edges (v0.9.0)
+                for m in raw_edges:
+                    nb = decode_bytes(m)
+                    pair = (min(slug, nb), max(slug, nb))
+                    if pair not in seen_edges:
+                        seen_edges.add(pair)
+                        edges_out.append({"source": slug, "target": nb, "type": "related_to"})
 
         return {"nodes": nodes_out, "edges": edges_out}
     except Exception as e:

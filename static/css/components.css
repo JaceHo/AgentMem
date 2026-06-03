@@ -146,15 +146,19 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent);box-shadow:0 
 .kbd{display:inline-block;font-size:9px;padding:1px 4px;background:var(--bg4);border:1px solid var(--border2);border-radius:2px;font-family:var(--mono);color:var(--text2);line-height:1.3}
 
 /* Graph canvas */
-#gcanvas{background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);cursor:grab;display:block}
+#gcanvas{background:var(--bg);cursor:grab;display:block;border-radius:0 0 12px 12px}
 #gcanvas:active{cursor:grabbing}
-.gctrl{display:flex;gap:6px;margin-bottom:8px;align-items:center;flex-wrap:wrap}
-.ginfo{font-size:10px;color:var(--text2);display:flex;gap:10px;align-items:center}
-.glegend{display:flex;gap:8px;flex-wrap:wrap;margin-top:6px}
-.legi{display:flex;align-items:center;gap:3px;font-size:9px;color:var(--text2)}
-.legd{width:8px;height:8px;border-radius:50%}
-.graph-sidebar{position:absolute;right:0;top:0;bottom:0;width:240px;background:var(--bg2);border-left:1px solid var(--border);padding:12px;overflow-y:auto;z-index:5;transform:translateX(100%);transition:transform .2s}
-.graph-sidebar.open{transform:translateX(0)}
+
+/* Graph floating controls */
+.g-float-controls{position:absolute;top:10px;right:14px;z-index:4;display:flex;align-items:center;gap:5px;background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:5px 10px;backdrop-filter:blur(12px);box-shadow:0 4px 16px rgba(0,0,0,0.25);transition:box-shadow .2s}
+.g-float-controls:hover{box-shadow:0 6px 20px rgba(0,0,0,0.35)}
+.g-float-controls input{font-size:11px;padding:4px 10px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);width:160px;transition:border-color .15s}
+.g-float-controls input:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(79,195,247,.1)}
+.g-float-sep{width:1px;height:18px;background:var(--border);margin:0 3px}
+
+/* Graph sidebar */
+.sidebar{position:absolute;right:0;top:0;bottom:0;width:270px;background:var(--bg2);border-left:1px solid var(--border);padding:16px;overflow-y:auto;z-index:5;transform:translateX(100%);transition:transform .3s cubic-bezier(.4,0,.2,1);box-shadow:-6px 0 20px rgba(0,0,0,0.2)}
+.sidebar.open{transform:translateX(0)}
 
 /* Search result highlight */
 mark{background:rgba(79,195,247,.15);color:var(--accent);padding:0 2px;border-radius:2px}
