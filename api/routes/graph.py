@@ -34,6 +34,7 @@ async def graph_stats_endpoint():
 async def graph_nodes_endpoint(limit: int = 60):
     """Return top N most-connected entities with their edges for graph visualization.
     Handles both Hash-based typed edges (v1.1) and legacy Set-based edges (v0.9.0)."""
+    limit = max(1, min(limit, 200))
     r = state.redis
     try:
         prefix = graph_mod.GRAPH_PREFIX

@@ -222,6 +222,7 @@ async def record_tool_sequence(req: ToolSequenceRequest):
 @router.get("/tool-graph/{tool_name}")
 async def tool_graph(tool_name: str, k: int = 5):
     """Return top-k outgoing transitions from tool_name in the TIG."""
+    k = max(1, min(k, 50))
     r = state.redis
     elem_key = tool_name.lower().replace(" ", "_")[:64]
     try:

@@ -123,6 +123,9 @@ class BM25Index:
         self._rebuild_threshold: int = 10
         self._add_lock = asyncio.Lock()      # protects list append only
         self._rebuild_lock = asyncio.Lock()  # prevents duplicate concurrent rebuilds
+        # Versioned snapshot: _snap = (bm25_index, docs_list) always in sync.
+        # search() reads _snap once, so scores and docs can never diverge.
+        self._snap: tuple | None = None  # (bm25, docs_list) or None
 
     async def add(self, uid: str, content: str, attrs: dict) -> None:
         """Add a fact to the corpus. Triggers a background rebuild if threshold crossed."""
@@ -182,6 +185,8 @@ class BM25Index:
             # Atomic reference swap — readers see either old or new, never partial
             self._bm25 = new_bm25
             self._built_at_len = n
+            # Update snapshot atomically so search() always gets consistent (bm25, docs) pair
+            self._snap = (new_bm25, docs_snapshot)
 
     async def search(self, query: str, k: int = 10) -> list[dict]:
         """Return top-k facts by BM25 score. Non-blocking: reads current index snapshot."""
@@ -194,13 +199,16 @@ class BM25Index:
         if (self._bm25 is None or (n - self._built_at_len) >= self._rebuild_threshold) \
                 and not self._rebuild_lock.locked():
             asyncio.create_task(self._rebuild_async())
-        bm25 = self._bm25  # atomic reference read (GIL guarantees this)
-        if bm25 is None:
+
+        # Use consistent snapshot: bm25 index and docs list built from same data
+        snap = self._snap
+        if snap is None:
             return []
+        bm25, docs_snapshot = snap
+
         tokens = self._tokenize(query)
         if not tokens:
             return []
-        docs_snapshot = self._docs  # read current list reference
         scores = bm25.get_scores(tokens)
         top_idx = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:k * 2]
         results = []
@@ -243,6 +251,7 @@ class BM25Index:
         async with self._rebuild_lock:
             self._bm25 = None
             self._built_at_len = 0
+            self._snap = None
 
 
 async def populate_bm25_from_redis(r, bm25_index: BM25Index) -> None:

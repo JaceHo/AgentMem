@@ -290,7 +290,7 @@ async def admission_gate(user_text: str) -> bool:
         + 0.30 * content_type_prior
     )
 
-    gate_threshold = float(os.getenv("AMAC_THRESHOLD", "0.40"))
+    gate_threshold = settings.amac_threshold
     if score < gate_threshold:
         log.info(
             f"[store] admission gate filtered (score={score:.2f} "

@@ -91,7 +91,9 @@ async def do_consolidate(
         return {"merged": 0, "decayed": 0, "pruned": 0, "total": len(all_facts), "ms": 0}
 
     # ── Phase 1: Decay ────────────────────────────────────────────────────────
-    decayed_count = 0
+    # Batch decay: collect all changed attrs, then write via pipeline to
+    # avoid N individual Redis round-trips on large corpora.
+    decay_updates: list[tuple[str, str]] = []  # (element, json_attrs)
     for fact in all_facts:
         changed = False
         ts = fact["attrs"].get("ts", now_ms)
@@ -105,14 +107,26 @@ async def do_consolidate(
             fact["attrs"]["effective_confidence"] = eff_conf
             changed = True
         if changed:
-            try:
-                await redis.execute_command(
-                    "VSETATTR", mem_store.FACT_KEY, fact["element"],
-                    json.dumps(fact["attrs"])
-                )
-                decayed_count += 1
-            except Exception as e:
-                log.debug(f"[consolidate] decay VSETATTR failed: {e}")
+            decay_updates.append((fact["element"], json.dumps(fact["attrs"])))
+
+    decayed_count = 0
+    if decay_updates:
+        # Pipeline: batch all VSETATTR into one round-trip
+        try:
+            async with redis.pipeline(transaction=False) as pipe:
+                for elem, attrs_json in decay_updates:
+                    pipe.execute_command("VSETATTR", mem_store.FACT_KEY, elem, attrs_json)
+                await pipe.execute()
+            decayed_count = len(decay_updates)
+        except Exception as e:
+            log.warning(f"[consolidate] pipeline decay failed, falling back one-by-one: {e}")
+            # Fallback: individual writes
+            for elem, attrs_json in decay_updates:
+                try:
+                    await redis.execute_command("VSETATTR", mem_store.FACT_KEY, elem, attrs_json)
+                    decayed_count += 1
+                except Exception as ex:
+                    log.debug(f"[consolidate] decay VSETATTR failed: {ex}")
 
     # ── Phase 2: Merge ────────────────────────────────────────────────────────
     merged_count = 0

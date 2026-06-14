@@ -176,8 +176,9 @@ async def _get_client() -> httpx.AsyncClient:
 async def close_client() -> None:
     """Close the shared httpx client (called during app shutdown)."""
     global _shared_client
-    if _shared_client is not None and not _shared_client.is_closed:
-        await _shared_client.aclose()
+    async with _client_lock:
+        if _shared_client is not None and not _shared_client.is_closed:
+            await _shared_client.aclose()
         _shared_client = None
 
 

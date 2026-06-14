@@ -207,8 +207,14 @@ async def session_by_commit(sha: str = ""):
     return result
 
 
+def _clamp(v: int, lo: int, hi: int) -> int:
+    """Clamp integer parameter to safe bounds."""
+    return max(lo, min(hi, v))
+
+
 @router.get("/commits")
 async def commits(branch: str = "", repo: str = "", limit: int = 20):
+    limit = _clamp(limit, 1, 200)
     r = state.redis
     _, keys = await r.scan(match="mem:commit:*", count=limit)
     if not keys:
@@ -413,6 +419,7 @@ async def compress_file(filePath: str = ""):
 
 @router.get("/sessions")
 async def compat_sessions(limit: int = 20):
+    limit = _clamp(limit, 1, 200)
     r = state.redis
     _, ctx_keys = await r.scan(match="mem:session:*:ctx", count=500)
     if not ctx_keys:
@@ -440,6 +447,7 @@ async def compat_sessions(limit: int = 20):
 
 @router.get("/observations")
 async def compat_observations(sessionId: str = "", limit: int = 20):
+    limit = _clamp(limit, 1, 200)
     r = state.redis
     seed = np.zeros(embedder._get_provider().dims, dtype=np.float32)
     card = await r.execute_command("VCARD", mem_store.EPISODE_KEY)
@@ -669,6 +677,7 @@ async def compat_import(req: ImportRequest, request: Request):
 
 
 async def _list_memories(limit: int = 50, category: str = "") -> dict:
+    limit = _clamp(limit, 1, 500)
     """Shared logic for listing memories."""
     r = state.redis
     seed = np.zeros(embedder._get_provider().dims, dtype=np.float32)
@@ -701,6 +710,7 @@ async def _list_memories(limit: int = 50, category: str = "") -> dict:
 
 @router.get("/memories")
 async def compat_memories(limit: int = 50, category: str = ""):
+    limit = _clamp(limit, 1, 500)
     return await _list_memories(limit=limit, category=category)
 
 
@@ -723,16 +733,18 @@ async def memory_detail(memory_id: str):
     except Exception:
         pass
 
-    return {"error": "memory not found", "id": memory_id}
+    raise HTTPException(status_code=404, detail=f"memory not found: {memory_id}")
 
 
 @router.get("/semantic")
 async def compat_semantic(limit: int = 50):
+    limit = _clamp(limit, 1, 500)
     return await _list_memories(limit=limit)
 
 
 @router.get("/procedural")
 async def compat_procedural(limit: int = 50):
+    limit = _clamp(limit, 1, 500)
     r = state.redis
     seed = np.zeros(embedder._get_provider().dims, dtype=np.float32)
     card = await r.execute_command("VCARD", mem_store.PROC_KEY)
