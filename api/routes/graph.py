@@ -2,7 +2,7 @@
 
 import logging
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 
 from api import state
 from api.schemas.graph import (
@@ -22,12 +22,12 @@ async def graph_stats_endpoint():
     """Return knowledge graph statistics: node count and edge count."""
     r = state.redis
     if r is None:
-        return {"nodes": 0, "edges": 0, "total_nodes": 0, "total_edges": 0, "error": "Redis not ready"}
+        raise HTTPException(status_code=503, detail="Redis not ready")
     try:
         return await graph_mod.graph_stats(r)
     except Exception as e:
         log.error(f"[graph/stats] {e}")
-        return {"nodes": 0, "edges": 0, "total_nodes": 0, "total_edges": 0, "error": str(e)}
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/graph/nodes")
@@ -120,7 +120,7 @@ async def graph_nodes_endpoint(limit: int = 60):
         return {"nodes": nodes_out, "edges": edges_out}
     except Exception as e:
         log.error(f"[graph/nodes] {e}")
-        return {"nodes": [], "edges": [], "error": str(e)}
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/graph/{entity}")
@@ -182,7 +182,7 @@ async def get_fact_confidence(element_id: str):
     try:
         raw = await r.execute_command("VGETATTR", mem_store.FACT_KEY, element_id)
         if not raw:
-            return {"error": "not_found", "element_id": element_id}
+            raise HTTPException(status_code=404, detail="fact not found")
         attrs = decode_attrs(raw)
         eff = mem_store.confidence_decay(attrs)
         return {
@@ -196,5 +196,7 @@ async def get_fact_confidence(element_id: str):
             "superseded_by": attrs.get("superseded_by", ""),
             "superseded_reason": attrs.get("superseded_reason", ""),
         }
+    except HTTPException:
+        raise
     except Exception as e:
-        return {"error": str(e), "element_id": element_id}
+        raise HTTPException(status_code=500, detail=str(e))

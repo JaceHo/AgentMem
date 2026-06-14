@@ -1,6 +1,6 @@
 """Health, stats, and config endpoints."""
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 
 from api import state
 from config.settings import settings
@@ -32,7 +32,7 @@ async def livez():
 async def stats():
     r = state.redis
     if r is None:
-        return {"error": "Redis not connected"}
+        raise HTTPException(status_code=503, detail="Redis not connected")
     try:
         counts = await state.mem_store.vcard(r)
         persona_raw = await r.hgetall("mem:persona")
@@ -64,7 +64,7 @@ async def stats():
 
         return counts
     except Exception as e:
-        return {"error": str(e)}
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/config")

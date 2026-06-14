@@ -67,6 +67,7 @@ async def admin_delete_facts_by_content(pattern: str = "Always send a report"):
         content = attrs.get("content", "")
         if pattern.lower() in content.lower():
             await r.execute_command("VREM", mem_store.FACT_KEY, elem_str)
+            await state.bm25_index.remove({elem_str})
             deleted += 1
     return {"deleted": deleted, "pattern": pattern}
 
@@ -76,7 +77,8 @@ async def provide_feedback(req: FeedbackRequest):
     """User rates memory relevance (1-5 stars). Adjusts importance and confidence."""
     r = state.redis
     if req.rating < 1 or req.rating > 5:
-        return {"error": "rating must be 1-5"}
+        from fastapi.exceptions import HTTPException
+        raise HTTPException(status_code=400, detail="rating must be 1-5")
 
     try:
         attrs = await mem_store.get_attrs(r, mem_store.FACT_KEY, req.element_id)
@@ -128,7 +130,8 @@ async def provide_feedback(req: FeedbackRequest):
 
     except Exception as e:
         log.error(f"[feedback] error processing feedback: {e}")
-        return {"error": str(e)}
+        from fastapi.exceptions import HTTPException
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/facts/{element_id}/pin")
@@ -150,7 +153,8 @@ async def pin_fact(element_id: str):
 
     except Exception as e:
         log.error(f"[pin] error pinning fact: {e}")
-        return {"error": str(e)}
+        from fastapi.exceptions import HTTPException
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.delete("/facts/{element_id}")
@@ -167,14 +171,15 @@ async def delete_fact(element_id: str):
         await r.execute_command("VREM", mem_store.FACT_KEY, element_id)
 
         # Incremental BM25 update instead of full reset
-        await state.bm25_index.remove(element_id)
+        await state.bm25_index.remove({element_id})
 
         log.info(f"[delete] user-deleted fact {element_id}: {content_preview}")
         return {"status": "ok", "element_id": element_id, "action": "hard_deleted"}
 
     except Exception as e:
         log.error(f"[delete] error deleting fact: {e}")
-        return {"error": str(e)}
+        from fastapi.exceptions import HTTPException
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/facts/{element_id}/metadata")
@@ -209,7 +214,8 @@ async def get_fact_metadata(element_id: str):
         }
 
     except Exception as e:
-        return {"error": str(e), "element_id": element_id}
+        from fastapi.exceptions import HTTPException
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/lifecycle/stats")

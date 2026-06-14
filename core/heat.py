@@ -9,6 +9,7 @@ Stored per-element in Redis VSETATTR JSON:
   { "access_count": int, "last_accessed": unix_ms, ... }
 """
 
+import asyncio
 import math
 import time
 

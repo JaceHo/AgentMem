@@ -343,8 +343,11 @@ async def lifespan(app: FastAPI):
     await state.task_manager.shutdown(timeout=settings.bg_task_shutdown_timeout)
     from core.http import close_client
     await close_client()
-    from mcp_server import close_client as _mcp_close_client
-    await _mcp_close_client()
+    try:
+        from mcp_server import close_client as _mcp_close_client
+        await _mcp_close_client()
+    except ImportError:
+        pass  # mcp package not installed — nothing to close
     await mem_store.close_pool()
 
 

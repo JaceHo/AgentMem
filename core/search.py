@@ -5,6 +5,7 @@ Extracted from main.py to provide reusable search primitives across route module
 """
 
 import asyncio
+import logging
 import re
 from functools import lru_cache
 
@@ -12,6 +13,8 @@ import numpy as np
 
 from core import embedder
 from core.utils import decode_bytes, decode_attrs
+
+log = logging.getLogger("mem")
 
 try:
     from rank_bm25 import BM25Okapi as _BM25Okapi

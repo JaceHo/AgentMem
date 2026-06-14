@@ -4,7 +4,7 @@ import json
 import logging
 import time
 
-from fastapi import APIRouter, BackgroundTasks
+from fastapi import APIRouter, BackgroundTasks, HTTPException
 
 from api import state
 from api.schemas.capability import (
@@ -189,14 +189,14 @@ async def tool_feedback(req: ToolFeedbackRequest):
     try:
         raw = await r.execute_command("VGETATTR", cap_mod.TOOL_KEY, elem_key)
     except Exception:
-        return {"ok": False, "reason": "redis error"}
+        raise HTTPException(status_code=503, detail="redis error")
     if not raw:
-        return {"ok": False, "reason": "tool not found"}
+        raise HTTPException(status_code=404, detail="tool not found")
 
     try:
         attrs = decode_attrs(raw)
     except Exception:
-        return {"ok": False, "reason": "parse error"}
+        raise HTTPException(status_code=500, detail="parse error")
 
     if req.success:
         attrs["success_count"] = attrs.get("success_count", 0) + 1
@@ -216,7 +216,7 @@ async def tool_feedback(req: ToolFeedbackRequest):
     try:
         await r.execute_command("VSETATTR", cap_mod.TOOL_KEY, elem_key, json.dumps(attrs))
     except Exception as e:
-        return {"ok": False, "reason": str(e)}
+        raise HTTPException(status_code=500, detail=str(e))
 
     log.debug(f"[tool-feedback] {elem_key} success={req.success} "
               f"s={attrs.get('success_count',0)} f={attrs.get('fail_count',0)}")
@@ -369,7 +369,7 @@ async def procedure_feedback(req: ProcedureFeedbackRequest):
             "COUNT", 3, "WITHSCORES", "WITHATTRIBS"
         )
     except Exception:
-        return {"ok": False, "reason": "redis error"}
+        raise HTTPException(status_code=503, detail="redis error")
 
     best_elem = None
     best_score = 0.0
@@ -392,7 +392,7 @@ async def procedure_feedback(req: ProcedureFeedbackRequest):
             best_score = s; best_elem = elem_str; best_attrs = attrs
 
     if not best_elem or best_score < 0.50:
-        return {"ok": False, "reason": "no matching procedure found", "best_score": best_score}
+        raise HTTPException(status_code=404, detail="no matching procedure found")
 
     if req.success:
         best_attrs["success_count"] = best_attrs.get("success_count", 0) + 1
@@ -402,7 +402,7 @@ async def procedure_feedback(req: ProcedureFeedbackRequest):
     try:
         await r.execute_command("VSETATTR", mem_store.PROC_KEY, best_elem, json.dumps(best_attrs))
     except Exception as e:
-        return {"ok": False, "reason": str(e)}
+        raise HTTPException(status_code=500, detail=str(e))
 
     log.debug(f"[proc-feedback] {best_elem[:40]} success={req.success} score={best_score:.2f}")
     return {
