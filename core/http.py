@@ -11,7 +11,6 @@ their own deadline via asyncio.wait_for.
 
 import asyncio
 import logging
-from typing import Any
 
 import httpx
 
@@ -21,18 +20,26 @@ DEFAULT_TIMEOUT = 10.0
 _MAX_CLIENT_TIMEOUT = 30.0
 
 _shared_client: httpx.AsyncClient | None = None
+_client_lock = asyncio.Lock()
 
 
-def _get_client() -> httpx.AsyncClient:
+async def _get_client() -> httpx.AsyncClient:
     """Return the shared AsyncClient, creating it on first call.
 
     The client uses a generous timeout (_MAX_CLIENT_TIMEOUT) as the upper bound.
     Individual requests enforce their own deadline via asyncio.wait_for.
     Production-tuned connection pool: 100 max connections, 20 keepalive,
     60s keepalive expiry for long-running services.
+
+    Uses asyncio.Lock to prevent race condition where two coroutines
+    both see _shared_client as None and create duplicate clients.
     """
     global _shared_client
-    if _shared_client is None or _shared_client.is_closed:
+    if _shared_client is not None and not _shared_client.is_closed:
+        return _shared_client
+    async with _client_lock:
+        if _shared_client is not None and not _shared_client.is_closed:
+            return _shared_client
         _shared_client = httpx.AsyncClient(
             timeout=httpx.Timeout(_MAX_CLIENT_TIMEOUT),
             limits=httpx.Limits(
@@ -64,7 +71,7 @@ async def async_post_json(
     of the shared client's timeout setting.
     """
     try:
-        client = _get_client()
+        client = await _get_client()
         resp = await asyncio.wait_for(
             client.post(url, json=payload or {}, headers=headers),
             timeout=timeout,
@@ -91,7 +98,7 @@ async def async_get_json(
     of the shared client's timeout setting.
     """
     try:
-        client = _get_client()
+        client = await _get_client()
         resp = await asyncio.wait_for(
             client.get(url, headers=headers),
             timeout=timeout,

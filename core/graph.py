@@ -638,7 +638,10 @@ async def get_entity_neighbors_with_counts(
         return results
 
     # Fallback: legacy Set-based edges (v0.9.0)
-    related_slugs_raw = await r.smembers(_key(entity))
+    try:
+        related_slugs_raw = await r.smembers(_key(entity))
+    except ResponseError:
+        related_slugs_raw = set()
     related_slugs = [
         decode_bytes(m) for m in related_slugs_raw
     ]

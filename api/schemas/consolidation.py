@@ -22,7 +22,7 @@ class CompressSessionRequest(BaseModel):
 
 class FeedbackRequest(BaseModel):
     element_id: str
-    rating: int              # -1 (negative) | 0 (neutral) | 1 (positive)
+    rating: int              # 1-5 stars (1-2: negative, 3: neutral, 4-5: positive)
     reason: str = ""
     comment: str = ""
 

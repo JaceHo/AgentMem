@@ -156,11 +156,16 @@ mcp = FastMCP(
 # httpx.AsyncClient with connection pooling is significantly faster for
 # repeated calls (MCP tools call the backend frequently).
 _shared_client: httpx.AsyncClient | None = None
+_client_lock = asyncio.Lock()
 
 
 async def _get_client() -> httpx.AsyncClient:
     global _shared_client
-    if _shared_client is None or _shared_client.is_closed:
+    if _shared_client is not None and not _shared_client.is_closed:
+        return _shared_client
+    async with _client_lock:
+        if _shared_client is not None and not _shared_client.is_closed:
+            return _shared_client
         _shared_client = httpx.AsyncClient(
             timeout=httpx.Timeout(TIMEOUT),
             limits=httpx.Limits(max_connections=50, max_keepalive_connections=10, keepalive_expiry=30),
