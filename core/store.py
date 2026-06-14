@@ -30,6 +30,7 @@ Redis 8 vectorset API summary:
   VSETATTR key element <json>   — FILTER expr: .field == "value"
 """
 
+import asyncio
 import json
 import logging
 import math
@@ -101,6 +102,44 @@ local new_json = cjson.encode(attrs)
 redis.call('VSETATTR', key, elem, new_json)
 return 1
 """
+
+_FEEDBACK_LUA = """
+local key = KEYS[1]
+local elem = ARGV[1]
+local action = ARGV[2]
+local rating = tonumber(ARGV[3])
+local now_ms = ARGV[4]
+local comment = ARGV[5]
+
+local raw = redis.call('VGETATTR', key, elem)
+if not raw then return 0 end
+
+local ok, attrs = pcall(cjson.decode, raw)
+if not ok or type(attrs) ~= 'table' then return 0 end
+
+attrs['user_rating'] = rating
+attrs['user_rating_ts'] = tonumber(now_ms)
+
+if comment and comment ~= '' then
+    attrs['user_comment'] = comment
+end
+
+if action == 'boost' then
+    local old_imp = attrs['importance'] or 0.5
+    attrs['importance'] = math.min(1.0, old_imp * 1.2)
+elseif action == 'reduce' then
+    local old_imp = attrs['importance'] or 0.5
+    attrs['importance'] = math.max(0.05, old_imp * 0.7)
+    attrs['needs_review'] = true
+end
+
+local new_json = cjson.encode(attrs)
+redis.call('VSETATTR', key, elem, new_json)
+return 1
+"""
+
+_feedback_script = None
+_feedback_script_lock = asyncio.Lock()
 
 _REINFORCE_LUA = """
 local key = KEYS[1]
@@ -741,3 +780,42 @@ async def get_attrs(r: aioredis.Redis, vset: str, element_id: str) -> dict | Non
 async def set_attrs(r: aioredis.Redis, vset: str, element_id: str, attrs: dict) -> None:
     """Encode and write VSETATTR for an element."""
     await r.execute_command("VSETATTR", vset, element_id, json.dumps(attrs, ensure_ascii=False))
+
+
+async def atomic_feedback(
+    r: aioredis.Redis,
+    element_id: str,
+    action: str,
+    rating: int,
+    comment: str = "",
+) -> dict | None:
+    """Atomic feedback: adjust importance + record rating in a single Lua call.
+
+    Prevents race conditions when two concurrent feedback requests hit the same fact.
+
+    Args:
+        action: "boost" (rating 4-5), "reduce" (rating 1-2), or "neutral" (rating 3)
+        rating: 1-5 star rating
+        comment: optional user comment
+
+    Returns:
+        Updated attrs dict, or None if element not found.
+    """
+    global _feedback_script
+    now_ms = int(time.time() * 1000)
+    try:
+        if _feedback_script is None:
+            async with _feedback_script_lock:
+                if _feedback_script is None:
+                    _feedback_script = r.register_script(_FEEDBACK_LUA)
+        result = await _feedback_script(
+            keys=[FACT_KEY],
+            args=[element_id, action, str(rating), str(now_ms), comment[:500]],
+        )
+        if int(result) != 1:
+            return None
+        # Read back the updated attrs
+        return await get_attrs(r, FACT_KEY, element_id)
+    except Exception as e:
+        log.warning("atomic_feedback Lua failed for %s: %s", element_id, e)
+        return None

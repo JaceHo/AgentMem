@@ -1,8 +1,6 @@
 """Capability routes — tools, environment, procedures, TIG, AWO, MACLA."""
 
-import json
 import logging
-import time
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 
@@ -17,7 +15,7 @@ from core import persona as persona_mod
 from core import scene as scene_mod
 from core import store as mem_store
 from core.search import encode
-from core.utils import decode_bytes, decode_attrs
+from core.utils import decode_bytes
 
 log = logging.getLogger("mem")
 router = APIRouter(tags=["capability"])
@@ -186,37 +184,10 @@ async def tool_feedback(req: ToolFeedbackRequest):
     """Record success/failure for a tool invocation (ToolMem)."""
     r = state.redis
     elem_key = req.tool_name.lower().replace(" ", "_").replace("/", "_")[:64]
-    try:
-        raw = await r.execute_command("VGETATTR", cap_mod.TOOL_KEY, elem_key)
-    except Exception:
-        raise HTTPException(status_code=503, detail="redis error")
-    if not raw:
+
+    attrs = await cap_mod.atomic_tool_feedback(r, elem_key, req.success)
+    if not attrs:
         raise HTTPException(status_code=404, detail="tool not found")
-
-    try:
-        attrs = decode_attrs(raw)
-    except Exception:
-        raise HTTPException(status_code=500, detail="parse error")
-
-    if req.success:
-        attrs["success_count"] = attrs.get("success_count", 0) + 1
-    else:
-        attrs["fail_count"] = attrs.get("fail_count", 0) + 1
-    attrs["use_count"] = attrs.get("use_count", 0) + 1
-
-    total = attrs.get("success_count", 0) + attrs.get("fail_count", 0)
-    if total >= 5:
-        rate = attrs.get("success_count", 0) / total
-        if   rate >= 0.85: quality = "reliable"
-        elif rate >= 0.60: quality = "mostly reliable"
-        elif rate >= 0.40: quality = "mixed"
-        else:              quality = "often fails"
-        attrs["capability_summary"] = f"{quality} ({attrs.get('success_count',0)}/{total}✓)"
-
-    try:
-        await r.execute_command("VSETATTR", cap_mod.TOOL_KEY, elem_key, json.dumps(attrs))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
     log.debug(f"[tool-feedback] {elem_key} success={req.success} "
               f"s={attrs.get('success_count',0)} f={attrs.get('fail_count',0)}")

@@ -81,52 +81,43 @@ async def provide_feedback(req: FeedbackRequest):
         raise HTTPException(status_code=400, detail="rating must be 1-5")
 
     try:
-        attrs = await mem_store.get_attrs(r, mem_store.FACT_KEY, req.element_id)
-        if not attrs:
+        if req.rating >= 4:
+            action = "boost"
+        elif req.rating <= 2:
+            action = "reduce"
+        else:
+            action = "neutral"
+
+        old_attrs = await mem_store.get_attrs(r, mem_store.FACT_KEY, req.element_id)
+        if not old_attrs:
             return {"status": "not_found", "element_id": req.element_id}
 
+        old_importance = old_attrs.get("importance", 0.5)
+
+        updated = await mem_store.atomic_feedback(
+            r, req.element_id, action, req.rating, req.comment or ""
+        )
+        if not updated:
+            return {"status": "not_found", "element_id": req.element_id}
+
+        # Also reinforce on positive feedback (resets Ebbinghaus decay)
         if req.rating >= 4:
-            old_importance = attrs.get("importance", 0.5)
-            attrs["importance"] = min(1.0, old_importance * 1.2)
-            attrs["user_rating"] = req.rating
-            attrs["user_rating_ts"] = int(time.time() * 1000)
-            if req.comment:
-                attrs["user_comment"] = req.comment[:500]
             await mem_store.reinforce_fact(r, req.element_id, source=f"user_feedback_{req.rating}")
-            await mem_store.set_attrs(r, mem_store.FACT_KEY, req.element_id, attrs)
-            log.info(f"[feedback] positive rating {req.rating}/5 for {req.element_id}, "
-                    f"importance {old_importance:.2f} → {attrs['importance']:.2f}")
-            return {
-                "status": "ok", "element_id": req.element_id,
-                "new_importance": attrs["importance"], "action": "boosted_and_reinforced"
-            }
 
-        elif req.rating <= 2:
-            old_importance = attrs.get("importance", 0.5)
-            attrs["importance"] = max(0.05, old_importance * 0.7)
-            attrs["user_rating"] = req.rating
-            attrs["user_rating_ts"] = int(time.time() * 1000)
-            attrs["needs_review"] = True
-            if req.comment:
-                attrs["user_comment"] = req.comment[:500]
-            await mem_store.set_attrs(r, mem_store.FACT_KEY, req.element_id, attrs)
-            log.info(f"[feedback] negative rating {req.rating}/5 for {req.element_id}, "
-                    f"importance {old_importance:.2f} → {attrs['importance']:.2f}")
-            return {
-                "status": "ok", "element_id": req.element_id,
-                "new_importance": attrs["importance"], "action": "reduced_and_flagged_for_review"
-            }
+        new_importance = updated.get("importance", old_importance)
+        log.info(f"[feedback] {action} rating {req.rating}/5 for {req.element_id}, "
+                f"importance {old_importance:.2f} → {new_importance:.2f}")
 
-        else:
-            attrs["user_rating"] = req.rating
-            attrs["user_rating_ts"] = int(time.time() * 1000)
-            if req.comment:
-                attrs["user_comment"] = req.comment[:500]
-            await mem_store.set_attrs(r, mem_store.FACT_KEY, req.element_id, attrs)
-            return {
-                "status": "ok", "element_id": req.element_id,
-                "action": "recorded_neutral_rating"
-            }
+        action_label = {
+            "boost": "boosted_and_reinforced",
+            "reduce": "reduced_and_flagged_for_review",
+            "neutral": "recorded_neutral_rating",
+        }[action]
+
+        return {
+            "status": "ok", "element_id": req.element_id,
+            "new_importance": new_importance, "action": action_label,
+        }
 
     except Exception as e:
         log.error(f"[feedback] error processing feedback: {e}")

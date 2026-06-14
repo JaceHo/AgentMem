@@ -25,7 +25,6 @@ Redis keys:
 
 import json
 import time
-from typing import Optional
 
 import redis.asyncio as aioredis
 
@@ -35,6 +34,44 @@ from .utils import decode_json, decode_bytes, force_str
 TOOL_KEY   = "mem:tools"
 ENV_KEY    = "mem:env"
 AGENT_KEY  = "mem:agent"
+
+# ── Atomic tool-feedback Lua script ────────────────────────────────────────────
+_TOOL_FEEDBACK_LUA = """
+local key = KEYS[1]
+local elem = ARGV[1]
+local success = ARGV[2] == '1'
+
+local raw = redis.call('VGETATTR', key, elem)
+if not raw then return 0 end
+
+local ok, attrs = pcall(cjson.decode, raw)
+if not ok or type(attrs) ~= 'table' then return 0 end
+
+if success then
+    attrs['success_count'] = (attrs['success_count'] or 0) + 1
+else
+    attrs['fail_count'] = (attrs['fail_count'] or 0) + 1
+end
+attrs['use_count'] = (attrs['use_count'] or 0) + 1
+
+local total = (attrs['success_count'] or 0) + (attrs['fail_count'] or 0)
+if total >= 5 then
+    local rate = (attrs['success_count'] or 0) / total
+    local quality
+    if rate >= 0.85 then quality = 'reliable'
+    elseif rate >= 0.60 then quality = 'mostly reliable'
+    elseif rate >= 0.40 then quality = 'mixed'
+    else quality = 'often fails'
+    end
+    attrs['capability_summary'] = quality .. ' (' .. (attrs['success_count'] or 0) .. '/' .. total .. '\\xe2\\x9c\\x93)'
+end
+
+local new_json = cjson.encode(attrs)
+redis.call('VSETATTR', key, elem, new_json)
+return 1
+"""
+
+_tool_feedback_script = None
 
 
 # ── Tool categories ────────────────────────────────────────────────────────────
@@ -194,12 +231,12 @@ async def recall_tools(
 
         # Bump use_count (fire-and-forget)
         import asyncio
-        asyncio.create_task(_bump_use_count(r, elem_str, attrs))
+        asyncio.create_task(_bump_use_count(r, elem_str))
 
     return tools
 
 
-async def _bump_use_count(r: aioredis.Redis, element: str, attrs: dict) -> None:
+async def _bump_use_count(r: aioredis.Redis, element: str) -> None:
     """Atomically increment use_count for a tool element.
 
     Uses the same atomic Lua script as heat.bump_heat to avoid
@@ -409,3 +446,32 @@ def format_tool_context(tools: list[dict], max_tools: int = 8,
     if tig_hints:
         lines.append(f"- *Frequent next tools*: {', '.join(tig_hints)}")
     return "\n".join(lines)
+
+
+async def atomic_tool_feedback(r: aioredis.Redis, elem_key: str, success: bool) -> dict | None:
+    """Atomic tool feedback: increment success/fail counters in a single Lua call.
+
+    Prevents race conditions when two concurrent feedback requests hit the same tool.
+
+    Returns:
+        Updated attrs dict, or None if tool not found.
+    """
+    global _tool_feedback_script
+    try:
+        if _tool_feedback_script is None:
+            _tool_feedback_script = r.register_script(_TOOL_FEEDBACK_LUA)
+        result = await _tool_feedback_script(
+            keys=[TOOL_KEY],
+            args=[elem_key, "1" if success else "0"],
+        )
+        if int(result) != 1:
+            return None
+        # Read back the updated attrs
+        raw = await r.execute_command("VGETATTR", TOOL_KEY, elem_key)
+        if not raw:
+            return None
+        return decode_json(raw)
+    except Exception as e:
+        import logging
+        logging.getLogger("mem").warning("atomic_tool_feedback Lua failed for %s: %s", elem_key, e)
+        return None

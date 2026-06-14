@@ -17,7 +17,7 @@ services:
       --save 60 1000
       --appendonly yes
       --maxmemory 1536mb
-      --maxmemory-policy allkeys-lru
+      --maxmemory-policy noeviction
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -35,6 +35,13 @@ services:
       - "127.0.0.1:18800:18800"
     environment:
       - REDIS_URL=redis://redis:6379
+      - AGENTMEM_API_KEY=${AGENTMEM_API_KEY:-}
+      - AGENTMEM_LLM_API_KEY=${AGENTMEM_LLM_API_KEY:-}
+      - AGENTMEM_LLM_BASE_URL=${AGENTMEM_LLM_BASE_URL:-}
+      - AGENTMEM_LLM_PROVIDER=${AGENTMEM_LLM_PROVIDER:-}
+      - AGENTMEM_LOG_LEVEL=${AGENTMEM_LOG_LEVEL:-INFO}
+      - AGENTMEM_AMAC_THRESHOLD=${AGENTMEM_AMAC_THRESHOLD:-0.40}
+      - AGENTMEM_BG_TASK_LIMIT=${AGENTMEM_BG_TASK_LIMIT:-50}
     depends_on:
       redis:
         condition: service_healthy
