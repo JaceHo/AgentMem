@@ -351,9 +351,11 @@ async def llm_merge_facts(contents: list[str], spawn_fn=None) -> str | None:
                 timeout=8.0,
             )
             if data is not None:
-                if spawn_fn:
-                    spawn_fn(extractor._report_quality(model, +1), "quality")
-                return data["choices"][0]["message"]["content"].strip()
+                content = data["choices"][0]["message"].get("content")
+                if content and content.strip():
+                    if spawn_fn:
+                        spawn_fn(extractor._report_quality(model, +1), "quality")
+                    return content.strip()
         except Exception as e:
             log.warning(f"[consolidate] LLM merge {model} failed: {e}")
             extractor.mark_model_failed(model)

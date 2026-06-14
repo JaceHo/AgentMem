@@ -100,8 +100,10 @@ async def summarize(text: str) -> str:
         if data is not None:
             choices = data.get("choices", [])
             if choices:
-                asyncio.create_task(_report_quality(model, +1))
-                return choices[0]["message"]["content"].strip()
+                content = choices[0]["message"].get("content")
+                if content and content.strip():
+                    asyncio.create_task(_report_quality(model, +1))
+                    return content.strip()
     except Exception as e:
         log.debug("[summarizer] %s failed: %s", model, e)
         asyncio.create_task(_report_quality(model, -1, reason="other"))
@@ -148,8 +150,10 @@ async def overwrite_update(
         if data is not None:
             choices = data.get("choices", [])
             if choices:
-                asyncio.create_task(_report_quality(model, +1))
-                return choices[0]["message"]["content"].strip()
+                content = choices[0]["message"].get("content")
+                if content and content.strip():
+                    asyncio.create_task(_report_quality(model, +1))
+                    return content.strip()
     except Exception as e:
         log.debug("[summarizer:overwrite] %s failed: %s", model, e)
         asyncio.create_task(_report_quality(model, -1, reason="other"))

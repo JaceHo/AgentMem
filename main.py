@@ -1566,11 +1566,13 @@ async def answer(req: AnswerRequest):
                 timeout=20.0,
             )
             if data is not None:
-                raw = data["choices"][0]["message"]["content"].strip()
-                answer = _parse_answer_raw(raw)
-                if answer:
-                    _spawn(extractor._report_quality(model, +1), "quality")
-                    return {"answer": answer}
+                raw_content = data["choices"][0]["message"].get("content")
+                if raw_content and raw_content.strip():
+                    raw = raw_content.strip()
+                    answer = _parse_answer_raw(raw)
+                    if answer:
+                        _spawn(extractor._report_quality(model, +1), "quality")
+                        return {"answer": answer}
             exclude = model
         except httpx.TimeoutException:
             log.warning("[answer] %s timed out (attempt %d)", model, attempt + 1)

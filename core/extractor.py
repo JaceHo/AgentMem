@@ -474,7 +474,13 @@ async def _llm_extract(conversation_text: str) -> list[ExtractedFact]:
                 exclude = model
                 continue
 
-            raw = data["choices"][0]["message"]["content"].strip()
+            raw_content = data["choices"][0]["message"].get("content")
+            if not raw_content or not raw_content.strip():
+                log.warning("[extractor] %s returned null content, trying next", model)
+                mark_model_failed(model)
+                exclude = model
+                continue
+            raw = raw_content.strip()
             items = _parse_llm_json(raw)
 
             if not isinstance(items, list):
