@@ -29,7 +29,7 @@ from collections import deque
 import redis.asyncio as aioredis
 from redis.exceptions import ResponseError
 
-from .utils import decode_json, decode_bytes, force_str
+from .utils import decode_json, decode_bytes
 
 log = logging.getLogger(__name__)
 

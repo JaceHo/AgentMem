@@ -1,6 +1,6 @@
 """API schemas for capability (tool/env/procedure) endpoints."""
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class ToolDefinition(BaseModel):
@@ -12,7 +12,7 @@ class ToolDefinition(BaseModel):
 
 
 class RegisterToolsRequest(BaseModel):
-    tools: list[ToolDefinition]
+    tools: list[ToolDefinition] = Field(max_length=100)
     agent_id: str = ""                  # optional agent identifier
     replace_all: bool = False           # if True, clear existing tools first
 

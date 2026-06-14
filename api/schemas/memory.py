@@ -2,7 +2,7 @@
 
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class RecallRequest(BaseModel):
@@ -27,6 +27,6 @@ class Message(BaseModel):
 
 
 class StoreRequest(BaseModel):
-    messages: list[Message]
+    messages: list[Message] = Field(max_length=50)
     session_id: str = ""
     metadata: dict[str, Any] | None = None
