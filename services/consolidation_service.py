@@ -65,11 +65,18 @@ async def do_consolidate(
     try:
         scanned = await asyncio.wait_for(
             vscan(redis, mem_store.FACT_KEY, max_count=5000),
-            timeout=30.0,
+            timeout=60.0,
         )
     except asyncio.TimeoutError:
-        log.warning("[consolidate] vscan timed out")
-        return {"merged": 0, "decayed": 0, "pruned": 0, "ms": int((time.time() - t0) * 1000)}
+        log.warning("[consolidate] vscan timed out (60s), retrying with smaller batch")
+        try:
+            scanned = await asyncio.wait_for(
+                vscan(redis, mem_store.FACT_KEY, max_count=2000),
+                timeout=30.0,
+            )
+        except asyncio.TimeoutError:
+            log.error("[consolidate] vscan timed out again, skipping consolidation")
+            return {"merged": 0, "decayed": 0, "pruned": 0, "ms": int((time.time() - t0) * 1000)}
 
     if not scanned:
         return {"merged": 0, "decayed": 0, "pruned": 0, "ms": 0}

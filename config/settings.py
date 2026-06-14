@@ -45,7 +45,7 @@ class Settings(BaseSettings):
         description="Embedding provider: local, openai, huggingface"
     )
     embedding_model: str = Field(
-        default="sentence-transformers/all-MiniLM-L12-v2",
+        default="sentence-transformers/all-MiniLM-L6-v2",
         description="Model name for embeddings"
     )
     

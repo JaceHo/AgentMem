@@ -357,19 +357,20 @@ async def get_related(
         for slug in frontier:
             # Try Hash-based typed edges first (v1.1); legacy keys are Sets,
             # and hgetall raises WRONGTYPE on a Set rather than returning {}.
+            members: set[str] = set()
             try:
                 raw_edges = await r.hgetall(_key_from_slug(slug))
+                if raw_edges:
+                    members = {decode_bytes(k) for k in raw_edges.keys()}
             except ResponseError:
-                raw_edges = {}
-            if raw_edges:
-                members = {
-                    decode_bytes(k)
-                    for k in raw_edges.keys()
-                }
-            else:
-                # Fallback: legacy Set-based edges (v0.9.0)
-                members_raw = await r.smembers(_key_from_slug(slug))
-                members = {decode_bytes(m) for m in members_raw}
+                # WRONGTYPE: key is a legacy Set, fall back to smembers
+                try:
+                    members_raw = await r.smembers(_key_from_slug(slug))
+                    members = {decode_bytes(m) for m in members_raw}
+                except Exception:
+                    pass
+            except Exception:
+                pass
             next_frontier |= members - visited - frontier
         visited |= frontier
         frontier = next_frontier
@@ -402,7 +403,11 @@ async def entity_recall(
     """
     from . import store as mem_store
 
-    related = await get_related(r, entity, depth=1)
+    try:
+        related = await get_related(r, entity, depth=1)
+    except Exception as e:
+        log.warning("entity_recall: get_related failed for %s: %s", entity, e)
+        return []
     if not related:
         return []
 

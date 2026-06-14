@@ -6,6 +6,7 @@ from pydantic import BaseModel
 class CompactRequest(BaseModel):
     session_id: str = ""
     force: bool = False
+    threshold_chars: int = 3000
 
 
 class AnswerRequest(BaseModel):

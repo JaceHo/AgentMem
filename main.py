@@ -1971,9 +1971,12 @@ async def recall(req: RecallRequest):
                 graph_mod.entity_recall(_get_redis(), ent, emb, k=2)
                 for ent in graph_ents
             ]
-            graph_results = await asyncio.gather(*graph_tasks)
+            graph_results = await asyncio.gather(*graph_tasks, return_exceptions=True)
             seen_contents = {f["content"] for f in facts}
             for batch in graph_results:
+                if isinstance(batch, Exception):
+                    log.warning("[recall] graph recall failed: %s", batch)
+                    continue
                 for gf in batch:
                     if gf["content"] not in seen_contents:
                         facts.append(gf)
