@@ -166,9 +166,8 @@ async def delete_fact(element_id: str):
 
         await r.execute_command("VREM", mem_store.FACT_KEY, element_id)
 
-        await state.bm25_index.reset()
-        from core.search import populate_bm25_from_redis
-        state.spawn(populate_bm25_from_redis(r, state.bm25_index), "bm25-rebuild-after-delete")
+        # Incremental BM25 update instead of full reset
+        await state.bm25_index.remove(element_id)
 
         log.info(f"[delete] user-deleted fact {element_id}: {content_preview}")
         return {"status": "ok", "element_id": element_id, "action": "hard_deleted"}

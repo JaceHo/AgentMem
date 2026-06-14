@@ -8,6 +8,7 @@ import os
 import time
 
 from fastapi import Request
+from fastapi.exceptions import HTTPException
 
 
 def compat_sid(req) -> str:
@@ -15,15 +16,15 @@ def compat_sid(req) -> str:
     return req.sessionId or req.session_id or f"ses_{int(time.time())}"
 
 
-def check_auth(request: Request) -> dict | None:
+def check_auth(request: Request) -> None:
     """Check AGENTMEMORY_SECRET bearer token if configured.
 
-    Returns None on success, or an error dict on failure.
+    Raises HTTPException(401) on auth failure.  Returns None on success.
     """
     secret = os.getenv("AGENTMEMORY_SECRET", "")
     if not secret:
         return None
     auth = request.headers.get("authorization", "")
     if auth != f"Bearer {secret}":
-        return {"status_code": 401, "error": "unauthorized"}
+        raise HTTPException(status_code=401, detail="unauthorized")
     return None

@@ -41,6 +41,24 @@ _model_fail_times: dict[str, float] = {}
 _CIRCUIT_BREAKER_TTL = 300  # seconds
 
 
+def _is_model_broken(model: str) -> bool:
+    """Check if a model is in circuit-breaker cooldown."""
+    import time as _time
+    fail_time = _model_fail_times.get(model)
+    if fail_time is None:
+        return False
+    if _time.time() - fail_time > _CIRCUIT_BREAKER_TTL:
+        del _model_fail_times[model]
+        return False
+    return True
+
+
+def _mark_model_failed(model: str) -> None:
+    """Record that a model failed, tripping its circuit breaker."""
+    import time as _time
+    _model_fail_times[model] = _time.time()
+
+
 async def _llm_call(prompt: str, system: str, max_tokens: int = 300) -> str | None:
     """Call LLM via aiserv role-based routing. Returns raw text or None on failure.
 
@@ -70,7 +88,7 @@ async def _llm_call(prompt: str, system: str, max_tokens: int = 300) -> str | No
         models_to_try.append(AISERV_FALLBACK_MODEL)
 
     # Filter out circuit-broken models
-    models_to_try = [m for m in models_to_try if m not in _model_fail_times]
+    models_to_try = [m for m in models_to_try if not _is_model_broken(m)]
 
     if not models_to_try:
         log.debug("[planner] all models circuit-broken, skipping planning")
@@ -100,7 +118,7 @@ async def _llm_call(prompt: str, system: str, max_tokens: int = 300) -> str | No
                 if content:
                     return content
         log.warning("[planner] %s returned no usable response", model)
-        _model_fail_times[model] = _time.time()  # trip circuit breaker
+        _mark_model_failed(model)  # trip circuit breaker
     log.warning("[planner] All models exhausted (%s)", ", ".join(tried))
     return None
 

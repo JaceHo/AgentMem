@@ -72,6 +72,7 @@ return 1
 """
 
 _bump_script = None  # cached Script object
+_bump_script_lock = asyncio.Lock()  # protects _bump_script initialization
 
 
 async def atomic_bump(
@@ -89,7 +90,9 @@ async def atomic_bump(
     now_ms = int(time.time() * 1000)
     try:
         if _bump_script is None:
-            _bump_script = r.register_script(_BUMP_HEAT_LUA)
+            async with _bump_script_lock:
+                if _bump_script is None:
+                    _bump_script = r.register_script(_BUMP_HEAT_LUA)
         await _bump_script(
             keys=[vset_key],
             args=[element, str(now_ms), count_field, time_field],

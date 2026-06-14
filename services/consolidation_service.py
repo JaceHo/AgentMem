@@ -322,11 +322,8 @@ async def llm_merge_facts(contents: list[str], spawn_fn=None) -> str | None:
             break
         tried.append(model)
 
-        if model in extractor._model_fail_times:
-            if time.time() - extractor._model_fail_times[model] < extractor._CIRCUIT_BREAKER_TTL:
-                continue
-            else:
-                del extractor._model_fail_times[model]
+        if extractor.is_model_circuit_broken(model):
+            continue
 
         facts_text = "\n".join(f"- {c}" for c in contents)
         prompt = (
@@ -352,7 +349,7 @@ async def llm_merge_facts(contents: list[str], spawn_fn=None) -> str | None:
                 return data["choices"][0]["message"]["content"].strip()
         except Exception as e:
             log.warning(f"[consolidate] LLM merge {model} failed: {e}")
-            extractor._model_fail_times[model] = time.time()
+            extractor.mark_model_failed(model)
             if spawn_fn:
                 spawn_fn(extractor._report_quality(model, -1, reason="other"), "quality")
 

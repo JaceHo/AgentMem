@@ -168,6 +168,14 @@ async def _get_client() -> httpx.AsyncClient:
     return _shared_client
 
 
+async def close_client() -> None:
+    """Close the shared httpx client (called during app shutdown)."""
+    global _shared_client
+    if _shared_client is not None and not _shared_client.is_closed:
+        await _shared_client.aclose()
+        _shared_client = None
+
+
 async def _post(path: str, payload: dict) -> dict:
     client = await _get_client()
     resp = await client.post(f"{BASE_URL}{path}", json=payload)

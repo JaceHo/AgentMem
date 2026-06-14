@@ -20,6 +20,20 @@ except ImportError:
 REST_URL = os.getenv("AGENTMEMORY_URL", "http://localhost:18800")
 SECRET = os.getenv("AGENTMEMORY_SECRET", "")
 
+# Module-level sync client — reused within a single hook invocation.
+# Each hook script is a separate process, so this doesn't leak across runs.
+_client: httpx.Client | None = None
+
+
+def _get_client() -> httpx.Client:
+    global _client
+    if _client is None or _client.is_closed:
+        _client = httpx.Client(
+            timeout=5.0,
+            limits=httpx.Limits(max_connections=4, max_keepalive_connections=2),
+        )
+    return _client
+
 
 def _auth_headers() -> dict[str, str]:
     headers = {"Content-Type": "application/json"}
@@ -56,7 +70,8 @@ def current_session_id(data: dict | None, default: str = "unknown") -> str:
 
 def post(path: str, payload: dict, timeout: float = 3.0) -> httpx.Response | None:
     try:
-        return httpx.post(f"{REST_URL}{path}", json=payload, headers=_auth_headers(), timeout=timeout)
+        client = _get_client()
+        return client.post(f"{REST_URL}{path}", json=payload, headers=_auth_headers(), timeout=timeout)
     except Exception:
         return None
 

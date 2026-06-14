@@ -33,9 +33,7 @@ router = APIRouter(tags=["compat"])
 
 @router.post("/session/start")
 async def compat_session_start(req: CompatSessionStartRequest, request: Request):
-    auth_err = _compat_check_auth(request)
-    if auth_err:
-        return auth_err
+    _compat_check_auth(request)
 
     r = state.redis
     sid = _compat_sid(req)
@@ -67,9 +65,7 @@ async def compat_session_start(req: CompatSessionStartRequest, request: Request)
 @router.post("/session/end")
 async def compat_session_end(req: CompatSessionEndRequest, request: Request,
                               background_tasks: BackgroundTasks):
-    auth_err = _compat_check_auth(request)
-    if auth_err:
-        return auth_err
+    _compat_check_auth(request)
 
     sid = _compat_sid(req)
 
@@ -85,9 +81,7 @@ async def compat_session_end(req: CompatSessionEndRequest, request: Request,
 
 @router.post("/observe")
 async def observe(req: ObserveRequest, request: Request, background_tasks: BackgroundTasks):
-    auth_err = _compat_check_auth(request)
-    if auth_err:
-        return auth_err
+    _compat_check_auth(request)
 
     sid = _compat_sid(req)
     project = req.project or req.cwd or ""
@@ -107,9 +101,7 @@ async def observe(req: ObserveRequest, request: Request, background_tasks: Backg
 @router.post("/summarize")
 async def compat_summarize(req: SummarizeRequest, request: Request,
                             background_tasks: BackgroundTasks):
-    auth_err = _compat_check_auth(request)
-    if auth_err:
-        return auth_err
+    _compat_check_auth(request)
 
     sid = _compat_sid(req)
 
@@ -125,9 +117,7 @@ async def compat_summarize(req: SummarizeRequest, request: Request,
 
 @router.post("/enrich")
 async def enrich(req: EnrichRequest, request: Request):
-    auth_err = _compat_check_auth(request)
-    if auth_err:
-        return auth_err
+    _compat_check_auth(request)
 
     r = state.redis
     files = req.files or []
@@ -157,9 +147,7 @@ async def enrich(req: EnrichRequest, request: Request):
 
 @router.post("/context")
 async def compat_context(req: ContextRequest, request: Request):
-    auth_err = _compat_check_auth(request)
-    if auth_err:
-        return auth_err
+    _compat_check_auth(request)
 
     r = state.redis
     sid = _compat_sid(req)
@@ -189,9 +177,7 @@ async def compat_context(req: ContextRequest, request: Request):
 
 @router.post("/session/commit")
 async def compat_session_commit(req: SessionCommitRequest, request: Request):
-    auth_err = _compat_check_auth(request)
-    if auth_err:
-        return auth_err
+    _compat_check_auth(request)
 
     r = state.redis
     sid = _compat_sid(req)
@@ -251,9 +237,7 @@ async def commits(branch: str = "", repo: str = "", limit: int = 20):
 
 @router.post("/claude-bridge/sync")
 async def claude_bridge_sync(req: ClaudeBridgeSyncRequest, request: Request):
-    auth_err = _compat_check_auth(request)
-    if auth_err:
-        return auth_err
+    _compat_check_auth(request)
 
     r = state.redis
     sid = _compat_sid(req)
@@ -289,9 +273,7 @@ async def claude_bridge_sync(req: ClaudeBridgeSyncRequest, request: Request):
 
 @router.post("/consolidate-pipeline")
 async def compat_consolidate_pipeline(request: Request, background_tasks: BackgroundTasks):
-    auth_err = _compat_check_auth(request)
-    if auth_err:
-        return auth_err
+    _compat_check_auth(request)
 
     async def _do_consolidate_compat():
         try:
@@ -306,17 +288,13 @@ async def compat_consolidate_pipeline(request: Request, background_tasks: Backgr
 
 @router.post("/crystals/auto")
 async def crystals_auto(request: Request):
-    auth_err = _compat_check_auth(request)
-    if auth_err:
-        return auth_err
+    _compat_check_auth(request)
     return {"status": "ok", "crystals": []}
 
 
 @router.post("/search")
 async def compat_search(req: SearchRequest, request: Request):
-    auth_err = _compat_check_auth(request)
-    if auth_err:
-        return auth_err
+    _compat_check_auth(request)
 
     r = state.redis
     sid = _compat_sid(req)
@@ -361,9 +339,7 @@ async def compat_search(req: SearchRequest, request: Request):
 
 @router.post("/remember")
 async def compat_remember(req: RememberRequest, request: Request):
-    auth_err = _compat_check_auth(request)
-    if auth_err:
-        return auth_err
+    _compat_check_auth(request)
 
     r = state.redis
     content = req.content
@@ -383,9 +359,7 @@ async def compat_remember(req: RememberRequest, request: Request):
 
 @router.post("/forget")
 async def compat_forget(req: ForgetRequest, request: Request):
-    auth_err = _compat_check_auth(request)
-    if auth_err:
-        return auth_err
+    _compat_check_auth(request)
 
     r = state.redis
     emb = encode(req.query)
@@ -501,9 +475,7 @@ async def compat_observations(sessionId: str = "", limit: int = 20):
 
 @router.post("/file-context")
 async def file_context(req: FileContextRequest, request: Request):
-    auth_err = _compat_check_auth(request)
-    if auth_err:
-        return auth_err
+    _compat_check_auth(request)
 
     r = state.redis
     files = [f.strip() for f in req.files.split(",") if f.strip()]
@@ -528,9 +500,7 @@ async def file_context(req: FileContextRequest, request: Request):
 
 @router.post("/patterns")
 async def compat_patterns(req: PatternsRequest, request: Request):
-    auth_err = _compat_check_auth(request)
-    if auth_err:
-        return auth_err
+    _compat_check_auth(request)
 
     r = state.redis
     query = req.query or "recurring patterns"
@@ -553,9 +523,7 @@ async def compat_patterns(req: PatternsRequest, request: Request):
 
 @router.post("/smart-search")
 async def smart_search(req: SmartSearchRequest, request: Request):
-    auth_err = _compat_check_auth(request)
-    if auth_err:
-        return auth_err
+    _compat_check_auth(request)
 
     r = state.redis
     emb = encode(req.query)
@@ -575,9 +543,7 @@ async def smart_search(req: SmartSearchRequest, request: Request):
 
 @router.post("/timeline")
 async def compat_timeline(req: TimelineRequest, request: Request):
-    auth_err = _compat_check_auth(request)
-    if auth_err:
-        return auth_err
+    _compat_check_auth(request)
 
     r = state.redis
     seed = np.zeros(embedder._get_provider().dims, dtype=np.float32)
@@ -660,9 +626,7 @@ async def compat_export():
 
 @router.post("/import")
 async def compat_import(req: ImportRequest, request: Request):
-    auth_err = _compat_check_auth(request)
-    if auth_err:
-        return auth_err
+    _compat_check_auth(request)
 
     r = state.redis
     data = req.data

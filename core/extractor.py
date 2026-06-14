@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -171,6 +172,27 @@ LLM_MAX_RETRIES = 3
 _model_fail_times: dict[str, float] = {}
 _CIRCUIT_BREAKER_TTL = 300  # seconds
 LLM_MAX_INPUT = 3000   # chars of conversation to send to LLM
+
+
+def is_model_circuit_broken(model: str) -> bool:
+    """Check if a model is currently in circuit-breaker cooldown."""
+    fail_time = _model_fail_times.get(model)
+    if fail_time is None:
+        return False
+    if time.time() - fail_time > _CIRCUIT_BREAKER_TTL:
+        del _model_fail_times[model]
+        return False
+    return True
+
+
+def mark_model_failed(model: str) -> None:
+    """Record that a model failed, tripping its circuit breaker."""
+    _model_fail_times[model] = time.time()
+
+
+def clear_model_circuit(model: str) -> None:
+    """Remove a model from circuit-breaker cooldown (e.g. after it recovers)."""
+    _model_fail_times.pop(model, None)
 
 
 async def _resolve_nlp_model(exclude: Optional[str] = None) -> tuple[str, str]:
@@ -418,7 +440,7 @@ async def _llm_extract(conversation_text: str) -> list[ExtractedFact]:
         del _model_fail_times[m]
 
     # Filter out circuit-broken models
-    candidate_models = [(m, t) for m, t in candidate_models if m not in _model_fail_times]
+    candidate_models = [(m, t) for m, t in candidate_models if not is_model_circuit_broken(m)]
     if not candidate_models:
         log.warning("[extractor] all models circuit-broken, falling back to regex-only")
         return []
@@ -448,7 +470,7 @@ async def _llm_extract(conversation_text: str) -> list[ExtractedFact]:
             )
             if data is None:
                 log.warning("[extractor] %s returned no data", model)
-                _model_fail_times[model] = _time.time()
+                mark_model_failed(model)
                 exclude = model
                 continue
 
@@ -457,7 +479,7 @@ async def _llm_extract(conversation_text: str) -> list[ExtractedFact]:
 
             if not isinstance(items, list):
                 log.warning("[extractor] %s returned non-list, trying next", model)
-                _model_fail_times[model] = _time.time()
+                mark_model_failed(model)
                 exclude = model
                 continue
 
@@ -550,7 +572,7 @@ async def _llm_extract(conversation_text: str) -> list[ExtractedFact]:
         except httpx.TimeoutException:
             log.warning("[extractor] %s timed out (%.1fs)", model, timeout_s)
             exclude = model
-            _model_fail_times[model] = _time.time()
+            mark_model_failed(model)
             # Self-healing: push -1 + reason="timeout" back to aiserv. The
             # reason field triggers aiserv to (a) urgently re-probe this
             # route and (b) write a synthetic failed ProbeResult so the
@@ -561,7 +583,7 @@ async def _llm_extract(conversation_text: str) -> list[ExtractedFact]:
                 "[extractor] %s failed: %s: %s", model, type(e).__name__, e
             )
             exclude = model
-            _model_fail_times[model] = _time.time()
+            mark_model_failed(model)
             asyncio.create_task(_report_quality(model, -1, reason="other"))
 
     log.warning(
