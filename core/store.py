@@ -280,6 +280,9 @@ def _get_pool() -> aioredis.ConnectionPool:
             REDIS_URL,
             decode_responses=False,
             max_connections=50,
+            socket_timeout=10,
+            socket_connect_timeout=5,
+            retry_on_timeout=True,
         )
     return _pool
 

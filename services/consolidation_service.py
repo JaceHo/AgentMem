@@ -134,111 +134,120 @@ async def do_consolidate(
 
     # Batch-encode all fact contents off the event loop to avoid blocking
     fact_contents = [f["attrs"]["content"] for f in all_facts]
-    fact_vecs = await asyncio.to_thread(encode_batch, fact_contents)
-    fact_embeddings: dict[str, np.ndarray] = {
-        f["element"]: vec for f, vec in zip(all_facts, fact_vecs)
-    }
-
-    # Pre-compute normalized embedding matrix for fast cosine similarity
-    # (avoids O(n) knn_search calls — uses numpy vectorized ops instead)
-    elem_order = [f["element"] for f in all_facts]
-    emb_matrix = np.stack([fact_embeddings[e] for e in elem_order]).astype(np.float32)
-    norms = np.linalg.norm(emb_matrix, axis=1, keepdims=True)
-    norms = np.maximum(norms, 1e-8)  # avoid division by zero
-    emb_normed = emb_matrix / norms
-
-    fact_by_element: dict[str, dict] = {f["element"]: f for f in all_facts}
-
-    for idx, fact in enumerate(all_facts):
-        if fact["element"] in superseded_elements:
-            continue
-
-        if merged_count >= _MAX_LLM_MERGES:
-            break
-
-        if time.time() - t0 > _OVERALL_TIMEOUT_S:
-            log.warning("[consolidate] overall timeout reached, stopping merge phase")
-            break
-
-        # In-memory cosine similarity (vectorized) — no Redis VSIM needed
-        sims = emb_normed @ emb_normed[idx]
-        # Get top-k similar indices (excluding self)
-        top_indices = np.argsort(sims)[::-1]
-        cluster = [fact]
-        fact_ts = fact["attrs"].get("ts", 0)
-
-        for sim_idx in top_indices[:10]:  # check top 10 candidates
-            if sim_idx == idx:
-                continue
-            sim_elem = elem_order[sim_idx]
-            if sim_elem in superseded_elements:
-                continue
-
-            cosine_sim = float(sims[sim_idx])
-            s_fact = fact_by_element.get(sim_elem)
-            s_ts = s_fact["attrs"].get("ts", 0) if s_fact else 0
-
-            days_between = abs(fact_ts - s_ts) / 86_400_000
-            temporal_factor = math.exp(-temporal_lambda * days_between)
-            affinity = cosine_sim * temporal_factor
-
-            if affinity >= similarity_threshold and s_fact:
-                cluster.append(s_fact)
-
-        if len(cluster) < 2:
-            continue
-
-        contents = [c["attrs"]["content"] for c in cluster]
-        merged_content = await llm_merge_facts(contents, spawn_fn=spawn_fn)
-        if not merged_content:
-            continue
-
-        cluster.sort(
-            key=lambda c: (c["attrs"].get("importance", 0.5), c["attrs"].get("ts", 0)),
-            reverse=True
+    try:
+        fact_vecs = await asyncio.wait_for(
+            asyncio.to_thread(encode_batch, fact_contents),
+            timeout=30.0,
         )
-        keeper = cluster[0]
-        keeper_element = keeper["element"]
+    except (asyncio.TimeoutError, Exception) as e:
+        log.warning(f"[consolidate] encode_batch failed ({type(e).__name__}: {e}), skipping merge phase")
+        fact_vecs = None
 
-        new_attrs = dict(keeper["attrs"])
-        new_attrs["content"] = merged_content[:500]
-        new_attrs["access_count"] = max(c["attrs"].get("access_count", 0) for c in cluster)
-        new_attrs["importance"] = max(c["attrs"].get("importance", 0.5) for c in cluster)
-        new_attrs["consolidated_from"] = len(cluster)
-        new_attrs["source_count"] = sum(c["attrs"].get("source_count", 1) for c in cluster)
-        new_attrs["last_confirmed_ts"] = int(time.time() * 1000)
-        new_attrs["version"] = keeper["attrs"].get("version", 1) + 1
+    if fact_vecs is not None:
+        fact_embeddings: dict[str, np.ndarray] = {
+            f["element"]: vec for f, vec in zip(all_facts, fact_vecs)
+        }
 
-        all_kw: set[str] = set()
-        all_persons: set[str] = set()
-        all_entities: set[str] = set()
-        for c in cluster:
-            all_kw.update(c["attrs"].get("keywords", []))
-            all_persons.update(c["attrs"].get("persons", []))
-            all_entities.update(c["attrs"].get("entities", []))
-        if all_kw:
-            new_attrs["keywords"] = list(all_kw)[:10]
-        if all_persons:
-            new_attrs["persons"] = list(all_persons)[:5]
-        if all_entities:
-            new_attrs["entities"] = list(all_entities)[:5]
+        # Pre-compute normalized embedding matrix for fast cosine similarity
+        # (avoids O(n) knn_search calls — uses numpy vectorized ops instead)
+        elem_order = [f["element"] for f in all_facts]
+        emb_matrix = np.stack([fact_embeddings[e] for e in elem_order]).astype(np.float32)
+        norms = np.linalg.norm(emb_matrix, axis=1, keepdims=True)
+        norms = np.maximum(norms, 1e-8)  # avoid division by zero
+        emb_normed = emb_matrix / norms
 
-        m_emb = await asyncio.to_thread(encode, merged_content)
-        try:
-            await redis.execute_command(
-                "VADD", mem_store.FACT_KEY, "FP32", m_emb.tobytes(),
-                keeper_element, "SETATTR", json.dumps(new_attrs)
+        fact_by_element: dict[str, dict] = {f["element"]: f for f in all_facts}
+
+        for idx, fact in enumerate(all_facts):
+            if fact["element"] in superseded_elements:
+                continue
+
+            if merged_count >= _MAX_LLM_MERGES:
+                break
+
+            if time.time() - t0 > _OVERALL_TIMEOUT_S:
+                log.warning("[consolidate] overall timeout reached, stopping merge phase")
+                break
+
+            # In-memory cosine similarity (vectorized) — no Redis VSIM needed
+            sims = emb_normed @ emb_normed[idx]
+            # Get top-k similar indices (excluding self)
+            top_indices = np.argsort(sims)[::-1]
+            cluster = [fact]
+            fact_ts = fact["attrs"].get("ts", 0)
+
+            for sim_idx in top_indices[:10]:  # check top 10 candidates
+                if sim_idx == idx:
+                    continue
+                sim_elem = elem_order[sim_idx]
+                if sim_elem in superseded_elements:
+                    continue
+
+                cosine_sim = float(sims[sim_idx])
+                s_fact = fact_by_element.get(sim_elem)
+                s_ts = s_fact["attrs"].get("ts", 0) if s_fact else 0
+
+                days_between = abs(fact_ts - s_ts) / 86_400_000
+                temporal_factor = math.exp(-temporal_lambda * days_between)
+                affinity = cosine_sim * temporal_factor
+
+                if affinity >= similarity_threshold and s_fact:
+                    cluster.append(s_fact)
+
+            if len(cluster) < 2:
+                continue
+
+            contents = [c["attrs"]["content"] for c in cluster]
+            merged_content = await llm_merge_facts(contents, spawn_fn=spawn_fn)
+            if not merged_content:
+                continue
+
+            cluster.sort(
+                key=lambda c: (c["attrs"].get("importance", 0.5), c["attrs"].get("ts", 0)),
+                reverse=True
             )
-        except Exception as e:
-            log.warning(f"[consolidate] failed to update keeper: {e}")
-            continue
+            keeper = cluster[0]
+            keeper_element = keeper["element"]
 
-        for c in cluster[1:]:
-            if c["element"] not in superseded_elements:
-                await mem_store.soft_delete_fact(redis, c["element"], keeper_element, reason="merged")
-                superseded_elements.add(c["element"])
+            new_attrs = dict(keeper["attrs"])
+            new_attrs["content"] = merged_content[:500]
+            new_attrs["access_count"] = max(c["attrs"].get("access_count", 0) for c in cluster)
+            new_attrs["importance"] = max(c["attrs"].get("importance", 0.5) for c in cluster)
+            new_attrs["consolidated_from"] = len(cluster)
+            new_attrs["source_count"] = sum(c["attrs"].get("source_count", 1) for c in cluster)
+            new_attrs["last_confirmed_ts"] = int(time.time() * 1000)
+            new_attrs["version"] = keeper["attrs"].get("version", 1) + 1
 
-        merged_count += 1
+            all_kw: set[str] = set()
+            all_persons: set[str] = set()
+            all_entities: set[str] = set()
+            for c in cluster:
+                all_kw.update(c["attrs"].get("keywords", []))
+                all_persons.update(c["attrs"].get("persons", []))
+                all_entities.update(c["attrs"].get("entities", []))
+            if all_kw:
+                new_attrs["keywords"] = list(all_kw)[:10]
+            if all_persons:
+                new_attrs["persons"] = list(all_persons)[:5]
+            if all_entities:
+                new_attrs["entities"] = list(all_entities)[:5]
+
+            m_emb = await asyncio.to_thread(encode, merged_content)
+            try:
+                await redis.execute_command(
+                    "VADD", mem_store.FACT_KEY, "FP32", m_emb.tobytes(),
+                    keeper_element, "SETATTR", json.dumps(new_attrs)
+                )
+            except Exception as e:
+                log.warning(f"[consolidate] failed to update keeper: {e}")
+                continue
+
+            for c in cluster[1:]:
+                if c["element"] not in superseded_elements:
+                    await mem_store.soft_delete_fact(redis, c["element"], keeper_element, reason="merged")
+                    superseded_elements.add(c["element"])
+
+            merged_count += 1
 
     # ── Phase 3: Prune ────────────────────────────────────────────────────────
     pruned_count = 0

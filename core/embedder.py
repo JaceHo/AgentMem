@@ -59,8 +59,26 @@ def _reset_provider(name: str = "local") -> None:
     """Force-switch to a specific provider (used by dimension guard)."""
     global _provider, DIMS
     with _provider_lock:
+        # Close old provider's HTTP client if any
+        if _provider is not None and hasattr(_provider, '_client') and _provider._client is not None:
+            try:
+                _provider._client.close()
+            except Exception:
+                pass
         _provider = _create_provider(name)
         DIMS = _provider.dims
+
+
+def close() -> None:
+    """Close the embedder's HTTP client. Call at app shutdown."""
+    global _provider
+    with _provider_lock:
+        if _provider is not None and hasattr(_provider, '_client') and _provider._client is not None:
+            try:
+                _provider._client.close()
+            except Exception:
+                pass
+            _provider._client = None
 
 
 def encode(text: str) -> np.ndarray:
@@ -147,7 +165,7 @@ class OllamaProvider(BaseProvider):
 
     def _get_client(self) -> httpx.Client:
         if self._client is None or self._client.is_closed:
-            self._client = httpx.Client(timeout=60)
+            self._client = httpx.Client(timeout=httpx.Timeout(15.0, connect=5.0))
         return self._client
 
     def encode(self, text: str) -> np.ndarray:
@@ -201,7 +219,7 @@ class OpenAIProvider(BaseProvider):
 
     def _get_client(self) -> httpx.Client:
         if self._client is None or self._client.is_closed:
-            self._client = httpx.Client(timeout=60)
+            self._client = httpx.Client(timeout=httpx.Timeout(15.0, connect=5.0))
         return self._client
 
     def encode(self, text: str) -> np.ndarray:
@@ -248,7 +266,7 @@ class GeminiProvider(BaseProvider):
 
     def _get_client(self) -> httpx.Client:
         if self._client is None or self._client.is_closed:
-            self._client = httpx.Client(timeout=60)
+            self._client = httpx.Client(timeout=httpx.Timeout(15.0, connect=5.0))
         return self._client
 
     def encode(self, text: str) -> np.ndarray:

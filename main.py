@@ -348,6 +348,8 @@ async def lifespan(app: FastAPI):
         await _mcp_close_client()
     except ImportError:
         pass  # mcp package not installed — nothing to close
+    from core.embedder import close as _embedder_close
+    _embedder_close()
     await mem_store.close_pool()
 
 
