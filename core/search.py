@@ -131,6 +131,17 @@ class BM25Index:
                 and not self._rebuild_lock.locked():
             asyncio.create_task(self._rebuild_async())
 
+    async def remove(self, uids: set[str]) -> None:
+        """Remove documents by uid set. Incremental — avoids full reset+repopulate."""
+        if not uids:
+            return
+        async with self._add_lock:
+            before = len(self._docs)
+            self._docs = [(u, c, a) for u, c, a in self._docs if u not in uids]
+            removed = before - len(self._docs)
+        if removed > 0 and not self._rebuild_lock.locked():
+            asyncio.create_task(self._rebuild_async())
+
     def _tokenize(self, text: str) -> list[str]:
         """Tokenize for BM25: English words >=3 chars + CJK bigrams."""
         text = text.lower()

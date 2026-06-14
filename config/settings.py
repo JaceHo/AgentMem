@@ -27,6 +27,11 @@ class Settings(BaseSettings):
     host: str = Field(default="0.0.0.0", description="Host to bind")
     port: int = Field(default=18800, description="Port to listen on")
     app_version: str = Field(default="1.1.0", description="Application version")
+    api_key: str | None = Field(
+        default=None,
+        description="API key for authenticating write endpoints (set AGENTMEM_API_KEY)",
+        json_schema_extra={"env": "AGENTMEM_API_KEY"},
+    )
     
     # ── Redis Configuration ────────────────────────────────────────────────
     redis_url: str = Field(

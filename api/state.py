@@ -33,6 +33,20 @@ log = logging.getLogger("mem")
 
 redis = None                          # aioredis.Redis — set during lifespan
 
+# Module references — used by route modules to access core functionality
+# without importing from main.py (avoids circular imports)
+embedder = embedder
+mem_store = mem_store
+cap_mod = cap_mod
+graph_mod = graph_mod
+persona_mod = persona_mod
+heat_mod = heat_mod
+scene_mod = scene_mod
+extractor = extractor
+summarizer = summarizer
+retrieval_planner = retrieval_planner
+log_sse = log_sse
+
 # ── Task manager for fire-and-forget background work ──────────────────────────
 task_manager = TaskManager(max_concurrent=settings.bg_task_limit)
 

@@ -18,13 +18,12 @@ import logging
 import math
 import time
 
-import httpx
 import numpy as np
 
 from core import extractor
 from core import store as mem_store
 from core.http import async_post_json
-from core.search import BM25Index, encode, encode_batch, vscan, populate_bm25_from_redis
+from core.search import BM25Index, encode, encode_batch, vscan
 
 log = logging.getLogger("mem")
 
@@ -233,10 +232,9 @@ async def do_consolidate(
             superseded_elements.add(fact["element"])
             pruned_count += 1
 
-    # ── Post-consolidation: invalidate BM25 index ─────────────────────────────
+    # ── Post-consolidation: incremental BM25 update ────────────────────────────
     if superseded_elements:
-        await bm25_index.reset()
-        spawn_fn(populate_bm25_from_redis(redis, bm25_index), "bm25-rebuild")
+        await bm25_index.remove(superseded_elements)
 
     ms = int((time.time() - t0) * 1000)
     log.info(
@@ -266,8 +264,10 @@ async def do_hard_prune(redis, bm25_index: BM25Index, spawn_fn) -> dict:
 
     removed_facts = 0
     removed_eps = 0
+    pruned_fact_ids: set[str] = set()
 
     async def _hard_prune_vset(vset_key: str, max_scan: int = 2000) -> int:
+        nonlocal pruned_fact_ids
         items = await vscan(redis, vset_key, max_count=max_scan)
         if not items:
             return 0
@@ -292,6 +292,8 @@ async def do_hard_prune(redis, bm25_index: BM25Index, spawn_fn) -> dict:
             try:
                 await redis.execute_command("VREM", vset_key, elem_str)
                 removed += 1
+                if vset_key == mem_store.FACT_KEY:
+                    pruned_fact_ids.add(elem_str)
             except Exception:
                 pass
         return removed
@@ -299,9 +301,8 @@ async def do_hard_prune(redis, bm25_index: BM25Index, spawn_fn) -> dict:
     removed_facts = await _hard_prune_vset(mem_store.FACT_KEY)
     removed_eps = await _hard_prune_vset(mem_store.EPISODE_KEY)
 
-    if removed_facts > 0:
-        await bm25_index.reset()
-        spawn_fn(populate_bm25_from_redis(redis, bm25_index), "bm25-rebuild")
+    if removed_facts > 0 and pruned_fact_ids:
+        await bm25_index.remove(pruned_fact_ids)
 
     ms = int((time.time() - t0) * 1000)
     log.info(f"[hard_prune] removed facts={removed_facts} episodes={removed_eps} {ms}ms")

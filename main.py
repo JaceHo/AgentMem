@@ -173,6 +173,15 @@ logging.getLogger().addHandler(_sse_handler)
 _redis = None  # backward compat — delegates to state.redis via property-like access
 _shutting_down = False  # set during lifespan shutdown to prevent new bg operations
 
+
+def _get_redis():
+    """Get the Redis client — always returns state.redis (single source of truth)."""
+    r = state.redis
+    if r is not None:
+        return r
+    # Fallback to legacy _redis global during startup before lifespan sets state.redis
+    return _redis
+
 # ── Task manager and counters — delegate to api.state (single source of truth) ─
 _task_manager = state.task_manager
 _AUTO_CONSOLIDATE_EVERY = state.AUTO_CONSOLIDATE_EVERY
@@ -216,7 +225,7 @@ async def _periodic_consolidate() -> None:
     global _periodic_prune_counter
     while True:
         await asyncio.sleep(3600)
-        r = _redis
+        r = _get_redis()
         if r is None:
             continue
         try:
@@ -287,7 +296,7 @@ async def lifespan(app: FastAPI):
     # provider, force local (384-dim) to avoid corrupting vector search.
     try:
         for vset_key in (mem_store.FACT_KEY, mem_store.EPISODE_KEY, mem_store.PROC_KEY):
-            info = await _redis.execute_command("VINFO", vset_key)
+            info = await _get_redis().execute_command("VINFO", vset_key)
             if not info:
                 continue
             info_dict = dict(zip(info[::2], info[1::2]))
@@ -302,13 +311,13 @@ async def lifespan(app: FastAPI):
         pass  # no existing vectorset, safe to use any provider
 
     log.info("Ensuring vectorset indexes…")
-    await mem_store.ensure_indexes(_redis)
+    await mem_store.ensure_indexes(_get_redis())
     _spawn(_periodic_consolidate(), "consolidate")
     _spawn(_auto_crystallize(), "crystallize")  # Auto-crystallize sessions every 6h
     # Populate BM25 corpus from existing Redis facts (non-blocking, best-effort)
-    _spawn(populate_bm25_from_redis(_redis, state.bm25_index), "bm25-populate")
+    _spawn(populate_bm25_from_redis(_get_redis(), state.bm25_index), "bm25-populate")
     # Backfill crystallized sorted-set index from existing keys (idempotent, skips if populated)
-    _spawn(_backfill_crystallized_index(_redis), "crystallize-index-backfill")
+    _spawn(_backfill_crystallized_index(_get_redis()), "crystallize-index-backfill")
     log.info("AgentMem v%s ready (session-handoff+hard-prune+auto-graph+batch-MCP+compat+auto-crystallize)", APP_VERSION)
 
     # The MCP Streamable-HTTP transport is mounted as an ASGI sub-app, whose
@@ -353,9 +362,30 @@ async def global_exception_handler(request: Request, exc: Exception):
 @app.middleware("http")
 async def redis_guard(request: Request, call_next):
     """Return 503 if Redis is not connected (prevents NoneType crashes)."""
-    if _redis is None and request.url.path not in ("/health", "/docs", "/openapi.json", "/redoc"):
+    if _get_redis() is None and request.url.path not in ("/health", "/docs", "/openapi.json", "/redoc"):
         from fastapi.responses import JSONResponse
         return JSONResponse(status_code=503, content={"detail": "Redis not connected"})
+    return await call_next(request)
+
+
+# Write-endpoint auth: if AGENTMEM_API_KEY is set, require X-API-Key header
+# for mutating endpoints. Read endpoints (GET /recall, /health, /stats) remain open.
+_WRITE_PREFIXES = ("/store", "/session/compress", "/session/clear",
+                   "/admin/", "/consolidate", "/crystallize", "/feedback")
+
+@app.middleware("http")
+async def api_key_guard(request: Request, call_next):
+    """Require API key on write endpoints when AGENTMEM_API_KEY is configured."""
+    if not settings.api_key:
+        return await call_next(request)
+    path = request.url.path
+    needs_auth = any(path.startswith(p) for p in _WRITE_PREFIXES)
+    if not needs_auth:
+        return await call_next(request)
+    provided = request.headers.get("X-API-Key", "")
+    if provided != settings.api_key:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=401, content={"detail": "Invalid or missing API key"})
     return await call_next(request)
 
 # ── Static files + SSE log router ─────────────────────────────────────────────
@@ -705,7 +735,7 @@ async def _admission_gate(user_text: str) -> bool:
     # F1 — Semantic novelty (w=0.25)
     # Offload CPU-bound embedding to thread pool so it doesn't block the event loop
     emb = await asyncio.to_thread(_encode, text)
-    recent = await mem_store.knn_search(_redis, mem_store.EPISODE_KEY, emb, k=3)
+    recent = await mem_store.knn_search(_get_redis(), mem_store.EPISODE_KEY, emb, k=3)
     if recent:
         max_sim = max(r.get("score", 0.0) for r in recent)
         semantic_novelty = 1.0 - max_sim
@@ -941,7 +971,7 @@ async def _evolve_similar_fact(element_id: str, new_keywords: list[str], new_top
     if not element_id or not new_keywords:
         return
     try:
-        raw = await _redis.execute_command("VGETATTR", mem_store.FACT_KEY, element_id)
+        raw = await _get_redis().execute_command("VGETATTR", mem_store.FACT_KEY, element_id)
         if not raw:
             return
         attrs = _decode_attrs(raw)
@@ -952,7 +982,7 @@ async def _evolve_similar_fact(element_id: str, new_keywords: list[str], new_top
         # Update topic if new one is more specific (longer = more specific)
         if new_topic and len(new_topic) > len(attrs.get("topic") or ""):
             attrs["topic"] = new_topic[:100]
-        await _redis.execute_command("VSETATTR", mem_store.FACT_KEY, element_id, json.dumps(attrs))
+        await _get_redis().execute_command("VSETATTR", mem_store.FACT_KEY, element_id, json.dumps(attrs))
         log.debug(f"[evolution] enriched fact {element_id}: +{len(new_keywords)} kws")
     except Exception as e:
         log.debug(f"[evolution] skipped: {e}")
@@ -1010,12 +1040,12 @@ async def _check_contradiction(existing_fact: dict, new_fact) -> None:
         for new_ent in new_ents:
             if old_ent.lower() != new_ent.lower():
                 await graph_mod.add_typed_edge(
-                    _redis, old_ent, new_ent, "contradicts",
+                    _get_redis(), old_ent, new_ent, "contradicts",
                     confidence=0.9, source="contradiction_detector", bidirectional=True,
                 )
 
     # Mark old fact as superseded
-    await mem_store.soft_delete_fact(_redis, element_id, "contradicted", reason="contradicted")
+    await mem_store.soft_delete_fact(_get_redis(), element_id, "contradicted", reason="contradicted")
     log.info(f"[contradiction] fact {element_id} superseded: contradicted by new fact")
 
 
@@ -1081,16 +1111,16 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
 
         # 4. Embed + dedup-check + save episode (with type taxonomy + causal chain)
         ep_emb = await asyncio.to_thread(_encode, summary[:500])
-        similar = await mem_store.knn_search(_redis, mem_store.EPISODE_KEY, ep_emb, k=1)
+        similar = await mem_store.knn_search(_get_redis(), mem_store.EPISODE_KEY, ep_emb, k=1)
         is_dup = bool(similar and similar[0].get("score", 0.0) > 0.95)
         ep_saved = 0
         new_ep_uid = ""
         prev_ep_id = ""
         if not is_dup:
             # Causal chain: look up the previous episode for this session
-            prev_ep_id = await mem_store.get_last_episode_id(_redis, session_id)
+            prev_ep_id = await mem_store.get_last_episode_id(_get_redis(), session_id)
             new_ep_uid = await mem_store.save_episode(
-                _redis, session_id, turn_text[:2000], ep_emb, lang, domain,
+                _get_redis(), session_id, turn_text[:2000], ep_emb, lang, domain,
                 ep_type="general",        # placeholder; updated after fact extraction below
                 prev_episode_id=prev_ep_id,
             )
@@ -1113,7 +1143,7 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
             if _contains_secret(fact.content):
                 continue
             f_emb = next(emb_iter)
-            existing = await mem_store.knn_search(_redis, mem_store.FACT_KEY, f_emb, k=1)
+            existing = await mem_store.knn_search(_get_redis(), mem_store.FACT_KEY, f_emb, k=1)
             if existing and existing[0].get("score", 0.0) > 0.95:
                 # A-MEM memory evolution: similar fact exists → async-update its keywords/topic
                 # (arXiv:2502.12110 §3: new memories trigger context refinement on neighbors)
@@ -1131,7 +1161,7 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
                     existing[0], fact,
                 ), "contradiction")
             uid = await mem_store.save_fact(
-                _redis, fact.content, fact.category, fact.confidence, f_emb, lang, domain,
+                _get_redis(), fact.content, fact.category, fact.confidence, f_emb, lang, domain,
                 keywords=fact.keywords, persons=fact.persons, entities=fact.entities,
                 importance=fact.importance, topic=fact.topic, location=fact.location,
                 source_episode_id=new_ep_uid or None,
@@ -1146,7 +1176,7 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
             if fact.triple_s and fact.triple_p and fact.triple_o:
                 attrs["triple_str"] = f"{fact.triple_s} | {fact.triple_p} | {fact.triple_o}"
             await _bm25_index.add(uid, fact.content, attrs)
-            await persona_mod.update(_redis, fact.category, fact.content)
+            await persona_mod.update(_get_redis(), fact.category, fact.content)
             fact_saved += 1
 
         # 5b. Back-fill ep_type on newly saved episode + complete causal chain
@@ -1154,11 +1184,11 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
             ep_type = _infer_ep_type(facts)
             # Update ep_type attr on the episode we just saved
             try:
-                raw = await _redis.execute_command("VGETATTR", mem_store.EPISODE_KEY, new_ep_uid)
+                raw = await _get_redis().execute_command("VGETATTR", mem_store.EPISODE_KEY, new_ep_uid)
                 if raw:
                     ep_attrs = _decode_attrs(raw)
                     ep_attrs["ep_type"] = ep_type
-                    await _redis.execute_command(
+                    await _get_redis().execute_command(
                         "VSETATTR", mem_store.EPISODE_KEY, new_ep_uid, json.dumps(ep_attrs)
                     )
             except Exception:
@@ -1167,11 +1197,11 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
             # (prev_ep_id was already fetched before save_episode above)
             if prev_ep_id and prev_ep_id != new_ep_uid:
                 _spawn(
-                    mem_store.update_episode_next_id(_redis, prev_ep_id, new_ep_uid),
+                    mem_store.update_episode_next_id(_get_redis(), prev_ep_id, new_ep_uid),
                     "ep-chain",
                 )
             # Advance the session's last-episode pointer
-            await mem_store.set_last_episode_id(_redis, session_id, new_ep_uid)
+            await mem_store.set_last_episode_id(_get_redis(), session_id, new_ep_uid)
             log.debug(f"[store] episode {new_ep_uid} type={ep_type} prev={prev_ep_id or 'none'}")
 
         # 6. Extract and store procedures (the 4th cognitive tier)
@@ -1188,12 +1218,12 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
             proc_contents = [pf.content for pf in proc_facts]
             proc_embs = await _encode_batch_async(proc_contents)
             for pf, p_emb in zip(proc_facts, proc_embs):
-                existing = await mem_store.knn_search(_redis, mem_store.PROC_KEY, p_emb, k=1)
+                existing = await mem_store.knn_search(_get_redis(), mem_store.PROC_KEY, p_emb, k=1)
                 if not existing or existing[0].get("score", 0.0) < 0.90:
                     content_lower = pf.content.lower()
                     tools_in_proc = [t for t in _KNOWN_TOOLS if t in content_lower]
                     await mem_store.save_procedure(
-                        _redis, task=pf.content, procedure=pf.content,
+                        _get_redis(), task=pf.content, procedure=pf.content,
                         embedding=p_emb, tools_used=tools_in_proc[:8],
                         domain=domain, language=lang,
                     )
@@ -1203,7 +1233,7 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
             if fact.persons or fact.entities:
                 all_ents = (fact.persons or []) + (fact.entities or [])
                 if len(all_ents) >= 2:
-                    await graph_mod.record_entities(_redis, all_ents, [])
+                    await graph_mod.record_entities(_get_redis(), all_ents, [])
 
         # 8. Accumulate rolling session summary (Tier 1 — layered controlled architecture)
         #    Append this turn's summary instead of overwriting, so Tier 1 grows across
@@ -1215,7 +1245,7 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
         fact_count = await _stores_since_consolidation.increment(fact_saved)
         if fact_count >= settings.auto_consolidate_every:
             await _stores_since_consolidation.reset()
-            _spawn(_do_consolidate(_redis, _bm25_index, _spawn), "consolidate")
+            _spawn(_do_consolidate(_get_redis(), _bm25_index, _spawn), "consolidate")
             log.info("[store] auto-consolidation triggered")
 
         ms = int((time.time() - t0) * 1000)
@@ -1253,15 +1283,15 @@ async def _accumulate_session(session_id: str, turn_summary: str) -> None:
         return
     # Redact secrets before writing to Tier 1 KV (prevents leakage via prependContext)
     turn_summary = _redact_secrets(turn_summary)
-    existing = await mem_store.get_session_context(_redis, session_id) or ""
+    existing = await mem_store.get_session_context(_get_redis(), session_id) or ""
     if not existing:
-        await mem_store.set_session_context(_redis, session_id, turn_summary[:1500])
+        await mem_store.set_session_context(_get_redis(), session_id, turn_summary[:1500])
         return
     combined = f"{existing}\n---\n{turn_summary}"
     if len(combined) > 1200:
         # MemAgent-style incremental overwrite: LLM decides what to keep
         combined = await summarizer.overwrite_update(existing, turn_summary, target_chars=900)
-    await mem_store.set_session_context(_redis, session_id, combined[:1500])
+    await mem_store.set_session_context(_get_redis(), session_id, combined[:1500])
 
 
 async def _do_compress_session(session_id: str) -> dict:
@@ -1279,7 +1309,7 @@ async def _do_compress_session(session_id: str) -> dict:
     if not session_id:
         return {"status": "skipped", "reason": "no session_id"}
 
-    ctx = await mem_store.get_session_context(_redis, session_id)
+    ctx = await mem_store.get_session_context(_get_redis(), session_id)
     if not ctx or len(ctx) < 80:
         return {"status": "skipped", "reason": "session too short to promote"}
 
@@ -1297,11 +1327,11 @@ async def _do_compress_session(session_id: str) -> dict:
 
     # Save as a session-summary episode (labelled so recall can distinguish)
     ep_emb  = await asyncio.to_thread(_encode, session_summary[:500])
-    similar = await mem_store.knn_search(_redis, mem_store.EPISODE_KEY, ep_emb, k=1)
+    similar = await mem_store.knn_search(_get_redis(), mem_store.EPISODE_KEY, ep_emb, k=1)
     ep_saved = 0
     if not similar or similar[0].get("score", 0.0) < 0.95:
         await mem_store.save_episode(
-            _redis, session_id,
+            _get_redis(), session_id,
             f"[Session Summary] {session_summary[:2000]}",
             ep_emb, lang, domain,
         )
@@ -1324,7 +1354,7 @@ async def _do_compress_session(session_id: str) -> dict:
         if _contains_secret(fact.content):
             continue
         f_emb = next(emb_iter)
-        existing = await mem_store.knn_search(_redis, mem_store.FACT_KEY, f_emb, k=1)
+        existing = await mem_store.knn_search(_get_redis(), mem_store.FACT_KEY, f_emb, k=1)
         if existing and existing[0].get("score", 0.0) > 0.95:
             if fact.keywords and existing[0].get("score", 0.0) > 0.80:
                 _spawn(_evolve_similar_fact(
@@ -1333,7 +1363,7 @@ async def _do_compress_session(session_id: str) -> dict:
                 ))
             continue
         uid = await mem_store.save_fact(
-            _redis, fact.content, fact.category, fact.confidence,
+            _get_redis(), fact.content, fact.category, fact.confidence,
             f_emb, lang, domain,
             keywords=fact.keywords, persons=fact.persons, entities=fact.entities,
             importance=fact.importance, topic=fact.topic, location=fact.location,
@@ -1348,18 +1378,18 @@ async def _do_compress_session(session_id: str) -> dict:
         if fact.triple_s and fact.triple_p and fact.triple_o:
             attrs["triple_str"] = f"{fact.triple_s} | {fact.triple_p} | {fact.triple_o}"
         await _bm25_index.add(uid, fact.content, attrs)
-        await persona_mod.update(_redis, fact.category, fact.content)
+        await persona_mod.update(_get_redis(), fact.category, fact.content)
         fact_saved += 1
 
     # Delete Tier 1 KV — session has been crystallised into long-term memory
-    await _redis.delete(f"{mem_store.SESSION_PRE}{session_id}:ctx")
+    await _get_redis().delete(f"{mem_store.SESSION_PRE}{session_id}:ctx")
 
     # Pin the session summary for the NEXT session's recall (cross-session handoff).
     # Strip platform tags before persisting — summaries must contain real content only.
     # Stored without TTL so it persists until the next compress overwrites it.
     clean_summary = _strip_platform_noise(session_summary)
     if clean_summary:
-        await _redis.set(_PINNED_SESSION_KEY, clean_summary[:600].encode())
+        await _get_redis().set(_PINNED_SESSION_KEY, clean_summary[:600].encode())
 
     log.info(f"[compress] session={session_id} promoted → ep+{ep_saved} facts+{fact_saved}")
     return {
@@ -1390,7 +1420,7 @@ async def session_compact(req: CompactRequest):
     if not req.session_id:
         return {"status": "skipped", "reason": "no session_id"}
 
-    ctx = await mem_store.get_session_context(_redis, req.session_id)
+    ctx = await mem_store.get_session_context(_get_redis(), req.session_id)
     if not ctx:
         return {"status": "skipped", "reason": "no session context"}
 
@@ -1416,7 +1446,7 @@ async def session_compact(req: CompactRequest):
         mid = len(ctx) // 2
         compacted = await summarizer.overwrite_update(ctx[:mid], ctx[mid:], target_chars=1000)
 
-    await mem_store.set_session_context(_redis, req.session_id, compacted[:1500])
+    await mem_store.set_session_context(_get_redis(), req.session_id, compacted[:1500])
 
     size_after = len(compacted)
     log.info(
@@ -1630,7 +1660,7 @@ async def recall(req: RecallRequest):
     # Recall strategy: scene-filtered first, supplement with global if sparse
     async def _fetch(vset: str, k: int, fexpr=None):
         return await mem_store.knn_search(
-            _redis, vset, emb, k, filter_expr=fexpr, bump_heat=True
+            _get_redis(), vset, emb, k, filter_expr=fexpr, bump_heat=True
         )
 
     # Detect if this is a capability query (needs tool context)
@@ -1641,16 +1671,16 @@ async def recall(req: RecallRequest):
     # + symbolic structured pass (async, no extra latency via gather)
     # + pinned last-session summary (cross-session handoff bridge, index 6)
     gather_tasks = [
-        persona_mod.get_context(_redis),
-        cap_mod.get_env_context(_redis),
-        mem_store.get_session_context(_redis, req.session_id),
+        persona_mod.get_context(_get_redis()),
+        cap_mod.get_env_context(_get_redis()),
+        mem_store.get_session_context(_get_redis(), req.session_id),
         _fetch(mem_store.FACT_KEY,    n_facts,    lang_filter_sym or None),
         _fetch(mem_store.EPISODE_KEY, n_episodes, lang_filter_sym or None),
         retrieval_planner.analyze_query_structure(req.query) if (req.query.strip() and req.enable_planning) else asyncio.sleep(0),  # symbolic layer (index 5) — LLM call only when enable_planning=True
-        _redis.get(_PINNED_SESSION_KEY),                       # handoff bridge (index 6)
+        _get_redis().get(_PINNED_SESSION_KEY),                       # handoff bridge (index 6)
     ]
     if req.include_tools and is_cap_query:
-        gather_tasks.append(cap_mod.recall_tools(_redis, emb, k=6))
+        gather_tasks.append(cap_mod.recall_tools(_get_redis(), emb, k=6))
     else:
         gather_tasks.append(asyncio.sleep(0))
     # Procedure recall (index 7): fire in parallel if include_procedures=True
@@ -1666,7 +1696,7 @@ async def recall(req: RecallRequest):
         cmd  = ["VSIM", mem_store.PROC_KEY, "FP32", blob,
                 "COUNT", max(k * 3, 6), "WITHSCORES", "WITHATTRIBS"]
         try:
-            results = await _redis.execute_command(*cmd)
+            results = await _get_redis().execute_command(*cmd)
         except Exception:
             return []
         procs = []
@@ -1710,11 +1740,11 @@ async def recall(req: RecallRequest):
     async def _fetch_crystallized_digests() -> list[dict]:
         """Fetch top-3 most recent crystallized session digests via sorted-set index."""
         try:
-            top_keys = await _redis.zrevrange(_CRYSTALLIZED_INDEX_KEY, 0, 9)
+            top_keys = await _get_redis().zrevrange(_CRYSTALLIZED_INDEX_KEY, 0, 9)
             if not top_keys:
                 return []
 
-            pipe = _redis.pipeline(transaction=False)
+            pipe = _get_redis().pipeline(transaction=False)
             for key in top_keys:
                 pipe.get(key)
             raw_values = await pipe.execute()
@@ -1762,7 +1792,7 @@ async def recall(req: RecallRequest):
     if sym_entities:
         ent_vecs = await _encode_batch_async(sym_entities[:3])
         sym_tasks = [
-            mem_store.knn_search(_redis, mem_store.FACT_KEY, vec, k=3,
+            mem_store.knn_search(_get_redis(), mem_store.FACT_KEY, vec, k=3,
                                  filter_expr=lang_filter_sym or None)
             for vec in ent_vecs
         ]
@@ -1788,7 +1818,7 @@ async def recall(req: RecallRequest):
             # Batch-encode all planning queries off the event loop
             extra_embs = await _encode_batch_async(extra_queries)
             extra_tasks = [
-                mem_store.knn_search(_redis, mem_store.FACT_KEY, emb, n_facts,
+                mem_store.knn_search(_get_redis(), mem_store.FACT_KEY, emb, n_facts,
                                      filter_expr=lang_filter_sym or None, bump_heat=True)
                 for emb in extra_embs
             ]
@@ -1885,7 +1915,7 @@ async def recall(req: RecallRequest):
             if extra_q:
                 reflection_emb = await asyncio.to_thread(_encode, extra_q[0])
                 reflection_facts = await mem_store.knn_search(
-                    _redis, mem_store.FACT_KEY, reflection_emb,
+                    _get_redis(), mem_store.FACT_KEY, reflection_emb,
                     k=max(3, n_facts // 2), bump_heat=True
                 )
                 seen_reflect = {f["content"] for f in facts}
@@ -1909,7 +1939,7 @@ async def recall(req: RecallRequest):
 
         if graph_ents:
             graph_tasks = [
-                graph_mod.entity_recall(_redis, ent, emb, k=2)
+                graph_mod.entity_recall(_get_redis(), ent, emb, k=2)
                 for ent in graph_ents
             ]
             graph_results = await asyncio.gather(*graph_tasks)
@@ -1927,7 +1957,7 @@ async def recall(req: RecallRequest):
     # Deterministic — no extra LLM call, single graph+vector pass.
     if (req.include_graph or _auto_graph_trigger) and len(facts) >= 2:
         try:
-            bridge_facts = await graph_mod.find_bridge_nodes(_redis, facts, emb, k=3)
+            bridge_facts = await graph_mod.find_bridge_nodes(_get_redis(), facts, emb, k=3)
             if bridge_facts:
                 seen_bridge = {f["content"] for f in facts}
                 for bf in bridge_facts:
@@ -1945,7 +1975,7 @@ async def recall(req: RecallRequest):
         top_tool_elem = tools_raw[0].get("_element", "")
         if top_tool_elem:
             try:
-                all_tig = await _redis.hgetall(mem_store.TOOL_GRAPH_KEY)
+                all_tig = await _get_redis().hgetall(mem_store.TOOL_GRAPH_KEY)
                 prefix  = f"{top_tool_elem}:"
                 trans: dict[str, int] = {}
                 for k_b, v_b in all_tig.items():
@@ -2028,7 +2058,7 @@ async def get_session(session_id: str):
     Inspect current Tier 1 session context for a given session_id.
     Useful for debugging what the agent has accumulated in this session.
     """
-    ctx = await mem_store.get_session_context(_redis, session_id)
+    ctx = await mem_store.get_session_context(_get_redis(), session_id)
     return {
         "session_id": session_id,
         "context":    ctx,
@@ -2068,7 +2098,7 @@ async def _auto_crystallize() -> None:
             all_session_keys = []
 
             while True:
-                cursor, keys = await _redis.scan(cursor, match=session_pattern, count=100)
+                cursor, keys = await _get_redis().scan(cursor, match=session_pattern, count=100)
                 all_session_keys.extend(keys)
                 if cursor == 0:
                     break
@@ -2078,7 +2108,7 @@ async def _auto_crystallize() -> None:
 
             # Batch check which sessions are already crystallized + get session data
             # Pipeline: exists(crystal_key) + get(session_key) per session
-            pipe = _redis.pipeline(transaction=False)
+            pipe = _get_redis().pipeline(transaction=False)
             key_map = []  # track (session_key, session_id, crystal_key) for each pipeline pair
             for key in all_session_keys:
                 key_str = _decode_bytes(key)
@@ -2121,7 +2151,7 @@ async def _auto_crystallize() -> None:
                 continue
 
             # Phase 2: Fetch all facts once (not per-session) and count per session
-            scanned = await _vscan(_redis, mem_store.FACT_KEY, max_count=200)
+            scanned = await _vscan(_get_redis(), mem_store.FACT_KEY, max_count=200)
             if len(scanned) <= 5:
                 continue
 
@@ -2144,13 +2174,13 @@ async def _auto_crystallize() -> None:
 
                 digest = await _crystallize_session_inline(session_id, session_obj, fact_count)
                 if digest:
-                    await _redis.setex(
+                    await _get_redis().setex(
                         crystal_key,
                         90 * 86400,
                         json.dumps(digest, ensure_ascii=False)
                     )
                     # Maintain sorted-set index so /recall can use ZREVRANGE instead of SCAN
-                    await _redis.zadd(
+                    await _get_redis().zadd(
                         _CRYSTALLIZED_INDEX_KEY,
                         {crystal_key: digest["crystallized_at"]},
                     )

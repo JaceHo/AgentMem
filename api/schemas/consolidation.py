@@ -16,12 +16,14 @@ class AnswerRequest(BaseModel):
 
 class CompressSessionRequest(BaseModel):
     session_id: str
+    wait: bool = False
 
 
 class FeedbackRequest(BaseModel):
-    fact_id: str
+    element_id: str
     rating: int              # -1 (negative) | 0 (neutral) | 1 (positive)
     reason: str = ""
+    comment: str = ""
 
 
 class CrystallizeRequest(BaseModel):

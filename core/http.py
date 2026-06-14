@@ -28,15 +28,17 @@ def _get_client() -> httpx.AsyncClient:
 
     The client uses a generous timeout (_MAX_CLIENT_TIMEOUT) as the upper bound.
     Individual requests enforce their own deadline via asyncio.wait_for.
+    Production-tuned connection pool: 100 max connections, 20 keepalive,
+    60s keepalive expiry for long-running services.
     """
     global _shared_client
     if _shared_client is None or _shared_client.is_closed:
         _shared_client = httpx.AsyncClient(
             timeout=httpx.Timeout(_MAX_CLIENT_TIMEOUT),
             limits=httpx.Limits(
-                max_connections=20,
-                max_keepalive_connections=10,
-                keepalive_expiry=30,
+                max_connections=100,
+                max_keepalive_connections=20,
+                keepalive_expiry=60,
             ),
         )
     return _shared_client

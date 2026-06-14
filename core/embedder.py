@@ -99,8 +99,9 @@ class LocalProvider(BaseProvider):
     name = "local"
     dims = 384
 
-    # all-MiniLM-L6-v2: benchmark-proven (LongMemEval-S R@5=95.2%),
+    # Default model: benchmark-proven (LongMemEval-S R@5=95.2%),
     # 384-dim, fast (~3ms/text), no API key needed.
+    # Can be overridden via EMBEDDING_MODEL env var or settings.embedding_model.
     _MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
     _model = None
     _model_lock = threading.Lock()
@@ -109,6 +110,10 @@ class LocalProvider(BaseProvider):
         dims_override = os.environ.get("EMBEDDING_DIMS")
         if dims_override:
             self.dims = int(dims_override)
+        # Respect EMBEDDING_MODEL env var or settings if set
+        model_override = os.environ.get("EMBEDDING_MODEL")
+        if model_override:
+            LocalProvider._MODEL_NAME = model_override
 
     def _get_model(self):
         with self._model_lock:
