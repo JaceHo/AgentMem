@@ -10,11 +10,12 @@ class GraphRecallRequest(BaseModel):
 
 
 class TypedEdgeRequest(BaseModel):
-    source: str
-    target: str
-    relation: str           # uses | depends_on | contradicts | caused | fixed | supersedes
+    source_entity: str
+    target_entity: str
+    relationship_type: str   # uses | depends_on | contradicts | caused | fixed | supersedes
     confidence: float = 0.8
-    source_name: str = ""   # optional provenance
+    source: str = ""         # optional provenance
+    bidirectional: bool = False
 
 
 class TraverseRequest(BaseModel):

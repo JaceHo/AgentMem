@@ -6,7 +6,7 @@ import os
 import time
 
 import numpy as np
-from fastapi import APIRouter, BackgroundTasks, Request
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 
 from api import state
 from api.compat import compat_sid as _compat_sid, check_auth as _compat_check_auth
@@ -196,12 +196,12 @@ async def compat_session_commit(req: SessionCommitRequest, request: Request):
 @router.get("/session/by-commit")
 async def session_by_commit(sha: str = ""):
     if not sha:
-        return {"error": "sha parameter required"}
+        raise HTTPException(status_code=400, detail="sha parameter required")
     r = state.redis
     commit_key = f"mem:commit:{sha}"
     data = await r.hgetall(commit_key)
     if not data:
-        return {"error": "commit not found", "sha": sha}
+        raise HTTPException(status_code=404, detail=f"commit not found: {sha}")
     result = {decode_bytes(k): decode_bytes(v)
               for k, v in data.items()}
     return result
@@ -386,7 +386,7 @@ async def compat_forget(req: ForgetRequest, request: Request):
 @router.post("/compress-file")
 async def compress_file(filePath: str = ""):
     if not filePath or not os.path.isfile(filePath):
-        return {"error": "file not found", "path": filePath}
+        raise HTTPException(status_code=404, detail=f"file not found: {filePath}")
     try:
         with open(filePath, "r") as f:
             content = f.read()
@@ -408,7 +408,7 @@ async def compress_file(filePath: str = ""):
             f.write("\n".join(compressed))
         return {"status": "ok", "original_lines": len(lines), "compressed_lines": len(compressed)}
     except Exception as e:
-        return {"error": str(e)}
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/sessions")
