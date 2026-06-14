@@ -42,6 +42,12 @@ services:
       - AGENTMEM_LOG_LEVEL=${AGENTMEM_LOG_LEVEL:-INFO}
       - AGENTMEM_AMAC_THRESHOLD=${AGENTMEM_AMAC_THRESHOLD:-0.40}
       - AGENTMEM_BG_TASK_LIMIT=${AGENTMEM_BG_TASK_LIMIT:-50}
+      - AGENTMEM_EMBEDDING_PROVIDER=${AGENTMEM_EMBEDDING_PROVIDER:-}
+      - AGENTMEM_OPENAI_API_KEY=${AGENTMEM_OPENAI_API_KEY:-}
+      - AGENTMEM_OPENAI_BASE_URL=${AGENTMEM_OPENAI_BASE_URL:-}
+      - AGENTMEM_OPENAI_EMBED_MODEL=${AGENTMEM_OPENAI_EMBED_MODEL:-}
+      - AGENTMEM_OLLAMA_BASE_URL=${AGENTMEM_OLLAMA_BASE_URL:-}
+      - AGENTMEM_GEMINI_API_KEY=${AGENTMEM_GEMINI_API_KEY:-}
     depends_on:
       redis:
         condition: service_healthy
@@ -49,7 +55,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 1G
+          memory: 2G
         reservations:
           memory: 256M
     healthcheck:

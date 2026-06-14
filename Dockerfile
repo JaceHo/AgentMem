@@ -1,17 +1,28 @@
-FROM python:3.12-slim AS base
+FROM python:3.12-slim AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential curl && rm -rf /var/lib/apt/lists/*
+    build-essential && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 
 # Pre-download the embedding model so the container starts fast
-# Must match LocalProvider._MODEL_NAME in core/embedder.py
-RUN python -c "from sentence_transformers import SentenceTransformer; \
+RUN pip install --no-cache-dir --prefix=/install sentence-transformers && \
+    python -c "from sentence_transformers import SentenceTransformer; \
     SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')"
+
+# ── Runtime stage ─────────────────────────────────────────────────────────────
+FROM python:3.12-slim AS runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy installed packages from builder
+COPY --from=builder /install /usr/local
 
 COPY . .
 
@@ -22,7 +33,9 @@ RUN groupadd -r agentmem && useradd -r -g agentmem -d /app -s /sbin/nologin agen
 
 ENV AGENTMEM_HOST=0.0.0.0 \
     AGENTMEM_PORT=18800 \
-    REDIS_URL=redis://redis:6379
+    REDIS_URL=redis://redis:6379 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
 EXPOSE 18800
 

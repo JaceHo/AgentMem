@@ -431,6 +431,11 @@ async def entity_recall(
     return relevant
 
 
+_graph_stats_cache: dict | None = None
+_graph_stats_cache_ts: float = 0
+_GRAPH_STATS_TTL = 60.0  # seconds
+
+
 async def graph_stats(r: aioredis.Redis) -> dict:
     """
     Count nodes and edges in the knowledge graph.
@@ -440,6 +445,12 @@ async def graph_stats(r: aioredis.Redis) -> dict:
     Handles both Hash-based typed edges (v1.1) and legacy Set-based edges (v0.9.0).
     Uses pipeline for batched size lookups (avoids N+1 queries).
     """
+    global _graph_stats_cache, _graph_stats_cache_ts
+    import time as _time
+    now = _time.time()
+    if _graph_stats_cache is not None and (now - _graph_stats_cache_ts) < _GRAPH_STATS_TTL:
+        return _graph_stats_cache
+
     node_keys = []
     async for key in r.scan_iter(f"{GRAPH_PREFIX}*"):
         node_keys.append(key)
@@ -476,7 +487,7 @@ async def graph_stats(r: aioredis.Redis) -> dict:
 
     directed = edge_count
     undirected = directed // 2
-    return {
+    result = {
         "node_count": node_count,
         "edge_count_directed": directed,
         "edge_count_undirected": undirected,
@@ -486,6 +497,9 @@ async def graph_stats(r: aioredis.Redis) -> dict:
         "total_nodes": node_count,
         "total_edges": undirected,
     }
+    _graph_stats_cache = result
+    _graph_stats_cache_ts = now
+    return result
 
 
 async def find_bridge_nodes(
