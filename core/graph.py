@@ -117,6 +117,7 @@ return 0
 """
 
 _edge_script = None  # cached Script object
+_edge_script_lock = asyncio.Lock()  # protects _edge_script initialization
 
 
 def _slug(entity: str) -> str:
@@ -176,7 +177,9 @@ async def record_entities(
 
     global _edge_script
     if _edge_script is None:
-        _edge_script = r.register_script(_UPSERT_EDGE_LUA)
+        async with _edge_script_lock:
+            if _edge_script is None:
+                _edge_script = r.register_script(_UPSERT_EDGE_LUA)
 
     now_ms = int(time.time() * 1000)
 
@@ -237,7 +240,9 @@ async def add_typed_edge(
 
     global _edge_script
     if _edge_script is None:
-        _edge_script = r.register_script(_UPSERT_EDGE_LUA)
+        async with _edge_script_lock:
+            if _edge_script is None:
+                _edge_script = r.register_script(_UPSERT_EDGE_LUA)
 
     now_ms = int(time.time() * 1000)
 

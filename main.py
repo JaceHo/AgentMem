@@ -388,6 +388,30 @@ async def api_key_guard(request: Request, call_next):
         return JSONResponse(status_code=401, content={"detail": "Invalid or missing API key"})
     return await call_next(request)
 
+# Request tracing: assign a unique ID to each request for log correlation
+import uuid as _uuid
+
+@app.middleware("http")
+async def request_tracing(request: Request, call_next):
+    """Assign a unique request ID and log request/response timing."""
+    request_id = request.headers.get("X-Request-ID") or str(_uuid.uuid4())[:8]
+    request.state.request_id = request_id
+
+    import time as _time
+    start = _time.monotonic()
+    response = await call_next(request)
+    elapsed_ms = int((_time.monotonic() - start) * 1000)
+
+    response.headers["X-Request-ID"] = request_id
+    response.headers["X-Response-Time"] = f"{elapsed_ms}ms"
+
+    # Structured access log for production monitoring
+    log.info(
+        "[access] %s %s → %d (%dms) rid=%s",
+        request.method, request.url.path, response.status_code, elapsed_ms, request_id,
+    )
+    return response
+
 # ── Static files + SSE log router ─────────────────────────────────────────────
 import os as _os
 _static_dir = _os.path.join(_os.path.dirname(__file__), "static")

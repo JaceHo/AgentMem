@@ -420,7 +420,7 @@ async def _llm_extract(conversation_text: str) -> list[ExtractedFact]:
     # Filter out circuit-broken models
     candidate_models = [(m, t) for m, t in candidate_models if m not in _model_fail_times]
     if not candidate_models:
-        log.warning("[extractor] all models circuit-broken, returning empty list")
+        log.warning("[extractor] all models circuit-broken, falling back to regex-only")
         return []
 
     for model, tier in candidate_models:
@@ -564,9 +564,9 @@ async def _llm_extract(conversation_text: str) -> list[ExtractedFact]:
             _model_fail_times[model] = _time.time()
             asyncio.create_task(_report_quality(model, -1, reason="other"))
 
-    log.error(
+    log.warning(
         "[extractor] All LLM models exhausted after %d attempts. Tried: %s. "
-        "Returning empty list - caller should use regex fallback.",
+        "Falling back to regex-only extraction.",
         LLM_MAX_RETRIES, ", ".join(tried_models) if tried_models else "none"
     )
     return []

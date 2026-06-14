@@ -59,16 +59,20 @@ async def _report_quality(model: str, score: int, reason: str = "") -> None:
 
     reason: optional ("timeout"/"5xx"/"other") — when set on score=-1, aiserv
     triggers an urgent re-probe and temporarily suppresses the failing route.
+    Never raises — caller uses asyncio.create_task() so exceptions would be silently lost.
     """
-    payload: dict = {"model": model, "score": score, "task_type": "language"}
-    if reason:
-        payload["reason"] = reason
-    await async_post_json(
-        f"{AISERV_BASE}/v1/quality-feedback",
-        payload=payload,
-        headers={"Authorization": f"Bearer {AISERV_KEY}"},
-        timeout=2.0,
-    )
+    try:
+        payload: dict = {"model": model, "score": score, "task_type": "language"}
+        if reason:
+            payload["reason"] = reason
+        await async_post_json(
+            f"{AISERV_BASE}/v1/quality-feedback",
+            payload=payload,
+            headers={"Authorization": f"Bearer {AISERV_KEY}"},
+            timeout=2.0,
+        )
+    except Exception:
+        pass  # best-effort; never block the caller
 
 
 async def summarize(text: str) -> str:

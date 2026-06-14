@@ -152,25 +152,41 @@ mcp = FastMCP(
 
 # ── HTTP helpers ──────────────────────────────────────────────────────────────
 
+# Shared client — avoids creating a new connection pool per request.
+# httpx.AsyncClient with connection pooling is significantly faster for
+# repeated calls (MCP tools call the backend frequently).
+_shared_client: httpx.AsyncClient | None = None
+
+
+async def _get_client() -> httpx.AsyncClient:
+    global _shared_client
+    if _shared_client is None or _shared_client.is_closed:
+        _shared_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(TIMEOUT),
+            limits=httpx.Limits(max_connections=50, max_keepalive_connections=10, keepalive_expiry=30),
+        )
+    return _shared_client
+
+
 async def _post(path: str, payload: dict) -> dict:
-    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-        resp = await client.post(f"{BASE_URL}{path}", json=payload)
-        resp.raise_for_status()
-        return resp.json()
+    client = await _get_client()
+    resp = await client.post(f"{BASE_URL}{path}", json=payload)
+    resp.raise_for_status()
+    return resp.json()
 
 
 async def _get(path: str, params: dict | None = None) -> dict:
-    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-        resp = await client.get(f"{BASE_URL}{path}", params=params or {})
-        resp.raise_for_status()
-        return resp.json()
+    client = await _get_client()
+    resp = await client.get(f"{BASE_URL}{path}", params=params or {})
+    resp.raise_for_status()
+    return resp.json()
 
 
 async def _delete(path: str) -> dict:
-    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-        resp = await client.delete(f"{BASE_URL}{path}")
-        resp.raise_for_status()
-        return resp.json()
+    client = await _get_client()
+    resp = await client.delete(f"{BASE_URL}{path}")
+    resp.raise_for_status()
+    return resp.json()
 
 
 def _dead() -> str:

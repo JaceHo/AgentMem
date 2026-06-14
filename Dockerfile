@@ -9,8 +9,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Pre-download the embedding model so the container starts fast
+# Must match LocalProvider._MODEL_NAME in core/embedder.py
 RUN python -c "from sentence_transformers import SentenceTransformer; \
-    SentenceTransformer('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')"
+    SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')"
 
 COPY . .
 
@@ -24,4 +25,5 @@ HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
     CMD curl -sf http://localhost:18800/health || exit 1
 
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "18800", \
-     "--log-level", "info", "--timeout-graceful-shutdown", "0"]
+     "--log-level", "info", "--timeout-graceful-shutdown", "30", \
+     "--workers", "1", "--loop", "uvloop", "--http", "httptools"]
