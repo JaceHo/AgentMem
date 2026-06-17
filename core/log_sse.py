@@ -25,6 +25,7 @@ import asyncio
 import json
 import logging
 import os
+import threading
 import time
 import uuid
 from collections import deque
@@ -51,6 +52,7 @@ _MAX_DISK_BYTES = 5 * 1024 * 1024
 # ── State ─────────────────────────────────────────────────────────────────────
 
 _connections: Dict[str, asyncio.Queue] = {}        # connection_id → queue
+_connections_lock = threading.Lock()                 # protects _connections across threads
 _buffer: Deque[dict] = deque(maxlen=_BUFFER_SIZE)  # in-memory ring of log dicts
 
 
@@ -142,6 +144,7 @@ class LogSSEHandler(logging.Handler):
 
     _DISK_FLUSH_INTERVAL = 2.0   # seconds between flushes
     _DISK_FLUSH_THRESHOLD = 50   # entries before immediate flush
+    _DISK_BUFFER_MAX = 200       # cap to prevent unbounded growth on flush failures
 
     def __init__(self, level: int = logging.INFO):
         super().__init__(level)
@@ -181,13 +184,19 @@ class LogSSEHandler(logging.Handler):
             }
             _buffer.append(entry)
             # Buffer disk write instead of per-record I/O
-            self._disk_buffer.append(json.dumps(entry, ensure_ascii=False) + "\n")
+            if len(self._disk_buffer) < self._DISK_BUFFER_MAX:
+                self._disk_buffer.append(json.dumps(entry, ensure_ascii=False) + "\n")
             now = time.monotonic()
             if (len(self._disk_buffer) >= self._DISK_FLUSH_THRESHOLD
                     or now - self._last_flush >= self._DISK_FLUSH_INTERVAL):
                 self._flush_disk()
             payload = json.dumps(entry, ensure_ascii=False)
-            for q in list(_connections.values()):
+            # Thread-safe: snapshot connections under lock to avoid
+            # RuntimeError from concurrent dict mutation (emit runs in
+            # logging thread, connect/disconnect in asyncio thread).
+            with _connections_lock:
+                queues = list(_connections.values())
+            for q in queues:
                 try:
                     q.put_nowait(payload)
                 except asyncio.QueueFull:
@@ -226,7 +235,8 @@ async def log_stream(request: Request):
     """
     cid = str(uuid.uuid4())
     q: asyncio.Queue = asyncio.Queue(maxsize=500)
-    _connections[cid] = q
+    with _connections_lock:
+        _connections[cid] = q
 
     welcome = json.dumps({
         "ts":    _now_iso(),
@@ -251,7 +261,8 @@ async def log_stream(request: Request):
                     # ignores it entirely and it never reaches `onmessage`.
                     yield ": keepalive\n\n"
         finally:
-            _connections.pop(cid, None)
+            with _connections_lock:
+                _connections.pop(cid, None)
 
     return StreamingResponse(
         _generate(),
@@ -266,16 +277,20 @@ async def log_stream(request: Request):
 
 @log_sse_router.get("/logs/connections")
 async def log_connections():
-    return {"active": len(_connections)}
+    with _connections_lock:
+        count = len(_connections)
+    return {"active": count}
 
 
 # ── Back-compat broadcast helper (kept so existing callers don't break) ───────
 
 async def broadcast(event_type: str, data: dict) -> None:
-    if not _connections:
+    with _connections_lock:
+        queues = list(_connections.values())
+    if not queues:
         return
     payload = json.dumps({"ts": _now_iso(), "event": event_type, **data})
-    for q in list(_connections.values()):
+    for q in queues:
         try:
             q.put_nowait(payload)
         except asyncio.QueueFull:

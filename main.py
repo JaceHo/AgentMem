@@ -377,8 +377,11 @@ async def redis_guard(request: Request, call_next):
 
 # Write-endpoint auth: if AGENTMEM_API_KEY is set, require X-API-Key header
 # for mutating endpoints. Read endpoints (GET /recall, /health, /stats) remain open.
-_WRITE_PREFIXES = ("/store", "/session/compress", "/session/clear",
-                   "/admin/", "/consolidate", "/crystallize", "/feedback")
+_WRITE_PREFIXES = ("/store", "/session/compress", "/session/clear", "/session/compact",
+                   "/admin/", "/consolidate", "/crystallize", "/feedback",
+                   "/register-tools", "/register-env", "/store-procedure",
+                   "/tool-feedback", "/procedure-feedback", "/record-tool-sequence",
+                   "/tool-graph/", "/observe")
 
 @app.middleware("http")
 async def api_key_guard(request: Request, call_next):

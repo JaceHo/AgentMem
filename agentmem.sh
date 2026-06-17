@@ -46,13 +46,19 @@ _kill_stale() {
     stale=$(lsof -ti "tcp:$PORT" 2>/dev/null || true)
     if [ -n "$stale" ]; then
         echo "  Killing stale process on :$PORT (pid $stale)"
-        echo "$stale" | xargs kill -9 2>/dev/null || true
-        sleep 1
+        echo "$stale" | xargs kill 2>/dev/null || true
+        sleep 2
+        # If still alive, force kill
+        stale=$(lsof -ti "tcp:$PORT" 2>/dev/null || true)
+        if [ -n "$stale" ]; then
+            echo "$stale" | xargs kill -9 2>/dev/null || true
+            sleep 1
+        fi
     fi
 }
 
 _start_direct() {
-    """Start uvicorn directly (no launchd). Used by 'start' and 'restart' fallback."""
+    # Start uvicorn directly (no launchd). Used by 'start' and 'restart' fallback.
     _kill_stale
     _register_capabilities &
     if ! $NO_AUTO; then
