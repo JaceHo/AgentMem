@@ -23,7 +23,7 @@ import numpy as np
 from core import extractor
 from core import store as mem_store
 from core.http import async_post_json
-from core.search import BM25Index, encode, encode_batch, vscan
+from core.search import BM25Index, async_encode_batch_chunked, encode, vscan
 
 log = logging.getLogger("mem")
 
@@ -132,16 +132,12 @@ async def do_consolidate(
     merged_count = 0
     superseded_elements: set[str] = set()
 
-    # Batch-encode all fact contents off the event loop to avoid blocking
+    # Encode fact contents in chunks — a single batch over ~1k+ facts times out
+    # on remote embedding APIs (ReadTimeout at 15s).
     fact_contents = [f["attrs"]["content"] for f in all_facts]
-    try:
-        fact_vecs = await asyncio.wait_for(
-            asyncio.to_thread(encode_batch, fact_contents),
-            timeout=30.0,
-        )
-    except (asyncio.TimeoutError, Exception) as e:
-        log.warning(f"[consolidate] encode_batch failed ({type(e).__name__}: {e}), skipping merge phase")
-        fact_vecs = None
+    fact_vecs = await async_encode_batch_chunked(fact_contents)
+    if fact_vecs is None:
+        log.warning("[consolidate] encode_batch failed, skipping merge phase")
 
     if fact_vecs is not None:
         fact_embeddings: dict[str, np.ndarray] = {

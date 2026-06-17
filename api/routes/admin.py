@@ -1,5 +1,6 @@
 """Admin routes — consolidation, crystallization, feedback, fact management, lifecycle."""
 
+import asyncio
 import logging
 import time
 
@@ -28,8 +29,17 @@ async def consolidate(background_tasks: BackgroundTasks):
 async def consolidate_sync():
     """Synchronous consolidation — returns results immediately."""
     from services.consolidation_service import do_consolidate
-    result = await do_consolidate(state.redis, state.bm25_index, state.spawn)
-    return result
+    try:
+        return await asyncio.wait_for(
+            do_consolidate(state.redis, state.bm25_index, state.spawn),
+            timeout=300.0,
+        )
+    except asyncio.TimeoutError:
+        log.warning("[consolidate] sync endpoint timed out (300s limit)")
+        return {
+            "error": "consolidation timed out after 300s",
+            "merged": 0, "decayed": 0, "pruned": 0, "ms": 300_000,
+        }
 
 
 @router.post("/consolidate/hard-prune")

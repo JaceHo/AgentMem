@@ -29,7 +29,7 @@ from __future__ import annotations
 import os
 import threading
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import Callable, Optional
 
 # Prevent sentence-transformers from phoning home to HuggingFace Hub
 # when using Ollama or other non-local providers. Avoids 30s+ timeouts.
@@ -37,6 +37,37 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
 import numpy as np
 import httpx
+
+# Max texts per HTTP request for remote embedding providers.
+_HTTP_EMBED_CHUNK = 32
+# Read timeout for embedding API calls (remote proxies can be slow).
+_HTTP_EMBED_TIMEOUT = httpx.Timeout(30.0, connect=5.0)
+
+
+def _normalize_vectors(raw_embeddings: list) -> list[np.ndarray]:
+    results = []
+    for emb in raw_embeddings:
+        vec = np.array(emb, dtype=np.float32)
+        norm = np.linalg.norm(vec)
+        if norm > 0:
+            vec = vec / norm
+        results.append(vec)
+    return results
+
+
+def _chunked_http_encode(
+    texts: list[str],
+    encode_chunk: Callable[[list[str]], list[np.ndarray]],
+) -> list[np.ndarray]:
+    """Split large batches into HTTP-sized chunks for remote providers."""
+    if not texts:
+        return []
+    if len(texts) <= _HTTP_EMBED_CHUNK:
+        return encode_chunk(texts)
+    results: list[np.ndarray] = []
+    for i in range(0, len(texts), _HTTP_EMBED_CHUNK):
+        results.extend(encode_chunk(texts[i:i + _HTTP_EMBED_CHUNK]))
+    return results
 
 # ── Public API (unchanged) ──────────────────────────────────────────
 
@@ -165,28 +196,23 @@ class OllamaProvider(BaseProvider):
 
     def _get_client(self) -> httpx.Client:
         if self._client is None or self._client.is_closed:
-            self._client = httpx.Client(timeout=httpx.Timeout(15.0, connect=5.0))
+            self._client = httpx.Client(timeout=_HTTP_EMBED_TIMEOUT)
         return self._client
 
     def encode(self, text: str) -> np.ndarray:
         return self.encode_batch([text])[0]
 
     def encode_batch(self, texts: list[str]) -> list[np.ndarray]:
-        results = []
+        return _chunked_http_encode(texts, self._encode_batch_http)
+
+    def _encode_batch_http(self, texts: list[str]) -> list[np.ndarray]:
         r = self._get_client().post(
             f"{self.base_url}/api/embed",
             json={"model": self.model, "input": texts},
         )
         r.raise_for_status()
         data = r.json()
-        embeddings = data.get("embeddings", [])
-        for emb in embeddings:
-            vec = np.array(emb, dtype=np.float32)
-            norm = np.linalg.norm(vec)
-            if norm > 0:
-                vec = vec / norm
-            results.append(vec)
-        return results
+        return _normalize_vectors(data.get("embeddings", []))
 
 
 # ── OpenAI-compatible ───────────────────────────────────────────────
@@ -219,13 +245,16 @@ class OpenAIProvider(BaseProvider):
 
     def _get_client(self) -> httpx.Client:
         if self._client is None or self._client.is_closed:
-            self._client = httpx.Client(timeout=httpx.Timeout(15.0, connect=5.0))
+            self._client = httpx.Client(timeout=_HTTP_EMBED_TIMEOUT)
         return self._client
 
     def encode(self, text: str) -> np.ndarray:
         return self.encode_batch([text])[0]
 
     def encode_batch(self, texts: list[str]) -> list[np.ndarray]:
+        return _chunked_http_encode(texts, self._encode_batch_http)
+
+    def _encode_batch_http(self, texts: list[str]) -> list[np.ndarray]:
         url = f"{self.base_url}/embeddings"
         r = self._get_client().post(
             url,
@@ -237,14 +266,7 @@ class OpenAIProvider(BaseProvider):
         )
         r.raise_for_status()
         data = r.json()
-        results = []
-        for item in data["data"]:
-            vec = np.array(item["embedding"], dtype=np.float32)
-            norm = np.linalg.norm(vec)
-            if norm > 0:
-                vec = vec / norm
-            results.append(vec)
-        return results
+        return _normalize_vectors(item["embedding"] for item in data["data"])
 
 
 # ── Gemini ──────────────────────────────────────────────────────────
@@ -266,13 +288,16 @@ class GeminiProvider(BaseProvider):
 
     def _get_client(self) -> httpx.Client:
         if self._client is None or self._client.is_closed:
-            self._client = httpx.Client(timeout=httpx.Timeout(15.0, connect=5.0))
+            self._client = httpx.Client(timeout=_HTTP_EMBED_TIMEOUT)
         return self._client
 
     def encode(self, text: str) -> np.ndarray:
         return self.encode_batch([text])[0]
 
     def encode_batch(self, texts: list[str]) -> list[np.ndarray]:
+        return _chunked_http_encode(texts, self._encode_batch_http)
+
+    def _encode_batch_http(self, texts: list[str]) -> list[np.ndarray]:
         url = (
             f"https://generativelanguage.googleapis.com/v1beta/"
             f"{self.model}:batchEmbedContents?key={self.api_key}"
@@ -291,14 +316,7 @@ class GeminiProvider(BaseProvider):
         )
         r.raise_for_status()
         data = r.json()
-        results = []
-        for emb in data.get("embeddings", []):
-            vec = np.array(emb["values"], dtype=np.float32)
-            norm = np.linalg.norm(vec)
-            if norm > 0:
-                vec = vec / norm
-            results.append(vec)
-        return results
+        return _normalize_vectors(emb["values"] for emb in data.get("embeddings", []))
 
 
 # ── Auto-detection ──────────────────────────────────────────────────

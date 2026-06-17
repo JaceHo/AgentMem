@@ -46,6 +46,43 @@ def encode_batch(texts: list[str]) -> list[np.ndarray]:
     return [np.asarray(v, dtype=np.float32) for v in vecs]
 
 
+async def async_encode_batch_chunked(
+    texts: list[str],
+    *,
+    batch_size: int = 64,
+    timeout_per_batch: float = 60.0,
+    max_retries: int = 1,
+) -> list[np.ndarray] | None:
+    """Encode texts in chunks off the event loop.
+
+    Returns None if any chunk fails after retries — callers should skip
+    operations that depend on the full embedding matrix (e.g. merge phase).
+    """
+    if not texts:
+        return []
+    all_vecs: list[np.ndarray] = []
+    for offset in range(0, len(texts), batch_size):
+        batch = texts[offset:offset + batch_size]
+        for attempt in range(max_retries + 1):
+            try:
+                vecs = await asyncio.wait_for(
+                    asyncio.to_thread(encode_batch, batch),
+                    timeout=timeout_per_batch,
+                )
+                all_vecs.extend(vecs)
+                break
+            except (asyncio.TimeoutError, Exception) as e:
+                if attempt < max_retries:
+                    await asyncio.sleep(0.5)
+                    continue
+                log.warning(
+                    "[encode] chunk at offset %d failed (%s: %s)",
+                    offset, type(e).__name__, e,
+                )
+                return None
+    return all_vecs
+
+
 # ── Zero-vector for VSIM scan-all ─────────────────────────────────────────────
 # Lazily computed to avoid stale dimensions if provider changes at runtime
 # (dimension guard in lifespan can reset provider, changing DIMS).

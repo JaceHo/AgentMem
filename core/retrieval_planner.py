@@ -117,9 +117,9 @@ async def _llm_call(prompt: str, system: str, max_tokens: int = 300) -> str | No
                 content = choices[0]["message"].get("content")
                 if content and content.strip():
                     return content.strip()
-        log.warning("[planner] %s returned no usable response", model)
+        log.debug("[planner] %s returned no usable response", model)
         _mark_model_failed(model)  # trip circuit breaker
-    log.warning("[planner] All models exhausted (%s)", ", ".join(tried))
+    log.debug("[planner] All models exhausted (%s)", ", ".join(tried))
     return None
 
 
