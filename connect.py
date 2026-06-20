@@ -187,8 +187,7 @@ def connect_cursor(dry_run: bool = False, force: bool = False) -> str:
     already = "agentmem" in mcp_servers
 
     mcp_entry = {
-        "type": "http",
-        "url": f"{AGENTMEM_URL.rstrip('/')}/mcp",
+        "url": f"http://127.0.0.1:18800/mcp",
     }
     if AGENTMEM_SECRET:
         mcp_entry["headers"] = {"X-API-Key": AGENTMEM_SECRET}
