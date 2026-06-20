@@ -390,13 +390,24 @@ async def compat_forget(req: ForgetRequest, request: Request):
 
 
 @router.post("/compress-file")
-async def compress_file(filePath: str = ""):
-    if not filePath or not os.path.isfile(filePath):
+async def compress_file(filePath: str = "", request: Request = None):
+    _compat_check_auth(request)
+
+    # Path traversal protection: only allow .md files under home directory
+    if not filePath:
+        raise HTTPException(status_code=400, detail="filePath is required")
+    resolved = os.path.realpath(filePath)
+    home_dir = os.path.expanduser("~")
+    if not resolved.startswith(home_dir):
+        raise HTTPException(status_code=403, detail="file must be under home directory")
+    if not resolved.endswith(".md"):
+        raise HTTPException(status_code=400, detail="only .md files are supported")
+    if not os.path.isfile(resolved):
         raise HTTPException(status_code=404, detail=f"file not found: {filePath}")
     try:
-        with open(filePath, "r") as f:
+        with open(resolved, "r") as f:
             content = f.read()
-        backup_path = filePath.replace(".md", ".original.md")
+        backup_path = resolved.replace(".md", ".original.md")
         if not os.path.exists(backup_path):
             with open(backup_path, "w") as f:
                 f.write(content)
@@ -410,7 +421,7 @@ async def compress_file(filePath: str = ""):
                 compressed.append(stripped[:120] + "…")
             elif stripped:
                 compressed.append(line)
-        with open(filePath, "w") as f:
+        with open(resolved, "w") as f:
             f.write("\n".join(compressed))
         return {"status": "ok", "original_lines": len(lines), "compressed_lines": len(compressed)}
     except Exception as e:
@@ -605,7 +616,8 @@ async def compat_profile():
 
 
 @router.get("/export")
-async def compat_export():
+async def compat_export(request: Request):
+    _compat_check_auth(request)
     r = state.redis
     export = {"version": "1.2.0", "exported_at": time.time(), "facts": [], "episodes": []}
 
@@ -677,8 +689,8 @@ async def compat_import(req: ImportRequest, request: Request):
 
 
 async def _list_memories(limit: int = 50, category: str = "") -> dict:
-    limit = _clamp(limit, 1, 500)
     """Shared logic for listing memories."""
+    limit = _clamp(limit, 1, 500)
     r = state.redis
     seed = np.zeros(embedder._get_provider().dims, dtype=np.float32)
     card = await r.execute_command("VCARD", mem_store.FACT_KEY)

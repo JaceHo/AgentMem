@@ -32,18 +32,21 @@ async def register_tools(req: RegisterToolsRequest, background_tasks: Background
     async def _do_register():
         count = 0
         for tool in req.tools:
-            emb = encode(f"{tool.name}: {tool.description}")
-            await cap_mod.register_tool(
-                state.redis,
-                name=tool.name,
-                description=tool.description,
-                embedding=emb,
-                category=tool.category,
-                source=tool.source,
-                parameters=tool.parameters or [],
-                agent_id=req.agent_id,
-            )
-            count += 1
+            try:
+                emb = encode(f"{tool.name}: {tool.description}")
+                await cap_mod.register_tool(
+                    state.redis,
+                    name=tool.name,
+                    description=tool.description,
+                    embedding=emb,
+                    category=tool.category,
+                    source=tool.source,
+                    parameters=tool.parameters or [],
+                    agent_id=req.agent_id,
+                )
+                count += 1
+            except Exception as e:
+                log.warning("[tools] failed to register %s: %s", tool.name, e)
         log.info(f"[tools] registered {count} tools (agent={req.agent_id})")
 
     background_tasks.add_task(_do_register)

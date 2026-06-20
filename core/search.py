@@ -51,12 +51,14 @@ async def async_encode_batch_chunked(
     *,
     batch_size: int = 64,
     timeout_per_batch: float = 60.0,
-    max_retries: int = 1,
+    max_retries: int = 2,
 ) -> list[np.ndarray] | None:
     """Encode texts in chunks off the event loop.
 
     Returns None if any chunk fails after retries — callers should skip
     operations that depend on the full embedding matrix (e.g. merge phase).
+    Retries with exponential backoff to handle transient embedding service
+    failures (502, 403, timeouts) common in production.
     """
     if not texts:
         return []
@@ -73,11 +75,16 @@ async def async_encode_batch_chunked(
                 break
             except (asyncio.TimeoutError, Exception) as e:
                 if attempt < max_retries:
-                    await asyncio.sleep(0.5)
+                    backoff = 0.5 * (2 ** attempt)
+                    log.info(
+                        "[encode] chunk at offset %d attempt %d/%d failed, retrying in %.1fs (%s: %s)",
+                        offset, attempt + 1, max_retries + 1, backoff, type(e).__name__, e,
+                    )
+                    await asyncio.sleep(backoff)
                     continue
                 log.warning(
-                    "[encode] chunk at offset %d failed (%s: %s)",
-                    offset, type(e).__name__, e,
+                    "[encode] chunk at offset %d failed after %d attempts (%s: %s)",
+                    offset, max_retries + 1, type(e).__name__, e,
                 )
                 return None
     return all_vecs

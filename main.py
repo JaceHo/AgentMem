@@ -87,6 +87,7 @@ Endpoints:
 
 import asyncio
 import json
+import hmac
 import logging
 import re
 import time
@@ -207,10 +208,25 @@ async def _encode_batch_async(texts: list[str]) -> list[np.ndarray]:
     """Batch-encode texts off the event loop using a single model forward pass.
 
     Uses asyncio.to_thread so the CPU-bound inference doesn't block the event loop.
+    Falls back to per-text encoding if batch fails (handles partial provider failures).
     """
     if not texts:
         return []
-    return list(await asyncio.to_thread(embedder.encode_batch, texts))
+    try:
+        return list(await asyncio.to_thread(embedder.encode_batch, texts))
+    except Exception as e:
+        log.warning("[encode_batch] batch encode failed (%s: %s), falling back to per-text", type(e).__name__, e)
+        # Fallback: try encoding texts individually — some may succeed
+        results = []
+        for text in texts:
+            try:
+                vec = await asyncio.to_thread(embedder.encode, text)
+                results.append(vec)
+            except Exception:
+                # Last resort: zero vector so the pipeline doesn't crash
+                log.warning("[encode_batch] single encode failed, using zero vector")
+                results.append(np.zeros(embedder.DIMS, dtype=np.float32))
+        return results
 
 # ── Session handoff: pinned last-session summary ───────────────────────────────
 # Key stores the most recent session summary so the NEXT session can always
@@ -381,7 +397,8 @@ _WRITE_PREFIXES = ("/store", "/session/compress", "/session/clear", "/session/co
                    "/admin/", "/consolidate", "/crystallize", "/feedback",
                    "/register-tools", "/register-env", "/store-procedure",
                    "/tool-feedback", "/procedure-feedback", "/record-tool-sequence",
-                   "/tool-graph/", "/observe")
+                   "/tool-graph/", "/observe", "/export", "/import",
+                   "/compress-file", "/forget", "/remember")
 
 @app.middleware("http")
 async def api_key_guard(request: Request, call_next):
@@ -393,7 +410,7 @@ async def api_key_guard(request: Request, call_next):
     if not needs_auth:
         return await call_next(request)
     provided = request.headers.get("X-API-Key", "")
-    if provided != settings.api_key:
+    if not hmac.compare_digest(provided, settings.api_key):
         from fastapi.responses import JSONResponse
         return JSONResponse(status_code=401, content={"detail": "Invalid or missing API key"})
     return await call_next(request)
@@ -1624,7 +1641,12 @@ async def recall(req: RecallRequest):
     # Detect scene of incoming query
     query_scene = scene_mod.detect(req.query)
     q_lang, q_domain = query_scene["language"], query_scene["domain"]
-    emb = await asyncio.to_thread(_encode, req.query)
+    try:
+        emb = await asyncio.to_thread(_encode, req.query)
+    except Exception as e:
+        log.error("[recall] embedding failed: %s", e)
+        ms = int((time.time() - t0) * 1000)
+        return {"prependContext": "", "facts": [], "episodes": [], "latency_ms": ms, "error": "embedding service unavailable"}
 
     # HyDE + MIRIX Active Retrieval Topic — run both in parallel for zero extra latency.
     #
@@ -1650,10 +1672,13 @@ async def recall(req: RecallRequest):
     _mirix_topic = _augment_results[1] if isinstance(_augment_results[1], str) else None
 
     if _hyde_doc:
-        hyde_emb = await asyncio.to_thread(_encode, _hyde_doc)
-        merged = (emb * 0.5 + hyde_emb * 0.5).astype(np.float32)
-        norm = np.linalg.norm(merged)
-        emb = merged / norm if norm > 0 else merged
+        try:
+            hyde_emb = await asyncio.to_thread(_encode, _hyde_doc)
+            merged = (emb * 0.5 + hyde_emb * 0.5).astype(np.float32)
+            norm = np.linalg.norm(merged)
+            emb = merged / norm if norm > 0 else merged
+        except Exception:
+            log.debug("[recall] HyDE embedding failed, using query embedding only")
 
     # Use MIRIX topic for BM25 search when available (vague queries benefit most)
     _bm25_query = _mirix_topic if _mirix_topic else req.query
