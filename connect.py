@@ -187,10 +187,11 @@ def connect_cursor(dry_run: bool = False, force: bool = False) -> str:
     already = "agentmem" in mcp_servers
 
     mcp_entry = {
-        "command": "python3",
-        "args": [os.path.abspath(os.path.join(HOOKS_DIR, "..", "mcp_server.py"))],
-        "env": _mcp_env_block(),
+        "type": "http",
+        "url": f"{AGENTMEM_URL.rstrip('/')}/mcp",
     }
+    if AGENTMEM_SECRET:
+        mcp_entry["headers"] = {"X-API-Key": AGENTMEM_SECRET}
 
     if already and not force:
         return f"✓ cursor (already wired in {mcp_path})"

@@ -369,7 +369,7 @@ async def lifespan(app: FastAPI):
     await mem_store.close_pool()
 
 
-app = FastAPI(title="AgentMem — Local Agent Memory Service", version=APP_VERSION, lifespan=lifespan)
+app = FastAPI(title="AgentMem — Local Agent Memory Service", version=APP_VERSION, lifespan=lifespan, redirect_slashes=False)
 
 
 @app.exception_handler(Exception)
@@ -380,6 +380,15 @@ async def global_exception_handler(request: Request, exc: Exception):
     log.error("[unhandled] %s %s → %s\n%s", request.method, request.url.path, exc, "".join(tb))
     from fastapi.responses import JSONResponse
     return JSONResponse(status_code=500, content={"detail": str(exc), "type": type(exc).__name__})
+
+
+@app.middleware("http")
+async def mcp_path_rewrite(request: Request, call_next):
+    """Rewrite /mcp → /mcp/ before routing (MCP clients POST without trailing slash)."""
+    if request.scope.get("path") == "/mcp":
+        request.scope["path"] = "/mcp/"
+        request.scope["raw_path"] = b"/mcp/"
+    return await call_next(request)
 
 
 @app.middleware("http")
@@ -469,8 +478,11 @@ app.include_router(admin_router)
 # ── MCP transports: Streamable HTTP (preferred) + SSE (legacy) ───────────────
 try:
     from mcp_server import build_mcp_app, build_sse_app
-    app.mount("/mcp",     build_mcp_app(), name="mcp_http")
-    app.mount("/mcp/sse", build_sse_app(), name="mcp_sse")
+    _mcp_asgi = build_mcp_app()
+    _sse_asgi = build_sse_app()
+
+    app.mount("/mcp/sse", _sse_asgi, name="mcp_sse")
+    app.mount("/mcp/", _mcp_asgi, name="mcp_http")
 except ImportError as _mcp_err:
     import logging as _logging
     _logging.getLogger(__name__).info("MCP server not available (install 'mcp' package): %s", _mcp_err)
