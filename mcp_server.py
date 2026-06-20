@@ -26,8 +26,8 @@ Per-agent config snippets
 Claude Code (.mcp.json):
     {"mcpServers": {"agentmem": {"type": "http", "url": "http://localhost:18800/mcp"}}}
 
-Cursor (.cursor/mcp.json):
-    {"mcpServers": {"agentmem": {"url": "http://localhost:18800/mcp"}}}
+Cursor (.cursor/mcp.json) — remote HTTP, no "type" field (see cursor.com/docs/context/mcp):
+    {"mcpServers": {"agentmem": {"url": "http://127.0.0.1:18800/mcp"}}}
 
 Windsurf (~/.codeium/windsurf/mcp_config.json):
     {"mcpServers": {"agentmem": {"serverUrl": "http://localhost:18800/mcp/sse"}}}
@@ -129,16 +129,18 @@ from __future__ import annotations
 
 import asyncio
 import json as _json
+import os
 
 import httpx
 
 from mcp.server.fastmcp import FastMCP
 
-BASE_URL = "http://127.0.0.1:18800"
+BASE_URL = os.getenv("AGENTMEMORY_URL", "http://127.0.0.1:18800").rstrip("/")
 TIMEOUT  = 12.0
 
 mcp = FastMCP(
     "agentmem",
+    json_response=True,
     instructions=(
         "AgentMem gives you persistent, cross-session memory. "
         "Call recall_memory at the start of each conversation with the user's question as the query. "

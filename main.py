@@ -482,7 +482,24 @@ try:
     _sse_asgi = build_sse_app()
 
     app.mount("/mcp/sse", _sse_asgi, name="mcp_sse")
-    app.mount("/mcp/", _mcp_asgi, name="mcp_http")
+
+    from starlette.routing import Mount as _Mount, Match as _Match
+
+    class _NoRedirectMount(_Mount):
+        """Serve POST /mcp (no trailing slash) without a 307 redirect."""
+
+        def matches(self, scope):
+            if scope.get("type") in ("http", "websocket"):
+                path = scope.get("path", "")
+                if path == "/mcp/sse" or path.startswith("/mcp/sse/"):
+                    return _Match.NONE, scope
+                if path == "/mcp":
+                    scope = dict(scope)
+                    scope["path"] = "/mcp/"
+                    scope["raw_path"] = b"/mcp/"
+            return super().matches(scope)
+
+    app.routes.insert(0, _NoRedirectMount("/mcp/", app=_mcp_asgi, name="mcp_http"))
 except ImportError as _mcp_err:
     import logging as _logging
     _logging.getLogger(__name__).info("MCP server not available (install 'mcp' package): %s", _mcp_err)
