@@ -68,6 +68,7 @@ _start_direct() {
         --host 0.0.0.0 \
         --port "$PORT" \
         --log-level info \
+        --timeout-keep-alive 75 \
         --timeout-graceful-shutdown 0 &
     echo "  Started (PID: $!)"
 }
@@ -188,6 +189,7 @@ case "${1:-help}" in
             --host 0.0.0.0 \
             --port "$PORT" \
             --log-level info \
+            --timeout-keep-alive 75 \
             --timeout-graceful-shutdown 0
         ;;
 
@@ -299,11 +301,11 @@ run_connect(all_agents=True)
                     | awk '{printf "  PID %-6s parent=%-6s started=%s %s %s %s %s\n", $1,$2,$3,$4,$5,$6,$7}'
             done
             echo ""
-            curl -sf "http://localhost:$PORT/health" 2>/dev/null \
+            curl -sf "http://127.0.0.1:$PORT/health" 2>/dev/null \
                 | python3 -m json.tool 2>/dev/null \
                 || echo "  (API not responding yet)"
             echo ""
-            curl -sf "http://localhost:$PORT/stats" 2>/dev/null \
+            curl -sf "http://127.0.0.1:$PORT/stats" 2>/dev/null \
                 | python3 -c "
 import json, sys
 try:
@@ -318,7 +320,7 @@ except: pass
 
     health)
         echo "Health:"
-        curl -sf "http://localhost:$PORT/health" | python3 -m json.tool 2>/dev/null \
+        curl -sf "http://127.0.0.1:$PORT/health" | python3 -m json.tool 2>/dev/null \
             || echo "  (not reachable)"
         ;;
 
@@ -429,7 +431,7 @@ except: pass
     setup)
         HOOKS_DIR="$SCRIPT_DIR/claude-code/hooks"
         CLAUDE_SETTINGS="$HOME/.claude/settings.json"
-        MCP_URL="http://localhost:$PORT"
+        MCP_URL="http://127.0.0.1:$PORT"
         MCP_SERVER_PY="$SCRIPT_DIR/mcp_server.py"
 
         # ── Parse --agent flag ────────────────────────────────────────────────
@@ -795,7 +797,7 @@ print('      Plist updated.')
         echo "[3/4] Waiting for service health (up to 40s)..."
         sleep 1
         for i in $(seq 1 200); do
-            STATUS=$(curl -sf -m 1 "http://localhost:$PORT/health" 2>/dev/null || echo "")
+            STATUS=$(curl -sf -m 1 "http://127.0.0.1:$PORT/health" 2>/dev/null || echo "")
             if echo "$STATUS" | python3 -c "import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get('status')=='ok' else 1)" 2>/dev/null; then
                 echo "      Service healthy (${i}00ms)."
                 break

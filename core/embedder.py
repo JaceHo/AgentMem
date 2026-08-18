@@ -196,7 +196,7 @@ class OllamaProvider(BaseProvider):
 
     def _get_client(self) -> httpx.Client:
         if self._client is None or self._client.is_closed:
-            self._client = httpx.Client(timeout=_HTTP_EMBED_TIMEOUT)
+            self._client = httpx.Client(timeout=_HTTP_EMBED_TIMEOUT, trust_env=False)
         return self._client
 
     def encode(self, text: str) -> np.ndarray:
@@ -245,7 +245,7 @@ class OpenAIProvider(BaseProvider):
 
     def _get_client(self) -> httpx.Client:
         if self._client is None or self._client.is_closed:
-            self._client = httpx.Client(timeout=_HTTP_EMBED_TIMEOUT)
+            self._client = httpx.Client(timeout=_HTTP_EMBED_TIMEOUT, trust_env=False)
         return self._client
 
     def encode(self, text: str) -> np.ndarray:
@@ -288,7 +288,7 @@ class GeminiProvider(BaseProvider):
 
     def _get_client(self) -> httpx.Client:
         if self._client is None or self._client.is_closed:
-            self._client = httpx.Client(timeout=_HTTP_EMBED_TIMEOUT)
+            self._client = httpx.Client(timeout=_HTTP_EMBED_TIMEOUT, trust_env=False)
         return self._client
 
     def encode(self, text: str) -> np.ndarray:
@@ -337,7 +337,7 @@ def _detect_provider() -> BaseProvider:
     try:
         import httpx
         base = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-        r = httpx.get(f"{base}/api/tags", timeout=2)
+        r = httpx.get(f"{base}/api/tags", timeout=2, trust_env=False)
         if r.status_code == 200:
             models = r.json().get("models", [])
             # Check if any model is an embedding model (nomic-embed-text, mxbai-embed, etc.)
