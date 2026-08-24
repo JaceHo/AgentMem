@@ -43,13 +43,13 @@ is_running() {
 
 _kill_stale() {
     local stale
-    stale=$(lsof -ti "tcp:$PORT" 2>/dev/null || true)
+    stale=$(lsof -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true)
     if [ -n "$stale" ]; then
         echo "  Killing stale process on :$PORT (pid $stale)"
         echo "$stale" | xargs kill 2>/dev/null || true
         sleep 2
         # If still alive, force kill
-        stale=$(lsof -ti "tcp:$PORT" 2>/dev/null || true)
+        stale=$(lsof -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true)
         if [ -n "$stale" ]; then
             echo "$stale" | xargs kill -9 2>/dev/null || true
             sleep 1
@@ -77,7 +77,7 @@ _wait_ready() {
     local port="${1:-$PORT}"
     local max="${2:-80}"
     local skip_initial="${3:-0}"  # seconds to skip before first poll
-    local t0; t0=$(date +%s%3N)
+    local t0; t0=$SECONDS
     echo -n "  Waiting for service"
     # Skip initial wait (old process dying / launchd starting new one)
     if [ "$skip_initial" -gt 0 ]; then
@@ -85,8 +85,7 @@ _wait_ready() {
     fi
     for i in $(seq 1 "$max"); do
         if curl -sf "http://127.0.0.1:$port/health" >/dev/null 2>&1; then
-            local t1; t1=$(date +%s%3N)
-            printf " ready (%dms)\n" "$((t1 - t0))"
+            printf " ready (%ds)\n" "$((SECONDS - t0))"
             return 0
         fi
         printf "."
@@ -225,12 +224,12 @@ case "${1:-help}" in
         t_start=$SECONDS
 
         # ── 1. Kill existing process directly so port frees immediately ────────
-        OLD_PID=$(lsof -ti "tcp:$PORT" 2>/dev/null | head -1 || true)
+        OLD_PID=$(lsof -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | head -1 || true)
         if [ -n "$OLD_PID" ]; then
             printf "  Killing pid %s ... " "$OLD_PID"
             kill "$OLD_PID" 2>/dev/null || true
             for _i in 1 2 3 4 5 6 7 8 9 10; do
-                lsof -ti "tcp:$PORT" >/dev/null 2>&1 || break
+                lsof -tiTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1 || break
                 sleep 0.1
             done
             echo "done"
@@ -367,7 +366,7 @@ except: pass
         subcmd="${2:-start}"
         case "$subcmd" in
             start)
-                stale=$(lsof -ti "tcp:$BENCH_PORT" 2>/dev/null || true)
+                stale=$(lsof -tiTCP:"$BENCH_PORT" -sTCP:LISTEN 2>/dev/null || true)
                 if [ -n "$stale" ]; then
                     echo "Killing stale process on :$BENCH_PORT (pid $stale)..."
                     kill -9 "$stale" 2>/dev/null || true
@@ -379,7 +378,7 @@ except: pass
                 echo "  Log     : $BENCH_LOG"
                 echo ""
                 export REDIS_URL="redis://localhost:6379/$BENCH_DB"
-                export AMAC_THRESHOLD="0.05"
+                export AGENTMEM_AMAC_THRESHOLD="0.05"
                 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
                 export TOKENIZERS_PARALLELISM=false OMP_NUM_THREADS=1
                 uv run uvicorn main:app \
@@ -398,7 +397,7 @@ except: pass
             fg)
                 echo "Starting benchmark service in foreground on :$BENCH_PORT"
                 export REDIS_URL="redis://localhost:6379/$BENCH_DB"
-                export AMAC_THRESHOLD="0.05"
+                export AGENTMEM_AMAC_THRESHOLD="0.05"
                 exec uv run uvicorn main:app \
                     --host 127.0.0.1 \
                     --port "$BENCH_PORT" \
@@ -411,7 +410,7 @@ except: pass
                     kill "$pid" 2>/dev/null && stopped=1
                     rm -f "$BENCH_PID"
                 fi
-                stale=$(lsof -ti "tcp:$BENCH_PORT" 2>/dev/null || true)
+                stale=$(lsof -tiTCP:"$BENCH_PORT" -sTCP:LISTEN 2>/dev/null || true)
                 if [ -n "$stale" ]; then
                     kill -9 "$stale" 2>/dev/null && stopped=1
                 fi

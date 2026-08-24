@@ -31,7 +31,7 @@ import urllib.error
 from typing import Any, Optional
 
 BASE = os.environ.get("AGENTMEM_URL", "http://localhost:18800").rstrip("/")
-TIMEOUT = float(os.environ.get("AGENTMEM_TIMEOUT", "10"))
+TIMEOUT = float(os.environ.get("AGENTMEM_TIMEOUT", "30"))
 
 
 def _req(method: str, path: str, body: Optional[dict] = None) -> tuple[int, Any]:
@@ -105,7 +105,10 @@ def cmd_recall(args: list[str]) -> None:
 def cmd_store(args: list[str]) -> None:
     if not args: die("usage: agentmem store <text>")
     text = " ".join(args)
-    status, body = _req("POST", "/store", {"content": text, "type": "fact"})
+    status, body = _req("POST", "/store", {
+        "messages": [{"role": "user", "content": text}],
+        "session_id": "agentmem-cli",
+    })
     if status != 200: die(f"store failed ({status}): {body}")
     print(json.dumps(body, indent=2, ensure_ascii=False))
 
