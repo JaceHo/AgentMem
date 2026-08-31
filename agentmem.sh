@@ -511,36 +511,6 @@ print(f"      Wrote {cfg_path}")
 PYEOF
         }
 
-        # ── Helper: write TOML entry (Codex CLI) ─────────────────────────────
-        _write_codex_toml() {
-            local cfg_file="$1"
-            local dir
-            dir="$(dirname "$cfg_file")"
-            mkdir -p "$dir"
-            python3 - "$cfg_file" "$MCP_SERVER_PY" << 'PYEOF'
-import sys, os
-cfg_path = sys.argv[1]
-server_py = sys.argv[2]
-block = (
-    '\n[mcp_servers.agentmem]\n'
-    'command = "python"\n'
-    f'args = ["{server_py}"]\n'
-)
-if os.path.isfile(cfg_path):
-    with open(cfg_path) as f:
-        content = f.read()
-    if "[mcp_servers.agentmem]" in content:
-        print(f"      {cfg_path} already has agentmem entry (skipped)")
-        sys.exit(0)
-    content = content.rstrip() + block
-else:
-    content = block.lstrip()
-with open(cfg_path, "w") as f:
-    f.write(content)
-print(f"      Wrote {cfg_path}")
-PYEOF
-        }
-
         # ── Per-agent setup functions ─────────────────────────────────────────
 
         _setup_claude() {
@@ -662,7 +632,7 @@ PYEOF
 
         _setup_codex() {
             echo "  [codex] Writing ~/.codex/config.toml (stdio transport)..."
-            _write_codex_toml "$HOME/.codex/config.toml"
+            uv run python -c "from connect import connect_codex; print(connect_codex())"
             echo "      → Restart Codex CLI to load new MCP server."
         }
 

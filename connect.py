@@ -24,11 +24,15 @@ import json
 import os
 import shutil
 import sys
+import tomllib
 from pathlib import Path
 from typing import Optional
 
 
-HOOKS_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+HOOKS_DIR = os.path.join(PROJECT_ROOT, "hooks")
+MCP_SERVER_PY = os.path.join(PROJECT_ROOT, "mcp_server.py")
+UV_EXECUTABLE = shutil.which("uv") or "uv"
 AGENTMEM_URL = os.getenv("AGENTMEMORY_URL", "http://localhost:18800")
 AGENTMEM_SECRET = os.getenv("AGENTMEMORY_SECRET", "")
 
@@ -71,6 +75,14 @@ def _mcp_env_block() -> dict:
     return env
 
 
+def _mcp_stdio_entry() -> dict:
+    return {
+        "command": UV_EXECUTABLE,
+        "args": ["run", "--project", PROJECT_ROOT, "python", MCP_SERVER_PY],
+        "env": _mcp_env_block(),
+    }
+
+
 # ── Claude Code ───────────────────────────────────────────────────────────────
 
 def detect_claude_code() -> bool:
@@ -89,11 +101,7 @@ def connect_claude_code(dry_run: bool = False, force: bool = False) -> str:
     mcp_servers = config.get("mcpServers", {})
     already = "agentmem" in mcp_servers
 
-    mcp_entry = {
-        "command": "python3",
-        "args": [os.path.abspath(os.path.join(HOOKS_DIR, "..", "mcp_server.py"))],
-        "env": _mcp_env_block(),
-    }
+    mcp_entry = _mcp_stdio_entry()
 
     if already and not force:
         return f"✓ claude-code (already wired in {claude_json})"
@@ -134,15 +142,18 @@ def connect_codex(dry_run: bool = False, force: bool = False) -> str:
 
     os.makedirs(codex_dir, exist_ok=True)
 
-    env_lines = ""
+    env_lines = []
     for k, v in _mcp_env_block().items():
-        env_lines += f'\n{k} = "{v}"'
+        env_lines.append(f"{k} = {json.dumps(v)}")
+    stdio_entry = _mcp_stdio_entry()
+    args = ", ".join(json.dumps(arg) for arg in stdio_entry["args"])
 
     toml_block = f'''
 [mcp_servers.agentmem]
-command = "python3"
-args = ["{os.path.abspath(os.path.join(HOOKS_DIR, '..', 'mcp_server.py'))}"]
-[mcp_servers.agentmem.env]{env_lines}
+command = {json.dumps(stdio_entry["command"])}
+args = [{args}]
+[mcp_servers.agentmem.env]
+{os.linesep.join(env_lines)}
 '''
 
     current = ""
@@ -150,15 +161,53 @@ args = ["{os.path.abspath(os.path.join(HOOKS_DIR, '..', 'mcp_server.py'))}"]
         with open(config_path) as f:
             current = f.read()
 
-    if "[mcp_servers.agentmem]" in current and not force:
+    already = "[mcp_servers.agentmem]" in current
+    matches = False
+    if already:
+        try:
+            agentmem = tomllib.loads(current).get("mcp_servers", {}).get("agentmem", {})
+            expected_env = _mcp_env_block()
+            actual_env = agentmem.get("env", {})
+            matches = (
+                agentmem.get("command") == stdio_entry["command"]
+                and agentmem.get("args") == stdio_entry["args"]
+                and all(actual_env.get(key) == value for key, value in expected_env.items())
+            )
+        except tomllib.TOMLDecodeError:
+            matches = False
+
+    if matches and not force:
         return f"✓ codex (already wired in {config_path})"
 
     if dry_run:
-        return f"[dry-run] Would add [mcp_servers.agentmem] to {config_path}"
+        action = "update" if already else "add"
+        return f"[dry-run] Would {action} [mcp_servers.agentmem] in {config_path}"
 
     backup = _backup(config_path)
-    with open(config_path, "a") as f:
-        f.write(toml_block)
+    if already:
+        lines = current.splitlines(keepends=True)
+        kept = []
+        skipping_agentmem = False
+        for line in lines:
+            stripped = line.strip()
+            is_table = stripped.startswith("[") and stripped.endswith("]")
+            is_agentmem_table = (
+                stripped == "[mcp_servers.agentmem]"
+                or stripped.startswith("[mcp_servers.agentmem.")
+            )
+            if is_agentmem_table:
+                skipping_agentmem = True
+                continue
+            if skipping_agentmem and is_table:
+                skipping_agentmem = False
+            if not skipping_agentmem:
+                kept.append(line)
+        current = "".join(kept)
+
+    with open(config_path, "w") as f:
+        f.write(current.rstrip())
+        f.write("\n" if current.strip() else "")
+        f.write(toml_block.lstrip())
 
     result = f"✓ codex → {config_path}"
     if backup:
@@ -227,11 +276,7 @@ def connect_gemini_cli(dry_run: bool = False, force: bool = False) -> str:
     mcp_servers = config.get("mcpServers", {})
     already = "agentmem" in mcp_servers
 
-    mcp_entry = {
-        "command": "python3",
-        "args": [os.path.abspath(os.path.join(HOOKS_DIR, "..", "mcp_server.py"))],
-        "env": _mcp_env_block(),
-    }
+    mcp_entry = _mcp_stdio_entry()
 
     if already and not force:
         return f"✓ gemini-cli (already wired in {settings_path})"
@@ -275,11 +320,7 @@ def connect_cline(dry_run: bool = False, force: bool = False) -> str:
     mcp_servers = config.get(key, {})
     already = "agentmem" in mcp_servers
 
-    mcp_entry = {
-        "command": "python3",
-        "args": [os.path.abspath(os.path.join(HOOKS_DIR, "..", "mcp_server.py"))],
-        "env": _mcp_env_block(),
-    }
+    mcp_entry = _mcp_stdio_entry()
 
     if already and not force:
         return f"✓ cline (already wired in VS Code settings)"
