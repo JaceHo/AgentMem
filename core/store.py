@@ -52,6 +52,7 @@ FACT_KEY     = "mem:facts"
 TOOL_KEY        = "mem:tools"          # capability: tool/skill definitions
 TOOL_GRAPH_KEY  = "mem:tool_graph"     # AutoTool TIG: tool transition counts hash (a:b → count)
 PROC_KEY        = "mem:procedures"     # procedural: successful workflows/patterns (4th cognitive tier)
+PROC_TASK_KEY   = "mem:proc_tasks"     # exact task → element id, so dedup does not depend on VSIM
 PROC_BY_TOOL_PRE = "mem:proc_by_tool:" # reverse index: tool_name → Set of proc element IDs
 ENV_KEY      = "mem:env"        # capability: environment state hash
 AGENT_KEY    = "mem:agent"      # capability: agent self-model hash
@@ -711,6 +712,76 @@ async def scan_all_procedures(r: aioredis.Redis, max_count: int = 1000) -> list[
     return procs
 
 
+async def nearest_procedures(
+    r: aioredis.Redis,
+    embedding: np.ndarray,
+    k: int = 5,
+) -> list[dict]:
+    """Top-k procedures by vector score.
+
+    Procedure rows store `task`, not `content`. knn_search drops them.
+    """
+    try:
+        results = await r.execute_command(
+            "VSIM", PROC_KEY, "FP32", _blob(embedding),
+            "COUNT", k + 1, "WITHSCORES", "WITHATTRIBS",
+        )
+    except Exception as e:
+        log.error("nearest_procedures VSIM failed: %s", e)
+        return []
+    items: list[dict] = []
+    i = 0
+    while i + 2 < len(results):
+        elem, score, raw = results[i], results[i + 1], results[i + 2]
+        i += 3
+        elem_str = force_str(elem)
+        if elem_str == "__seed__":
+            continue
+        try:
+            attrs = decode_json(raw) or {}
+        except Exception:
+            continue
+        if attrs.get("_seed") or not attrs.get("task"):
+            continue
+        items.append({
+            "score": float(score) if score else 0.0,
+            "attrs": attrs,
+            "_element": elem_str,
+        })
+        if len(items) >= k:
+            break
+    return items
+
+
+async def find_procedure_by_task(
+    r: aioredis.Redis,
+    embedding: np.ndarray,
+    task: str,
+    *,
+    min_score: float = 0.80,
+    k: int = 8,
+) -> dict | None:
+    """Return an existing procedure with this exact task, including legacy rows."""
+    mapped = await r.hget(PROC_TASK_KEY, task[:300])
+    if mapped:
+        elem = force_str(mapped)
+        try:
+            raw = await r.execute_command("VGETATTR", PROC_KEY, elem)
+            attrs = decode_json(raw) or {}
+        except Exception:
+            attrs = {}
+        if attrs.get("task"):
+            return {"score": 1.0, "attrs": attrs, "_element": elem}
+    for item in await nearest_procedures(r, embedding, k=k):
+        if item["attrs"].get("task") == task and item["score"] >= min_score:
+            try:
+                await r.hset(PROC_TASK_KEY, task[:300], item["_element"])
+            except Exception:
+                pass
+            return item
+    return None
+
+
 async def save_procedure(
     r: aioredis.Redis,
     task: str,
@@ -726,8 +797,10 @@ async def save_procedure(
     """
     uid = str(_ulid_mod.new())
     tools = (tools_used or [])[:10]
+    task_key = task[:300]
     attr = json.dumps({
-        "task":          task[:300],
+        "task":          task_key,
+        "content":       task_key,
         "procedure":     procedure[:1000],
         "tools_used":    tools,
         "domain":        domain,
@@ -737,6 +810,10 @@ async def save_procedure(
     })
     await r.execute_command("VADD", PROC_KEY, "FP32", _blob(embedding), uid,
                             "SETATTR", attr)
+    try:
+        await r.hset(PROC_TASK_KEY, task_key, uid)
+    except Exception:
+        pass
     # Populate reverse index for each tool
     if tools:
         await link_proc_to_tools(r, uid, tools)

@@ -212,8 +212,12 @@ async def _encode_batch_async(texts: list[str]) -> list[np.ndarray]:
     """
     if not texts:
         return []
+    if embedder.embedding_unavailable():
+        raise embedder.EmbeddingUnavailable("embedding circuit open")
     try:
         return list(await asyncio.to_thread(embedder.encode_batch, texts))
+    except embedder.EmbeddingUnavailable:
+        raise
     except Exception as e:
         log.warning("[encode_batch] batch encode failed (%s: %s), falling back to per-text", type(e).__name__, e)
         # Fallback: try encoding texts individually — some may succeed
@@ -222,6 +226,8 @@ async def _encode_batch_async(texts: list[str]) -> list[np.ndarray]:
             try:
                 vec = await asyncio.to_thread(embedder.encode, text)
                 results.append(vec)
+            except embedder.EmbeddingUnavailable:
+                raise
             except Exception:
                 # Last resort: zero vector so the pipeline doesn't crash
                 log.warning("[encode_batch] single encode failed, using zero vector")
@@ -1500,6 +1506,14 @@ async def session_compact(req: CompactRequest):
     if not req.session_id:
         return {"status": "skipped", "reason": "no session_id"}
 
+    # PostToolUse fires this on every tool. One compact per few seconds is enough;
+    # the body is already a no-op when the KV is under the threshold.
+    gate_ok = await _get_redis().set(
+        f"mem:compact:gate:{req.session_id}", "1", nx=True, ex=8,
+    )
+    if not gate_ok:
+        return {"status": "skipped", "reason": "debounced"}
+
     ctx = await mem_store.get_session_context(_get_redis(), req.session_id)
     if not ctx:
         return {"status": "skipped", "reason": "no session context"}
@@ -1663,54 +1677,54 @@ async def system_prompt(agent: str = ""):
 
 
 
+_RECALL_AUGMENT_BUDGET_S = 2.5
+
+
+async def _recall_augmentations(req: RecallRequest) -> dict:
+    """At most two LLM augmentations, under one wall-clock budget.
+
+    HyDE, MIRIX topic, query-structure, and plan_queries used to run as
+    separate stages with an 8s multi-model retry each. That held /recall
+    for 13–24s after the Claude hook had already abandoned the request at 4s.
+    """
+    tasks: dict[str, asyncio.Task] = {}
+    q = req.query.strip()
+    if req.enable_hyde and len(q) > 10:
+        tasks["hyde"] = asyncio.create_task(retrieval_planner.generate_hyde_doc(req.query))
+    if req.enable_planning:
+        tasks["plan"] = asyncio.create_task(retrieval_planner.plan_queries(req.query))
+    elif len(q) > 8:
+        tasks["topic"] = asyncio.create_task(retrieval_planner.generate_retrieval_topic(req.query))
+    if not tasks:
+        return {}
+    _done, pending = await asyncio.wait(set(tasks.values()), timeout=_RECALL_AUGMENT_BUDGET_S)
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+        log.info(
+            "[recall] augmentation budget %.1fs hit, dropped %s",
+            _RECALL_AUGMENT_BUDGET_S,
+            ",".join(name for name, task in tasks.items() if task in pending),
+        )
+    out: dict = {}
+    for name, task in tasks.items():
+        if task in pending or task.cancelled():
+            continue
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            continue
+        if exc is not None:
+            log.debug("[recall] %s augmentation failed: %s", name, exc)
+            continue
+        out[name] = task.result()
+    return out
+
+
 @app.post("/recall")
 async def recall(req: RecallRequest):
     t0 = time.time()
-
-    # Detect scene of incoming query
-    query_scene = scene_mod.detect(req.query)
-    q_lang, q_domain = query_scene["language"], query_scene["domain"]
-    try:
-        emb = await asyncio.to_thread(_encode, req.query)
-    except Exception as e:
-        log.error("[recall] embedding failed: %s", e)
-        ms = int((time.time() - t0) * 1000)
-        return {"prependContext": "", "facts": [], "episodes": [], "latency_ms": ms, "error": "embedding service unavailable"}
-
-    # HyDE + MIRIX Active Retrieval Topic — run both in parallel for zero extra latency.
-    #
-    # HyDE (Gao et al. 2022, arXiv:2212.10496): generate hypothetical memory → embed →
-    #   average with query embedding. Hypothetical docs are closer in embedding space
-    #   to actual stored memories than raw questions.
-    #
-    # MIRIX Active Retrieval (arXiv:2507.07957 §3.2): generate focused retrieval topic
-    #   from vague queries ("that auth thing" → "JWT token validation middleware error").
-    #   Use topic as the BM25 search query for better lexical precision on vague prompts.
-    _hyde_task = (
-        retrieval_planner.generate_hyde_doc(req.query)
-        if req.enable_hyde and req.query.strip() and len(req.query) > 10
-        else asyncio.sleep(0)
-    )
-    _topic_task = (
-        retrieval_planner.generate_retrieval_topic(req.query)
-        if req.query.strip() and len(req.query) > 8
-        else asyncio.sleep(0)
-    )
-    _augment_results = await asyncio.gather(_hyde_task, _topic_task)
-    _hyde_doc   = _augment_results[0] if isinstance(_augment_results[0], str) else None
-    _mirix_topic = _augment_results[1] if isinstance(_augment_results[1], str) else None
-
-    if _hyde_doc:
-        try:
-            hyde_emb = await asyncio.to_thread(_encode, _hyde_doc)
-            merged = (emb * 0.5 + hyde_emb * 0.5).astype(np.float32)
-            norm = np.linalg.norm(merged)
-            emb = merged / norm if norm > 0 else merged
-        except Exception:
-            log.debug("[recall] HyDE embedding failed, using query embedding only")
-
-    # Use MIRIX topic for BM25 search when available (vague queries benefit most)
-    _bm25_query = _mirix_topic if _mirix_topic else req.query
 
     if _is_brief_option_reply(req.query):
         hint = (
@@ -1723,6 +1737,43 @@ async def recall(req: RecallRequest):
         ms = int((time.time() - t0) * 1000)
         log.info(f"[recall] session={req.session_id} option-reply shortcut {ms}ms")
         return {"prependContext": hint, "latency_ms": ms}
+
+    # Detect scene of incoming query
+    query_scene = scene_mod.detect(req.query)
+    q_lang, q_domain = query_scene["language"], query_scene["domain"]
+
+    if embedder.embedding_unavailable():
+        ms = int((time.time() - t0) * 1000)
+        log.debug("[recall] embedding circuit open — skipping retrieval")
+        return {"prependContext": "", "facts": [], "episodes": [], "latency_ms": ms, "error": "embedding service unavailable"}
+
+    # Overlap the query embed with the augmentation LLM calls.
+    emb_task = asyncio.create_task(asyncio.to_thread(_encode, req.query))
+    aug_task = asyncio.create_task(_recall_augmentations(req))
+    emb_res, aug_res = await asyncio.gather(emb_task, aug_task, return_exceptions=True)
+    if isinstance(emb_res, Exception):
+        log.warning("[recall] embedding failed: %s", emb_res)
+        ms = int((time.time() - t0) * 1000)
+        return {"prependContext": "", "facts": [], "episodes": [], "latency_ms": ms, "error": "embedding service unavailable"}
+    emb = emb_res
+    aug = aug_res if isinstance(aug_res, dict) else {}
+
+    # HyDE (Gao et al. 2022): blend a hypothetical memory into the query vector.
+    # MIRIX topic, when planning is off, replaces the BM25 string for vague prompts.
+    _hyde_doc = aug.get("hyde") if isinstance(aug.get("hyde"), str) else None
+    _mirix_topic = aug.get("topic") if isinstance(aug.get("topic"), str) else None
+    _planned = aug.get("plan") if isinstance(aug.get("plan"), list) else None
+
+    if _hyde_doc:
+        try:
+            hyde_emb = await asyncio.to_thread(_encode, _hyde_doc)
+            merged = (emb * 0.5 + hyde_emb * 0.5).astype(np.float32)
+            norm = np.linalg.norm(merged)
+            emb = merged / norm if norm > 0 else merged
+        except Exception:
+            log.debug("[recall] HyDE embedding failed, using query embedding only")
+
+    _bm25_query = _mirix_topic if _mirix_topic else req.query
 
     # Adaptive retrieval depth (SimpleMem-inspired C_q estimator)
     n_facts, n_episodes = _estimate_depth(req.query, req.memory_limit_number)
@@ -1766,7 +1817,7 @@ async def recall(req: RecallRequest):
         mem_store.get_session_context(_get_redis(), req.session_id),
         _fetch(mem_store.FACT_KEY,    n_facts,    lang_filter_sym or None),
         _fetch(mem_store.EPISODE_KEY, n_episodes, lang_filter_sym or None),
-        retrieval_planner.analyze_query_structure(req.query) if (req.query.strip() and req.enable_planning) else asyncio.sleep(0),  # symbolic layer (index 5) — LLM call only when enable_planning=True
+        asyncio.sleep(0),  # index 5 kept stable; structure LLM is outside the recall budget
         _get_redis().get(_PINNED_SESSION_KEY),                       # handoff bridge (index 6)
     ]
     if req.include_tools and is_cap_query:
@@ -1896,17 +1947,17 @@ async def recall(req: RecallRequest):
         if sym_facts:
             log.debug(f"[recall] symbolic pass: +{len(sym_facts)} facts for entities {sym_entities[:3]}")
 
-    # SimpleMem Section 3.3 — Intent-Aware Planning (opt-in)
-    # If enable_planning=True, run LLM query planning to generate targeted queries,
-    # then re-fetch for each query and merge. Adds ~300-600ms but improves recall
-    # for complex multi-part questions.
-    if req.enable_planning:
-        targeted_queries = await retrieval_planner.plan_queries(req.query)
+    # Planning ran inside the augmentation budget above. Use the queries only
+    # when that call finished; otherwise the original query search stands.
+    if req.enable_planning and _planned and len(_planned) > 1:
+        targeted_queries = _planned
         if len(targeted_queries) > 1:
             # Run targeted queries in parallel (exclude original already fetched above)
             extra_queries = [q for q in targeted_queries if q != req.query]
-            # Batch-encode all planning queries off the event loop
-            extra_embs = await _encode_batch_async(extra_queries)
+            try:
+                extra_embs = await _encode_batch_async(extra_queries)
+            except embedder.EmbeddingUnavailable:
+                extra_embs = []
             extra_tasks = [
                 mem_store.knn_search(_get_redis(), mem_store.FACT_KEY, emb, n_facts,
                                      filter_expr=lang_filter_sym or None, bump_heat=True)

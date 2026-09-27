@@ -168,6 +168,33 @@ async def register_tool(
     return elem_key
 
 
+async def register_observed_tool(
+    r: aioredis.Redis,
+    name: str,
+    agent_id: str = "",
+) -> str:
+    """Upsert a stub so feedback can land for a tool that was never registered.
+
+    Uses a zero vector. A live embed here would block the hook on the same
+    embedding backend whose 502s already show up in recall.
+    """
+    import numpy as np
+    from . import embedder
+    try:
+        dims = embedder._get_provider().dims
+    except Exception:
+        dims = embedder.DIMS
+    await ensure_tool_index(r, dims)
+    return await register_tool(
+        r,
+        name=name,
+        description=f"Observed from tool feedback ({name})",
+        embedding=np.zeros(dims, dtype=np.float32),
+        source="observed",
+        agent_id=agent_id,
+    )
+
+
 async def recall_tools(
     r: aioredis.Redis,
     embedding,              # query embedding np.ndarray

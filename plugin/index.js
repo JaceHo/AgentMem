@@ -24,7 +24,7 @@
 
 const DEFAULT_BASE_URL = "http://127.0.0.1:18800";
 const DEFAULT_LIMIT    = 6;
-const RECALL_TIMEOUT   = 7000;   // ms — block agent start if exceeded (raised from 3000: avg recall is 4-6s)
+const RECALL_TIMEOUT   = 7000;   // ms — server budgets augmentation at 2.5s; leave room for embed + redis
 const STORE_TIMEOUT    = 10000;  // ms — raised from 500: pipeline (summarize+embed+LLM) takes 500-2000ms
 const REG_TIMEOUT      = 2000;   // ms — tool/env registration (non-blocking)
 
@@ -38,6 +38,7 @@ export default {
     const cfg    = api.pluginConfig ?? {};
     const log    = api.logger ?? console;
     const base   = (cfg.baseUrl ?? DEFAULT_BASE_URL).replace(/\/$/, "");
+    const compactAt = new Map();
     const limit  = cfg.memoryLimitNumber ?? DEFAULT_LIMIT;
     const tag    = "[memos-local]";
 
@@ -208,11 +209,16 @@ export default {
       post("/tool-feedback", { tool_name: toolName, success, session_id: sessionId },
            REG_TIMEOUT).catch(() => {});
 
-      // 2. Mid-session compact (same as compact.sh PostToolUse hook)
+      // 2. Mid-session compact, debounced. tool_end fires on every tool.
       if (sessionId) {
-        post("/session/compact",
-             { session_id: sessionId, threshold_chars: 3000 },
-             REG_TIMEOUT).catch(() => {});
+        const now = Date.now();
+        const last = compactAt.get(sessionId) || 0;
+        if (now - last > 8000) {
+          compactAt.set(sessionId, now);
+          post("/session/compact",
+               { session_id: sessionId, threshold_chars: 3000 },
+               REG_TIMEOUT).catch(() => {});
+        }
       }
     });
 
@@ -258,10 +264,11 @@ export default {
 
       // 1. Queue turn storage (async background, non-blocking)
       // v0.5.2: Log failures instead of silently swallowing them.
+      const capped = messages.slice(-50);
       fetch(`${base}/store`, {
         method:  "POST",
         headers: { "Content-Type": "application/json" },
-        body:    JSON.stringify({ messages, session_id: sessionId }),
+        body:    JSON.stringify({ messages: capped, session_id: sessionId }),
         signal:  AbortSignal.timeout(STORE_TIMEOUT),
       }).then(r => { if (!r?.ok) log.warn?.(`${tag} store HTTP ${r?.status}`); })
         .catch(e => log.warn?.(`${tag} store failed: ${e?.message}`));
@@ -305,7 +312,7 @@ export default {
 
           // 5. AWO meta-tool detection (v0.9.6): after recording TIG transitions,
           //    trigger chain detection to synthesize composite procedure entries.
-          //    Idempotent — knn_search dedup prevents re-adding existing chains.
+          //    Skipped server-side when the chain set is unchanged.
           fetch(`${base}/tool-graph/detect-meta-tools?threshold=5`, {
             method:  "POST",
             headers: { "Content-Type": "application/json" },

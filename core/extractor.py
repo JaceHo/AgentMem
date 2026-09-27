@@ -31,7 +31,7 @@ import datetime
 
 import httpx
 
-from .http import async_get_json, async_post_json
+from .http import async_get_json, async_post_json, async_post_json_detailed
 
 log = logging.getLogger("mem")
 
@@ -163,14 +163,25 @@ AISERV_KEY   = "sk-aiserv-local"
 AISERV_ROLE  = "nlp"                    # maps to /v1/role/nlp
 AISERV_FALLBACK_MODEL = "ZhipuAI/GLM-4.7-Flash"  # direct fallback if /v1/role/nlp returns broken models
 AISERV_MODEL_CASCADE = []               # populated dynamically; kept for import compat
-FAST_LLM_TIMEOUT_S = 6.0               # fast models: fail fast, move on
-ROLE_LLM_TIMEOUT_S = 6.0               # premium models: same — fail fast, don't block stores
+# Extraction runs inside the background _do_store task — the HTTP caller is
+# already "queued", so these timeouts never block anyone. 6s dropped facts
+# wholesale under load ("all models circuit-broken" → regex=0 → facts+0);
+# 12s still timed out with aiserv under concurrent mesh load. Structured
+# 1500-token extraction simply needs this much headroom.
+FAST_LLM_TIMEOUT_S = 20.0              # fast models: generous — background task
+ROLE_LLM_TIMEOUT_S = 60.0              # premium/reasoning models: role:nlp sometimes
+                                       # routes slow reasoners (Intern-S1) that finish
+                                       # in 30-60s — extraction is background, wait
 LLM_TIMEOUT_S = ROLE_LLM_TIMEOUT_S
 LLM_MAX_RETRIES = 3
 
-# Circuit breaker: models that failed recently are skipped for 5 minutes
+# Circuit breaker: models that failed recently are skipped for 5 minutes.
+# A single timeout must not lock the model out — aiserv blips were turning
+# every later compress into regex=0 / facts+0 for the full cooldown.
 _model_fail_times: dict[str, float] = {}
+_model_fail_counts: dict[str, int] = {}
 _CIRCUIT_BREAKER_TTL = 300  # seconds
+_CIRCUIT_OPEN_AFTER = 2
 LLM_MAX_INPUT = 3000   # chars of conversation to send to LLM
 
 
@@ -181,18 +192,23 @@ def is_model_circuit_broken(model: str) -> bool:
         return False
     if time.time() - fail_time > _CIRCUIT_BREAKER_TTL:
         del _model_fail_times[model]
+        _model_fail_counts.pop(model, None)
         return False
     return True
 
 
 def mark_model_failed(model: str) -> None:
-    """Record that a model failed, tripping its circuit breaker."""
-    _model_fail_times[model] = time.time()
+    """Record a model failure. The breaker opens only after repeated failures."""
+    n = _model_fail_counts.get(model, 0) + 1
+    _model_fail_counts[model] = n
+    if n >= _CIRCUIT_OPEN_AFTER:
+        _model_fail_times[model] = time.time()
 
 
 def clear_model_circuit(model: str) -> None:
     """Remove a model from circuit-breaker cooldown (e.g. after it recovers)."""
     _model_fail_times.pop(model, None)
+    _model_fail_counts.pop(model, None)
 
 
 async def _resolve_nlp_model(exclude: Optional[str] = None) -> tuple[str, str]:
@@ -359,6 +375,14 @@ def _load_proxy() -> str | None:
     return p or None
 
 
+def _looks_like_empty_array(raw: str) -> bool:
+    """True when the model explicitly returned an empty JSON array."""
+    text = raw.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+    return text == "[]"
+
+
 def _parse_llm_json(raw: str) -> list:
     """Robustly parse JSON from LLM response (handles markdown fences + truncation).
 
@@ -451,7 +475,7 @@ async def _llm_extract(conversation_text: str) -> list[ExtractedFact]:
         tried_models.append(model)
         timeout_s = _timeout_for(model, tier)
         try:
-            data = await async_post_json(
+            posted = await async_post_json_detailed(
                 AISERV_URL,
                 payload={
                     "model":      model,
@@ -468,10 +492,20 @@ async def _llm_extract(conversation_text: str) -> list[ExtractedFact]:
                 headers={"Authorization": f"Bearer {AISERV_KEY}"},
                 timeout=timeout_s,
             )
+            data, err = posted.data, posted.error
             if data is None:
-                log.warning("[extractor] %s returned no data", model)
+                if err == "timeout":
+                    log.warning("[extractor] %s timed out (%.1fs)", model, timeout_s)
+                    reason = "timeout"
+                elif err and err.startswith("http_"):
+                    log.warning("[extractor] %s HTTP %s", model, err[5:])
+                    reason = "http"
+                else:
+                    log.warning("[extractor] %s returned no data (%s)", model, err or "empty")
+                    reason = "other"
                 mark_model_failed(model)
                 exclude = model
+                asyncio.create_task(_report_quality(model, -1, reason=reason))
                 continue
 
             raw_content = data["choices"][0]["message"].get("content")
@@ -488,6 +522,14 @@ async def _llm_extract(conversation_text: str) -> list[ExtractedFact]:
                 mark_model_failed(model)
                 exclude = model
                 continue
+            if not items and not _looks_like_empty_array(raw):
+                log.warning("[extractor] %s produced no parseable facts, trying next", model)
+                mark_model_failed(model)
+                exclude = model
+                continue
+            # A good response proves the model is healthy — reset its circuit
+            # breaker so a recovered model isn't locked out for the full TTL.
+            clear_model_circuit(model)
 
             facts: list[ExtractedFact] = []
             for item in items:
@@ -595,7 +637,7 @@ async def _llm_extract(conversation_text: str) -> list[ExtractedFact]:
     log.warning(
         "[extractor] All LLM models exhausted after %d attempts. Tried: %s. "
         "Falling back to regex-only extraction.",
-        LLM_MAX_RETRIES, ", ".join(tried_models) if tried_models else "none"
+        len(tried_models), ", ".join(tried_models) if tried_models else "none"
     )
     return []
 

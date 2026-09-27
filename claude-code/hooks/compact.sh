@@ -13,13 +13,34 @@ print(d.get('session_id', ''))
 " "$INPUT" 2>/dev/null || echo "")
 if [ -z "$SESSION" ]; then exit 0; fi
 
-# 1. Mid-session compact
-PAYLOAD=$(python3 -c "
+# 1. Mid-session compact, at most once per 8s per session. PostToolUse
+#    fires on every tool, and the server no-ops until the KV is large.
+SKIP_COMPACT=$(python3 -c "
+import os, sys, time
+sid = sys.argv[1]
+safe = ''.join(c if c.isalnum() else '_' for c in sid)[:80]
+path = '/tmp/agentmem-compact-' + safe
+now = time.time()
+try:
+    if now - os.path.getmtime(path) < 8:
+        print('1')
+        raise SystemExit
+except FileNotFoundError:
+    pass
+try:
+    open(path, 'w').close()
+except OSError:
+    pass
+print('0')
+" "$SESSION" 2>/dev/null || echo 0)
+if [ "$SKIP_COMPACT" != "1" ]; then
+  PAYLOAD=$(python3 -c "
 import json, sys
 print(json.dumps({'session_id': sys.argv[1], 'threshold_chars': 3000}))
 " "$SESSION" 2>/dev/null)
-curl -sf -m 3 -X POST http://localhost:18800/session/compact \
-  -H 'Content-Type: application/json' -d "$PAYLOAD" > /dev/null 2>&1 &
+  curl -sf -m 3 -X POST http://localhost:18800/session/compact \
+    -H 'Content-Type: application/json' -d "$PAYLOAD" > /dev/null 2>&1 &
+fi
 
 # 2. ToolMem feedback: extract tool_name + heuristic success, fire-and-forget
 TOOL_NAME=$(python3 -c "

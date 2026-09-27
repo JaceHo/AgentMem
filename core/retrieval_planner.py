@@ -27,14 +27,14 @@ import logging
 
 from .http import async_post_json
 from .extractor import (
-    AISERV_URL, AISERV_KEY, _resolve_nlp_model, _resolve_qa_model,
+    AISERV_URL, AISERV_KEY, _resolve_nlp_model,
     AISERV_FALLBACK_MODEL, _parse_llm_json,
 )
 
 log = logging.getLogger("mem")
 
-_PLAN_TIMEOUT_S = 8.0               # match extractor timeout for working models
-_PLAN_MAX_RETRIES = 3               # try up to 3 distinct models before giving up
+_PLAN_TIMEOUT_S = 2.5               # stay inside the recall augmentation budget
+_PLAN_MAX_MODELS = 2                # one role pick + the static fallback
 
 # Simple circuit breaker: models that failed recently are skipped for 5 minutes
 _model_fail_times: dict[str, float] = {}
@@ -72,23 +72,16 @@ async def _llm_call(prompt: str, system: str, max_tokens: int = 300) -> str | No
     for m in expired:
         del _model_fail_times[m]
 
-    exclude = None
     tried = []
+    # One role lookup. Resolving three models plus QA was itself a serial
+    # chain of HTTP calls before the planner prompt ever ran.
+    model, _ = await _resolve_nlp_model()
     models_to_try = []
-    for _ in range(_PLAN_MAX_RETRIES):
-        model, _ = await _resolve_nlp_model(exclude=exclude)
-        if model not in models_to_try:
-            models_to_try.append(model)
-        exclude = model
-    # Also try QA role as additional fallback
-    qa_model, _ = await _resolve_qa_model()
-    if qa_model not in models_to_try:
-        models_to_try.append(qa_model)
-    if AISERV_FALLBACK_MODEL not in models_to_try:
+    if model and not _is_model_broken(model):
+        models_to_try.append(model)
+    if AISERV_FALLBACK_MODEL not in models_to_try and not _is_model_broken(AISERV_FALLBACK_MODEL):
         models_to_try.append(AISERV_FALLBACK_MODEL)
-
-    # Filter out circuit-broken models
-    models_to_try = [m for m in models_to_try if not _is_model_broken(m)]
+    models_to_try = models_to_try[:_PLAN_MAX_MODELS]
 
     if not models_to_try:
         log.debug("[planner] all models circuit-broken, skipping planning")

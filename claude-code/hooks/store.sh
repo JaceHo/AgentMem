@@ -41,6 +41,9 @@ with open(transcript_path) as f:
                             tool_sequence.append(name)
         except: pass
 if not messages: sys.exit(0)
+# Server keeps the last 50 and then the last 4 turns. Sending the whole
+# transcript 422'd once a session passed that cap, so the turn was dropped.
+messages = messages[-50:]
 # 1. Store messages → long-term memory
 payload = json.dumps({"messages": messages, "session_id": session_id}).encode()
 req = urllib.request.Request("http://localhost:18800/store",
@@ -67,8 +70,8 @@ if len(tool_sequence) >= 2:
         headers={"Content-Type": "application/json"}, method="POST")
     try: urllib.request.urlopen(req3, timeout=2)
     except: pass
-    # 5. AWO meta-tool detection (v0.9.6): synthesize composite procedures from TIG chains.
-    #    Idempotent — knn_search dedup prevents re-adding existing meta-tool entries.
+    # 5. AWO meta-tool detection: synthesize composite procedures from TIG chains.
+    #    Skipped when the chain set is unchanged, and exact-task dedup blocks dupes.
     req4 = urllib.request.Request("http://localhost:18800/tool-graph/detect-meta-tools?threshold=5",
         data=b"{}", headers={"Content-Type": "application/json"}, method="POST")
     try: urllib.request.urlopen(req4, timeout=3)

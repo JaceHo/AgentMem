@@ -26,8 +26,10 @@ Env vars:
 
 from __future__ import annotations
 
+import logging
 import os
 import threading
+import time
 from abc import ABC, abstractmethod
 from typing import Callable, Optional
 
@@ -37,6 +39,8 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
 import numpy as np
 import httpx
+
+log = logging.getLogger("mem")
 
 # Max texts per HTTP request for remote embedding providers.
 _HTTP_EMBED_CHUNK = 32
@@ -112,16 +116,73 @@ def close() -> None:
             _provider._client = None
 
 
+class EmbeddingUnavailable(RuntimeError):
+    """Embedding backend is in cooldown after a transport or HTTP failure."""
+
+
+_embed_down_until = 0.0
+_EMBED_COOLDOWN_S = 30.0
+
+
+def embedding_unavailable() -> bool:
+    """True while the embedding circuit is open."""
+    return time.monotonic() < _embed_down_until
+
+
+def _is_embed_outage(exc: BaseException) -> bool:
+    if isinstance(exc, (httpx.HTTPError, TimeoutError, OSError)):
+        return True
+    msg = str(exc).lower()
+    return "502" in msg or "bad gateway" in msg or "timed out" in msg
+
+
+def _trip_embed_circuit(exc: BaseException) -> None:
+    global _embed_down_until
+    if time.monotonic() >= _embed_down_until:
+        log.warning(
+            "[embed] backend failed (%s: %s); skipping embeds for %.0fs",
+            type(exc).__name__, exc, _EMBED_COOLDOWN_S,
+        )
+    _embed_down_until = time.monotonic() + _EMBED_COOLDOWN_S
+
+
+def _clear_embed_circuit() -> None:
+    global _embed_down_until
+    _embed_down_until = 0.0
+
+
 def encode(text: str) -> np.ndarray:
     """Encode a single text string to a normalized float32 vector."""
-    return _get_provider().encode(text)
+    if embedding_unavailable():
+        raise EmbeddingUnavailable("embedding circuit open")
+    try:
+        vec = _get_provider().encode(text)
+    except EmbeddingUnavailable:
+        raise
+    except Exception as exc:
+        if _is_embed_outage(exc):
+            _trip_embed_circuit(exc)
+        raise
+    _clear_embed_circuit()
+    return vec
 
 
 def encode_batch(texts: list[str]) -> list[np.ndarray]:
     """Encode multiple texts. Returns list of normalized float32 vectors."""
     if not texts:
         return []
-    return _get_provider().encode_batch(texts)
+    if embedding_unavailable():
+        raise EmbeddingUnavailable("embedding circuit open")
+    try:
+        vecs = _get_provider().encode_batch(texts)
+    except EmbeddingUnavailable:
+        raise
+    except Exception as exc:
+        if _is_embed_outage(exc):
+            _trip_embed_circuit(exc)
+        raise
+    _clear_embed_circuit()
+    return vecs
 
 
 # Alias for compatibility with tests that use embed()

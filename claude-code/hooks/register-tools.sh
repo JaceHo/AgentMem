@@ -6,8 +6,15 @@
 # Fire-and-forget: does NOT block session start.
 unset PYTHONWARNINGS
 
-python3 - << 'PYEOF'
-import json, os, urllib.request
+INPUT=$(cat)
+python3 - "$INPUT" << 'PYEOF'
+import json, os, sys, urllib.request
+
+session_id = ""
+try:
+    session_id = json.loads(sys.argv[1]).get("session_id") or ""
+except Exception:
+    pass
 
 # ── 1. Known Claude Code built-in tools ──────────────────────────────────────
 BUILTIN_TOOLS = [
@@ -100,7 +107,7 @@ for path in settings_candidates:
 
 all_tools = BUILTIN_TOOLS + mcp_tools
 
-payload = json.dumps({"tools": all_tools, "agent_id": ""}).encode()
+payload = json.dumps({"tools": all_tools, "agent_id": session_id}).encode()
 req = urllib.request.Request(
     "http://localhost:18800/register-tools",
     data=payload,

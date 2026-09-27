@@ -1,5 +1,6 @@
 """Capability routes — tools, environment, procedures, TIG, AWO, MACLA."""
 
+import hashlib
 import json
 import logging
 import time
@@ -17,10 +18,18 @@ from core import persona as persona_mod
 from core import scene as scene_mod
 from core import store as mem_store
 from core.search import encode
-from core.utils import decode_bytes
+from core.utils import decode_attrs, decode_bytes
 
 log = logging.getLogger("mem")
 router = APIRouter(tags=["capability"])
+
+AWO_SIG_KEY = "mem:awo:chain_sig"
+
+
+def _chain_signature(chains: list[dict]) -> str:
+    """Stable id of the chain set. Edge weights can change without a new chain."""
+    idents = sorted("→".join(ch["chain"]) for ch in chains)
+    return hashlib.sha1("\n".join(idents).encode()).hexdigest()
 
 
 @router.post("/register-tools")
@@ -158,11 +167,15 @@ async def store_procedure(req: StoreProcedureRequest, background_tasks: Backgrou
     async def _do_store_proc():
         emb = encode(req.task)
         sc = scene_mod.detect(req.task)
-        existing = await mem_store.knn_search(r, mem_store.PROC_KEY, emb, k=1)
-        if existing and existing[0].get("score", 0.0) > 0.90:
-            elem = existing[0].get("_element")
+        hit = await mem_store.find_procedure_by_task(r, emb, req.task)
+        if not hit:
+            near = await mem_store.nearest_procedures(r, emb, k=1)
+            if near and near[0]["score"] > 0.90:
+                hit = near[0]
+        if hit:
+            elem = hit.get("_element")
             if elem:
-                attrs = dict(existing[0].get("attrs", {}))
+                attrs = dict(hit.get("attrs") or {})
                 attrs["success_count"] = attrs.get("success_count", 1) + 1
                 try:
                     await r.execute_command("VSETATTR", mem_store.PROC_KEY, elem, json.dumps(attrs))
@@ -191,6 +204,19 @@ async def tool_feedback(req: ToolFeedbackRequest):
     elem_key = req.tool_name.lower().replace(" ", "_").replace("/", "_")[:64]
 
     attrs = await cap_mod.atomic_tool_feedback(r, elem_key, req.success)
+    observed = False
+    if not attrs:
+        # Hooks report every tool Claude actually ran. Most 404s were tools
+        # outside the static builtin list, so ToolMem never learned them.
+        observed = True
+        try:
+            await cap_mod.register_observed_tool(
+                r, name=req.tool_name, agent_id=req.session_id,
+            )
+            attrs = await cap_mod.atomic_tool_feedback(r, elem_key, req.success)
+        except Exception as e:
+            log.warning("[tool-feedback] could not observe %s: %s", elem_key, e)
+            attrs = None
     if not attrs:
         raise HTTPException(status_code=404, detail="tool not found")
 
@@ -199,6 +225,7 @@ async def tool_feedback(req: ToolFeedbackRequest):
     return {
         "ok":                True,
         "tool":              elem_key,
+        "observed":          observed,
         "success_count":     attrs.get("success_count", 0),
         "fail_count":        attrs.get("fail_count", 0),
         "capability_summary": attrs.get("capability_summary", ""),
@@ -295,8 +322,21 @@ async def detect_meta_tools(threshold: int = 5, background_tasks: BackgroundTask
     if not chains:
         return {"detected": 0, "chains": [], "new_procedures": 0}
 
+    sig = _chain_signature(chains)
+    prev = await r.get(AWO_SIG_KEY)
+    if decode_bytes(prev) == sig:
+        return {
+            "detected": len(chains),
+            "chains": chains[:10],
+            "new_procedures": 0,
+            "synthesis": "skipped",
+            "reason": "unchanged",
+            "threshold": threshold,
+        }
+
     async def _synthesize_chains(chains_to_add: list[dict]):
         new_count = 0
+        embed_failures = 0
         for ch in chains_to_add[:20]:
             a, b, c = ch["chain"]
             task = f"[meta-tool] {a} → {b} → {c} workflow"
@@ -305,16 +345,37 @@ async def detect_meta_tools(threshold: int = 5, background_tasks: BackgroundTask
                 f"(TIG count: {a}→{b}={ch['ab_count']}, {b}→{c}={ch['bc_count']}).\n"
                 f"1. Use {a}\n2. Use {b}\n3. Use {c}"
             )
-            emb = encode(task)
-            existing = await mem_store.knn_search(r, mem_store.PROC_KEY, emb, k=1)
-            if existing and existing[0].get("score", 0.0) > 0.90:
+            mapped = await r.hget(mem_store.PROC_TASK_KEY, task[:300])
+            if mapped:
+                continue
+            try:
+                emb = encode(task)
+            except Exception as e:
+                embed_failures += 1
+                log.warning("[awo] embed failed for %s: %s", a, e)
+                continue
+            if await mem_store.find_procedure_by_task(r, emb, task):
                 continue
             await mem_store.save_procedure(
                 r, task=task, procedure=procedure, embedding=emb,
                 tools_used=[a, b, c], domain="meta", language="en",
             )
             new_count += 1
-        log.info(f"[awo] synthesized {new_count} meta-tool procedures from {len(chains_to_add)} chains")
+        if embed_failures == 0:
+            try:
+                await r.set(AWO_SIG_KEY, sig)
+            except Exception:
+                pass
+        if new_count:
+            log.info(
+                "[awo] synthesized %d new meta-tool procedures from %d chains",
+                new_count, len(chains_to_add),
+            )
+        else:
+            log.info(
+                "[awo] no new meta-tool procedures (%d chains, embed_failures=%d)",
+                len(chains_to_add), embed_failures,
+            )
 
     if background_tasks is not None:
         background_tasks.add_task(_synthesize_chains, chains)

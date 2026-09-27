@@ -27,8 +27,10 @@ print(json.dumps({'query': sys.argv[1], 'session_id': sys.argv[2],
                   'enable_planning': True, 'enable_hyde': True}))
 " "$PROMPT" "$SESSION" 2>/dev/null)
 
-# Hard-cap recall to 4s (planning adds ~300-600ms). Skip silently if exceeded.
-RESULT=$(curl -sf -m 4 -X POST http://localhost:18800/recall \
+# Hard-cap recall to 6s. Server augmentation is budgeted at 2.5s and overlaps
+# the query embed; 4s was shorter than a single planning round-trip, so the
+# hook always discarded the response while the server kept working.
+RESULT=$(curl -sf -m 6 -X POST http://localhost:18800/recall \
   -H 'Content-Type: application/json' -d "$PAYLOAD" 2>/dev/null)
 
 python3 -c "

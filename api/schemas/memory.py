@@ -2,7 +2,11 @@
 
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+# The handler only keeps the last few turns. Rejecting longer transcripts
+# dropped the whole Stop-hook store (422) once a session passed 50 messages.
+_STORE_MESSAGE_CAP = 50
 
 
 class RecallRequest(BaseModel):
@@ -27,6 +31,13 @@ class Message(BaseModel):
 
 
 class StoreRequest(BaseModel):
-    messages: list[Message] = Field(max_length=50)
+    messages: list[Message] = Field(max_length=_STORE_MESSAGE_CAP)
     session_id: str = ""
     metadata: dict[str, Any] | None = None
+
+    @field_validator("messages", mode="before")
+    @classmethod
+    def _keep_recent_messages(cls, value: Any) -> Any:
+        if isinstance(value, list) and len(value) > _STORE_MESSAGE_CAP:
+            return value[-_STORE_MESSAGE_CAP:]
+        return value
