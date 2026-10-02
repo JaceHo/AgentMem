@@ -1484,6 +1484,61 @@ def build_sse_app():
     return mcp.sse_app(mount_path="/mcp/sse")
 
 
+# ── KB tools — progressive-disclosure knowledge base (index/digest/chunks) ────
+
+@mcp.tool()
+async def kb_index() -> str:
+    """
+    List the knowledge base: one line per document (title + description).
+    Tier 0 — cheap enough to check at the start of any task that may need
+    reference material. Follow up with kb_digest or kb_search.
+    """
+    docs = (await _get("/kb/index")).get("docs", [])
+    if not docs:
+        return "(knowledge base is empty — ingest documents via kb_ingest)"
+    lines = [f"- [{d['id']}] {d['title']} — {d.get('description', '')[:120]} ({d.get('chunks', 0)} chunks)" for d in docs]
+    return "Knowledge base index:\n" + "\n".join(lines)
+
+
+@mcp.tool()
+async def kb_digest(doc_id: str) -> str:
+    """
+    Load a document's Tier 1 digest: markdown summary + section map.
+    Use after kb_index when a document looks relevant, before pulling chunks.
+    """
+    meta = await _get(f"/kb/doc/{doc_id}/digest")
+    sections = ", ".join(meta.get("sections", []))
+    return f"# {meta.get('title')}\nPath: {meta.get('path')}\nSections: {sections}\n\n{meta.get('digest', '')}"
+
+
+@mcp.tool()
+async def kb_search(query: str, k: int = 6) -> str:
+    """
+    Hybrid (vector + BM25) search over knowledge-base chunks. Returns the most
+    relevant passages with their document, section and source path. Tier 2.
+    """
+    data = await _post("/kb/search", {"query": query, "k": k})
+    chunks = data.get("chunks", [])
+    if not chunks:
+        return f"(no KB passages match {query!r})"
+    out = []
+    for c in chunks:
+        out.append(f"[{c['title']} › {c['section']}] (score {c['score']})\n{c['text'][:800]}\n(source: {c['path']})")
+    return "\n\n---\n\n".join(out)
+
+
+@mcp.tool()
+async def kb_ingest(path: str, enrich: bool = True) -> str:
+    """
+    Ingest a file or directory (under the home directory) into the knowledge
+    base: parse → chunk → contextual enrichment → digest. Supports .md/.txt,
+    .pdf (pymupdf) and .epub (ebooklib). Incremental: unchanged files are skipped.
+    """
+    import json as _json
+    report = await _post("/kb/ingest", {"path": path, "enrich": enrich})
+    return _json.dumps(report, ensure_ascii=False)
+
+
 # ── Standalone entry point ────────────────────────────────────────────────────
 
 if __name__ == "__main__":

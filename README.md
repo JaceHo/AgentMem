@@ -392,3 +392,24 @@ Available via HTTP (`/mcp`), SSE (`/mcp/sse`), or stdio (`python mcp_server.py`)
 | EvolveMem | [2605.13941](https://arxiv.org/abs/2605.13941) | AutoResearch loop: self-optimize retrieval config against bench-f1.py |
 | MemR3 | [2512.20237](https://arxiv.org/abs/2512.20237) | Closed-loop retrieve→reflect→answer controller for multi-hop queries |
 | EMem | [2511.17208](https://arxiv.org/abs/2511.17208) | EDU event-centric facts: (event, participant, temporal_cue, context) |
+
+## Knowledge base (KB) — documents, articles, books
+
+Progressive-disclosure knowledge plane (contextual retrieval + RAPTOR-style digests):
+ingest once, then let agents pull only what they need.
+
+```bash
+curl -X POST :18800/kb/ingest -d '{"path": "~/my-docs", "enrich": true, "library": "work"}'
+```
+
+- **Tier 0** `GET /kb/index` — one line per doc; cheap enough for a system prompt
+- **Tier 1** `GET /kb/doc/{id}/digest` — summary + section map
+- **Tier 2** `POST /kb/search` — hybrid vector+BM25 (wRRF) chunk retrieval, with source paths
+
+Pipeline: parse (md/txt native, pdf/epub via optional pymupdf/ebooklib) → structural
+chunking → per-chunk LLM context blurb via aiserv (Anthropic contextual retrieval,
+−49% retrieval failure) → doc digest → incremental re-ingest by content hash
+(unchanged files skip). Originals stay on disk; Redis holds chunks + embeddings + meta.
+MCP tools: `kb_index`, `kb_digest`, `kb_search`, `kb_ingest`. Tests:
+`tests/integration/test_kb.py` (daily scenes: ingest→index→digest→search→update→remove,
+LLM-outage fallbacks).

@@ -158,6 +158,36 @@ from services.consolidation_service import (
 logging.basicConfig(level=getattr(logging, settings.log_level), format=settings.log_format)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+
+class _ConciseNotificationFilter(logging.Filter):
+    """The MCP SDK logs a multi-KB pydantic validation dump (WARNING) for every
+    unknown client notification — Trae sends custom notifications/trae/* types
+    on every session stop. Unknown notifications are ignored by design per the
+    MCP spec, so collapse the dump to a one-line DEBUG record."""
+
+    _marker = "Failed to validate notification"
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if self._marker not in record.getMessage():
+            return True
+        import re as _re
+
+        m = _re.search(r"input_value='([^']+)'", record.getMessage())
+        record.levelno = record.level = logging.DEBUG
+        record.levelname = logging.getLevelName(logging.DEBUG)
+        record.msg = "MCP: ignoring unknown client notification %s" % (
+            m.group(1) if m else "(unparseable)",
+        )
+        record.args = None
+        return True
+
+
+_concise_filter = _ConciseNotificationFilter()
+logging.getLogger().addFilter(_concise_filter)
+for _h in logging.getLogger().handlers:
+    _h.addFilter(_concise_filter)
+
 log = logging.getLogger("mem")
 APP_VERSION = settings.app_version
 
@@ -313,6 +343,15 @@ async def lifespan(app: FastAPI):
     log.info("Connecting to Redis…")
     _redis = await mem_store.get_client()
     _state.redis = _redis  # share with compat/health/graph routes
+
+    # KB plane: rebuild the in-RAM BM25 index for knowledge-base chunks
+    try:
+        from core import kb as kb_mod
+        _warmed = await kb_mod.get_kb().warm(_redis)
+        if _warmed:
+            log.info("[kb] BM25 warm: %d chunks", _warmed)
+    except Exception as exc:
+        log.warning("[kb] warm skipped: %s", exc)
 
     # Dimension guard: if existing vectorset has different dims than current
     # provider, force local (384-dim) to avoid corrupting vector search.
@@ -480,6 +519,8 @@ app.include_router(capability_router)
 app.include_router(graph_router)
 app.include_router(compat_router)
 app.include_router(admin_router)
+from api.routes.kb import router as kb_router
+app.include_router(kb_router)
 
 # ── MCP transports: Streamable HTTP (preferred) + SSE (legacy) ───────────────
 try:

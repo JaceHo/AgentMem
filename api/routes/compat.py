@@ -561,6 +561,13 @@ async def smart_search(req: SmartSearchRequest, request: Request):
     }
 
 
+@router.post("/smart_search")
+async def smart_search_underscore_alias(req: SmartSearchRequest, request: Request):
+    """Underscore alias for /smart-search — taskd memory nodes and the MCP tool
+    naming use smart_search, and the 404 used to surface as a node failure."""
+    return await smart_search(req, request)
+
+
 @router.post("/timeline")
 async def compat_timeline(req: TimelineRequest, request: Request):
     _compat_check_auth(request)

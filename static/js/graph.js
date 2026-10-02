@@ -35,12 +35,12 @@ const PALETTE = {
   leaf:    { fill: '#4d96ff', glow: 'rgba(77,150,255,0.4)', light: '#85b5ff' },
   selected:{ fill: '#c084fc', glow: 'rgba(192,132,252,0.6)', light: '#dbb4ff' },
   edgeTypes: {
-    related_to:    { color: 'rgba(77,150,255,0.15)',  flow: 'rgba(77,150,255,0.5)' },
-    depends_on:    { color: 'rgba(255,107,107,0.25)', flow: 'rgba(255,107,107,0.7)' },
-    part_of:       { color: 'rgba(107,203,119,0.25)', flow: 'rgba(107,203,119,0.7)' },
-    influences:    { color: 'rgba(255,217,61,0.25)',  flow: 'rgba(255,217,61,0.7)' },
-    contradicts:   { color: 'rgba(239,68,68,0.25)',   flow: 'rgba(239,68,68,0.7)' },
-    supports:      { color: 'rgba(52,211,153,0.25)',  flow: 'rgba(52,211,153,0.7)' },
+    related_to:    { color: 'rgba(77,150,255,0.38)',  flow: 'rgba(77,150,255,0.6)' },
+    depends_on:    { color: 'rgba(255,107,107,0.45)', flow: 'rgba(255,107,107,0.7)' },
+    part_of:       { color: 'rgba(107,203,119,0.45)', flow: 'rgba(107,203,119,0.7)' },
+    influences:    { color: 'rgba(255,217,61,0.45)',  flow: 'rgba(255,217,61,0.7)' },
+    contradicts:   { color: 'rgba(239,68,68,0.5)',    flow: 'rgba(239,68,68,0.7)' },
+    supports:      { color: 'rgba(52,211,153,0.45)',  flow: 'rgba(52,211,153,0.7)' },
   },
   edgeHighlight: 'rgba(192,132,252,0.7)',
   edgeHighlightFlow: 'rgba(192,132,252,0.9)',
@@ -99,6 +99,7 @@ async function loadGraph() {
   const maxConn = Math.max(1, ...rawNodes.map(n => n.connections || 1));
   const canvas = $('gcanvas');
   const W = canvas.width / G.dpr, H = canvas.height / G.dpr;
+  const maxR = Math.min(W, H) * 0.38;
 
   // Sort nodes by connections (hubs first) for staggered entrance
   rawNodes.sort((a, b) => (b.connections || 1) - (a.connections || 1));
@@ -108,12 +109,14 @@ async function loadGraph() {
     const conn = n.connections || 1;
     const r = 8 + Math.sqrt(conn / maxConn) * 22;  // 8–30px radius
     const color = nodeColor({ ...n, connections: conn, id: n.id }, maxConn);
+    // Hub-centered seeding: golden-angle spiral, hubs near the middle
+    const dist = 30 + maxR * (1 - Math.sqrt(conn / maxConn));
     const node = {
       id: n.id, label: n.label || n.id,
       connections: conn, r, color,
       x: W / 2, y: H / 2,   // start from center
-      tx: W / 2 + (Math.random() - 0.5) * Math.min(W, H) * 0.6,
-      ty: H / 2 + (Math.random() - 0.5) * Math.min(W, H) * 0.6,
+      tx: W / 2 + Math.cos(i * 2.399963) * dist,
+      ty: H / 2 + Math.sin(i * 2.399963) * dist,
       vx: 0, vy: 0,
       // Entrance animation
       entranceDelay: i * 20,  // stagger ms
@@ -135,6 +138,7 @@ async function loadGraph() {
   G.hover = null;
   G._searchHighlight = q || null;
   G._particles = [];
+  G._autofitPending = true;
 
   // Start entrance animation
   G.entranceStart = performance.now();
@@ -175,11 +179,16 @@ function simStep() {
   for (let i = 0; i < nodes.length; i++) {
     for (let j = i + 1; j < nodes.length; j++) {
       const a = nodes[i], b = nodes[j];
-      const dx = b.x - a.x, dy = b.y - a.y;
+      let dx = b.x - a.x, dy = b.y - a.y;
+      // Coincident nodes (entrance never ran, stacked starts) feel no force — nudge apart
+      if (Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5) {
+        dx = ((i * 7919 + j * 104729) % 21) - 10 || 7;
+        dy = ((i * 15487 + j * 7919) % 21) - 10 || 7;
+      }
       const d2 = dx * dx + dy * dy || 1;
       const d = Math.sqrt(d2);
-      const minDist = a.r + b.r + 30;
-      const f = d < minDist ? 3000 / d2 : 800 / d2;
+      const minDist = a.r + b.r + 46;
+      const f = d < minDist ? 3200 / d2 : 1100 / d2;
       const fx = (dx / d) * f, fy = (dy / d) * f;
       a.vx -= fx; a.vy -= fy;
       b.vx += fx; b.vy += fy;
@@ -193,25 +202,29 @@ function simStep() {
     if (!a || !b) return;
     const dx = b.x - a.x, dy = b.y - a.y;
     const d = Math.sqrt(dx * dx + dy * dy) || 1;
-    const restLen = 120 + (a.r + b.r);
-    const f = (d - restLen) * 0.02;
+    const restLen = 100 + (a.r + b.r) * 0.55;
+    const f = (d - restLen) * 0.05;
     const fx = (dx / d) * f, fy = (dy / d) * f;
     a.vx += fx; a.vy += fy;
     b.vx -= fx; b.vy -= fy;
   });
 
-  // Gravity toward center
+  // Gravity toward center — hubs anchored hardest so the graph reads hub-centered
+  const gMax = Math.max(1, ...nodes.map(n => n.connections || 1));
   nodes.forEach(n => {
-    n.vx += (W / 2 - n.x) * 0.004;
-    n.vy += (H / 2 - n.y) * 0.004;
+    const g = 0.0012 + 0.0035 * Math.sqrt((n.connections || 1) / gMax);
+    n.vx += (W / 2 - n.x) * g;
+    n.vy += (H / 2 - n.y) * g;
   });
 
   // Damping + position update + bounds
   nodes.forEach(n => {
     if (G.drag === n) return;
     n.vx *= 0.85; n.vy *= 0.85;
+    const sp = Math.hypot(n.vx, n.vy);
+    if (sp > 14) { n.vx = (n.vx / sp) * 14; n.vy = (n.vy / sp) * 14; }
     n.x += n.vx; n.y += n.vy;
-    const pad = n.r + 10;
+    const pad = n.r + 24;
     n.x = Math.max(pad, Math.min(W - pad, n.x));
     n.y = Math.max(pad, Math.min(H - pad, n.y));
   });
@@ -268,6 +281,13 @@ function startSimulation() {
   G.running = true;
   G.tickCount = 0;
 
+  // Hidden / throttled tabs never fire rAF — if no frame has run by 2.5s,
+  // fast-forward the physics so the graph still ends up settled and centered.
+  clearTimeout(G._ffTimer);
+  G._ffTimer = setTimeout(() => {
+    if (G.tickCount === 0 && G.running && !G.settled) fastForward();
+  }, 2500);
+
   function frame() {
     simStep();
     renderG();
@@ -276,6 +296,7 @@ function startSimulation() {
       G.raf = requestAnimationFrame(frame);
     } else {
       G.settled = true;
+      if (G._autofitPending) { G._autofitPending = false; gFitAll(); }
       G.raf = requestAnimationFrame(idleFrame);
     }
   }
@@ -288,6 +309,21 @@ function startSimulation() {
     G.raf = requestAnimationFrame(idleFrame);
   }
   G.raf = requestAnimationFrame(frame);
+}
+
+function fastForward() {
+  if (!G.nodes.length) return;
+  G.entranceProgress = 1;
+  if (G.tickCount === 0) {
+    // No frame ever ran (throttled tab) — the entrance never positioned the
+    // nodes, so seed the hub-centered spiral before converging the physics.
+    G.nodes.forEach(n => { n.x = n.tx; n.y = n.ty; n.vx = 0; n.vy = 0; });
+  }
+  G.nodes.forEach(n => { n.opacity = 1; n.scale = 1; });
+  for (let i = 0; i < 320; i++) simStep();
+  if (G._autofitPending) { G._autofitPending = false; gFitAll(); }
+  G.settled = true;
+  renderG();
 }
 
 // ── Rendering ────────────────────────────────────────────────────────────────
@@ -340,7 +376,7 @@ function renderG() {
     const isHot = activeId && (e.source === activeId || e.target === activeId);
     const isDimmed = activeId && !isHot;
 
-    ctx.globalAlpha = alpha * (isDimmed ? 0.15 : isHot ? 1 : 0.5);
+    ctx.globalAlpha = alpha * (isDimmed ? 0.15 : isHot ? 1 : 0.9);
     drawCurvedEdge(ctx, a, b, e.type, isHot);
     ctx.globalAlpha = 1;
   });
@@ -565,7 +601,7 @@ function drawCurvedEdge(ctx, a, b, type, hot) {
   const cx = mx + nx * curveOffset, cy = my + ny * curveOffset;
 
   ctx.strokeStyle = edgeColor(type, hot);
-  ctx.lineWidth = hot ? 2.5 : 0.8;
+  ctx.lineWidth = hot ? 2.6 : 1.3;
   ctx.beginPath();
   ctx.moveTo(a.x, a.y);
   ctx.quadraticCurveTo(cx, cy, b.x, b.y);
@@ -1119,7 +1155,7 @@ function gFitAll() {
   });
   const rangeX = maxX - minX || 1, rangeY = maxY - minY || 1;
   const pad = 80;
-  G.zoom = Math.min((W - pad * 2) / rangeX, (H - pad * 2) / rangeY, 2.5);
+  G.zoom = Math.min((W - pad * 2) / rangeX, (H - pad * 2) / rangeY, 1.15);
   G.panX = (W - rangeX * G.zoom) / 2 - minX * G.zoom;
   G.panY = (H - rangeY * G.zoom) / 2 - minY * G.zoom;
 }
