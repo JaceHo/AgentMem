@@ -27,9 +27,15 @@ class Settings(BaseSettings):
     host: str = Field(default="0.0.0.0", description="Host to bind")
     port: int = Field(default=18800, description="Port to listen on")
     app_version: str = Field(default="1.1.0", description="Application version")
+    # LAN default: auth OFF. Set AGENTMEM_AUTH=1 (and AGENTMEM_API_KEY) only when
+    # exposing beyond a trusted LAN. A key alone does not enable the write gate.
+    auth: bool = Field(
+        default=False,
+        description="Require X-API-Key on write endpoints (AGENTMEM_AUTH=1)",
+    )
     api_key: str | None = Field(
         default=None,
-        description="API key for authenticating write endpoints (set AGENTMEM_API_KEY)",
+        description="API key for write endpoints when auth=True (AGENTMEM_API_KEY)",
         json_schema_extra={"env": "AGENTMEM_API_KEY"},
     )
     
@@ -40,9 +46,12 @@ class Settings(BaseSettings):
     )
     
     # ── Embedding Configuration ───────────────────────────────────────────
+    # LAN default path: leave unset → embedder auto-detects local aiserv
+    # (http://127.0.0.1:4000/v1, key sk-aiserv-local-dev). Force with
+    # EMBEDDING_PROVIDER=openai|local|ollama|hashing|gemini.
     embedding_provider: str = Field(
-        default="local",
-        description="Embedding provider: local, openai, huggingface"
+        default="",
+        description="Embedding provider override: openai, local, ollama, hashing, gemini (empty = auto)"
     )
     embedding_model: str = Field(
         default="sentence-transformers/all-MiniLM-L6-v2",
@@ -192,18 +201,19 @@ class Settings(BaseSettings):
     )
     
     # ── LLM Configuration ──────────────────────────────────────────────────
+    # LAN default: local aiserv gateway — no cloud key required.
     llm_provider: str = Field(
-        default="glm-4-flash",
-        description="LLM provider for extraction/summarization"
+        default="aiserv/fast",
+        description="LLM model id for extraction/summarization (aiserv role or OpenAI-compat id)"
     )
     llm_api_key: str | None = Field(
-        default=None,
-        description="API key for LLM provider",
+        default="sk-aiserv-local-dev",
+        description="API key for LLM provider (LAN aiserv local-dev key by default)",
         json_schema_extra={"env": "AGENTMEM_LLM_API_KEY"}
     )
     llm_base_url: str | None = Field(
-        default=None,
-        description="Base URL for LLM API",
+        default="http://127.0.0.1:4000/v1",
+        description="Base URL for LLM API (LAN aiserv by default)",
         json_schema_extra={"env": "AGENTMEM_LLM_BASE_URL"}
     )
     llm_timeout_seconds: float = Field(

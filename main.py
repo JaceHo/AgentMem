@@ -445,26 +445,77 @@ async def redis_guard(request: Request, call_next):
     return await call_next(request)
 
 
-# Write-endpoint auth: if AGENTMEM_API_KEY is set, require X-API-Key header
-# for mutating endpoints. Read endpoints (GET /recall, /health, /stats) remain open.
-_WRITE_PREFIXES = ("/store", "/session/compress", "/session/clear", "/session/compact",
-                   "/admin/", "/consolidate", "/crystallize", "/feedback",
-                   "/register-tools", "/register-env", "/store-procedure",
-                   "/tool-feedback", "/procedure-feedback", "/record-tool-sequence",
-                   "/tool-graph/", "/observe", "/export", "/import",
-                   "/compress-file", "/forget", "/remember")
+# Write-endpoint auth: LAN default is OPEN (AGENTMEM_AUTH unset/false). Set
+# AGENTMEM_AUTH=1 (and AGENTMEM_API_KEY) only when exposing beyond a trusted LAN.
+# When auth is on, require X-API-Key on every mutating request. Reads stay open
+# (GET/HEAD/OPTIONS by method, plus a small allowlist of POST-as-read query routes).
+#
+# Design note (2026-10-24 re-audit): the previous rule matched request PATHS against a
+# prefix list, which silently under-covered as routes were added — DELETE /facts/{id},
+# DELETE /procedures/{id}, POST /facts/{id}/pin, POST /kb/remove, POST /graph/edge,
+# POST /facts/{id}/reinforce and every /session/* write matched nothing and stayed
+# unauthenticated on a 0.0.0.0-bound service. Default-deny by METHOD (when auth is on)
+# inverts the failure mode: a new route is protected unless it is explicitly a read.
+# Policy lives in pure functions (tests/unit/test_write_guard.py).
+_WRITE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+_READ_POST_PREFIXES = (
+    "/recall",           # /recall, /recall-tools, /recall-procedures
+    "/search",           # kb /search, compat /search
+    "/smart-search", "/smart_search",
+    "/timeline",
+    "/graph/recall", "/graph/traverse",
+    "/context", "/file-context",
+    "/patterns", "/summarize",
+    # MCP streamable-HTTP / SSE transport. Cursor POSTs initialize here with no
+    # API key; a 401 is misread as OAuth → namespace stuck on mcp_auth only.
+    # Tool→REST write gating (when AGENTMEM_AUTH=1) still happens inside mcp_server.
+    "/mcp",
+)
+
+
+def needs_write_auth(method: str, path: str) -> bool:
+    """True when a request mutates state and must present the API key.
+
+    Pure policy function — no app, no request object — so the matrix is testable.
+    """
+    if method.upper() not in _WRITE_METHODS:
+        return False
+    return not any(path.startswith(p) for p in _READ_POST_PREFIXES)
+
+
+def check_write_auth(
+    method: str,
+    path: str,
+    provided: str,
+    configured: str,
+    *,
+    auth_enabled: bool = False,
+) -> bool:
+    """True = allow.
+
+    LAN default: auth_enabled=False → open (no key needed).
+    When AGENTMEM_AUTH=1, writes require a matching AGENTMEM_API_KEY.
+    AUTH on with an empty configured key fails closed on writes.
+    """
+    if not auth_enabled:
+        return True
+    if not needs_write_auth(method, path):
+        return True
+    if not configured:
+        return False
+    return hmac.compare_digest(provided, configured)
+
 
 @app.middleware("http")
 async def api_key_guard(request: Request, call_next):
-    """Require API key on write endpoints when AGENTMEM_API_KEY is configured."""
-    if not settings.api_key:
-        return await call_next(request)
-    path = request.url.path
-    needs_auth = any(path.startswith(p) for p in _WRITE_PREFIXES)
-    if not needs_auth:
-        return await call_next(request)
-    provided = request.headers.get("X-API-Key", "")
-    if not hmac.compare_digest(provided, settings.api_key):
+    """Require API key on write endpoints when AGENTMEM_AUTH=1."""
+    if not check_write_auth(
+        request.method,
+        request.url.path,
+        request.headers.get("X-API-Key", ""),
+        settings.api_key or "",
+        auth_enabled=bool(settings.auth),
+    ):
         from fastapi.responses import JSONResponse
         return JSONResponse(status_code=401, content={"detail": "Invalid or missing API key"})
     return await call_next(request)

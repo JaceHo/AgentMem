@@ -56,6 +56,19 @@ bash agentmem.sh setup          # service + all 8 Claude Code hooks
 
 Open a new Claude Code session. Done.
 
+### LAN defaults (no cloud key, no auth)
+
+On a trusted LAN with local [aiserv](https://github.com/JaceHo) at `http://127.0.0.1:4000`, AgentMem needs **no external API key and no write auth**:
+
+| Concern | Default |
+|---------|---------|
+| Auth | **Off** (`AGENTMEM_AUTH` unset). Set `AGENTMEM_AUTH=1` + `AGENTMEM_API_KEY=…` only when exposing beyond LAN. |
+| LLM / embeddings | Local aiserv (`OPENAI_BASE_URL=http://127.0.0.1:4000/v1`, key `sk-aiserv-local-dev`) |
+| Offline / CI | `EMBEDDING_PROVIDER=hashing` (deterministic, zero network) |
+| Cursor MCP | `http://127.0.0.1:18800/mcp` — **no** header / token. `/mcp` is never write-gated (a 401 here makes Cursor invent a fake OAuth `mcp_auth` step). |
+
+Copy `.env.example` → `.env` if you want the knobs explicit. A key sitting in `.env` alone does **not** enable the write gate — `AGENTMEM_AUTH=1` is required. After changing auth/env, run `bash agentmem.sh restart --force` so the live process reloads.
+
 **Other agents:**
 ```bash
 bash agentmem.sh setup --agent cursor      # Cursor

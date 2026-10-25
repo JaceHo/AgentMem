@@ -2,32 +2,38 @@
 Multi-provider embedder with auto-detection.
 
 Supports:
-  - local   : sentence-transformers (default, no API key needed)
+  - openai  : OpenAI-compatible /v1/embeddings (aiserv, Azure, vLLM, LM Studio)
+  - local   : sentence-transformers (offline MiniLM)
   - ollama  : local Ollama /api/embeddings endpoint
-  - openai  : OpenAI-compatible /v1/embeddings (also Azure, vLLM, LM Studio)
   - gemini  : Google Gemini embedding API
+  - hashing : deterministic offline embedder (tests / fully air-gapped)
 
-Selection priority:
+Selection priority (LAN-first):
   1. EMBEDDING_PROVIDER env var (explicit override)
-  2. Auto-detect from available API keys
-  3. Fallback to local sentence-transformers
+  2. Auto-detect from available cloud API keys (gemini / openai)
+  3. Local aiserv at 127.0.0.1:4000 (no external key — sk-aiserv-local-dev)
+  4. Local Ollama with an embedding model
+  5. Fallback to local sentence-transformers
 
 Env vars:
-  EMBEDDING_PROVIDER   — force provider: local | ollama | openai | gemini
+  EMBEDDING_PROVIDER   — force provider: local | ollama | openai | gemini | hashing
   EMBEDDING_DIMS       — override vector dimensions (auto-detected if omitted)
   OLLAMA_BASE_URL      — Ollama API base (default http://localhost:11434)
   OLLAMA_EMBED_MODEL   — Ollama model name (default nomic-embed-text)
-  OPENAI_API_KEY       — OpenAI / compatible API key
-  OPENAI_BASE_URL      — OpenAI-compatible base URL
+  OPENAI_API_KEY       — OpenAI / compatible API key (aiserv local-dev when LAN)
+  OPENAI_BASE_URL      — OpenAI-compatible base URL (default aiserv on LAN)
   OPENAI_EMBED_MODEL   — model name (default text-embedding-3-small)
+  AISERV_URL           — aiserv root (default http://127.0.0.1:4000)
   GEMINI_API_KEY       — Google Gemini API key
   GEMINI_EMBED_MODEL   — Gemini model (default models/gemini-embedding-001)
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
+import re
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -278,6 +284,45 @@ class OllamaProvider(BaseProvider):
 
 # ── OpenAI-compatible ───────────────────────────────────────────────
 
+_AISERV_LOCAL_KEY = "sk-aiserv-local-dev"
+_AISERV_DEFAULT_ROOT = "http://127.0.0.1:4000"
+
+
+def _is_lan_openai_base(base_url: str) -> bool:
+    """True for loopback / private aiserv-style OpenAI-compat bases."""
+    u = (base_url or "").lower()
+    return any(
+        h in u
+        for h in ("127.0.0.1", "localhost", "0.0.0.0", "[::1]", ".local/")
+    )
+
+
+def _aiserv_root() -> str:
+    raw = (
+        os.environ.get("AISERV_URL")
+        or os.environ.get("OPENAI_BASE_URL")
+        or _AISERV_DEFAULT_ROOT
+    ).rstrip("/")
+    if raw.endswith("/v1"):
+        raw = raw[:-3]
+    return raw
+
+
+def _aiserv_reachable(timeout: float = 0.4) -> bool:
+    """Fast probe — LAN aiserv up → prefer it over downloading MiniLM."""
+    try:
+        root = _aiserv_root()
+        r = httpx.get(
+            f"{root}/v1/models",
+            timeout=timeout,
+            trust_env=False,
+            headers={"Authorization": f"Bearer {_AISERV_LOCAL_KEY}"},
+        )
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
 class OpenAIProvider(BaseProvider):
     name = "openai"
     dims = 1536  # text-embedding-3-small
@@ -286,15 +331,21 @@ class OpenAIProvider(BaseProvider):
         "text-embedding-3-small": 1536,
         "text-embedding-3-large": 3072,
         "text-embedding-ada-002": 1536,
+        "nomic-embed-text": 768,
     }
 
     def __init__(self):
+        # LAN default: aiserv OpenAI-compat endpoint, local-dev key (no cloud key).
+        default_base = f"{_AISERV_DEFAULT_ROOT}/v1"
+        self.base_url = os.environ.get("OPENAI_BASE_URL", default_base).rstrip("/")
         self.api_key = os.environ.get("OPENAI_API_KEY", "")
         if not self.api_key:
-            raise ValueError("OPENAI_API_KEY is required for openai embedding provider")
-        self.base_url = os.environ.get(
-            "OPENAI_BASE_URL", "https://api.openai.com/v1"
-        ).rstrip("/")
+            if _is_lan_openai_base(self.base_url):
+                self.api_key = _AISERV_LOCAL_KEY
+            else:
+                raise ValueError(
+                    "OPENAI_API_KEY is required for non-LAN openai embedding provider"
+                )
         self.model = os.environ.get("OPENAI_EMBED_MODEL", "text-embedding-3-small")
         dims_override = os.environ.get("EMBEDDING_DIMS")
         if dims_override:
@@ -380,28 +431,99 @@ class GeminiProvider(BaseProvider):
         return _normalize_vectors(emb["values"] for emb in data.get("embeddings", []))
 
 
+# ── Offline hashing embedder (no model, no network) ────────────────────────
+#
+# Deterministic, dependency-free *lexical* embedder for offline / dev / test
+# use.  It feature-hashes de-duplicated, stopword-filtered tokens into a
+# fixed-dim vector and L2-normalizes.  Lexically similar texts get similar
+# vectors (high cosine); dissimilar texts get near-orthogonal vectors (low
+# cosine).  This replaces the MiniLM local provider in the test suite so the
+# whole suite runs fully offline — no HuggingFace download, no network.  It is
+# selected via EMBEDDING_PROVIDER=hashing (see tests/conftest.py); production
+# still defaults to local/remote providers with the circuit breaker intact.
+
+_HASHING_STOPWORDS = frozenset(
+    """
+    a an the and or but if then else when at by for with without about above below
+    to of in on into is are was were be been being this that these those it its as
+    from we you they he she i my your our their his her not no yes do does did have
+    has had will would can could should may might must i'm you're he's she's it's
+    we're they're there here what which who whom whose why how all any both each
+    few more most other some such only own same so than too very just don now also
+    """
+    .split()
+)
+
+
+class HashingProvider(BaseProvider):
+    name = "hashing"
+    dims = 384
+
+    def __init__(self):
+        dims_override = os.environ.get("EMBEDDING_DIMS")
+        if dims_override:
+            self.dims = int(dims_override)
+
+    @staticmethod
+    def _tokenize(text: str) -> list[str]:
+        text = text.lower()
+        words = re.findall(r"[a-z0-9]+", text)
+        cjk = re.findall(r"[\u4e00-\u9fff\u3400-\u4dbf]", text)
+        return words + cjk
+
+    def _vectorize(self, text: str) -> np.ndarray:
+        vec = np.zeros(self.dims, dtype=np.float32)
+        seen: set[str] = set()
+        for tok in self._tokenize(text):
+            if tok in _HASHING_STOPWORDS or tok in seen:
+                continue
+            seen.add(tok)
+            h = int(hashlib.md5(tok.encode("utf-8")).hexdigest(), 16)
+            vec[h % self.dims] += 1.0
+        norm = np.linalg.norm(vec)
+        if norm > 0:
+            vec = vec / norm
+        return vec
+
+    def encode(self, text: str) -> np.ndarray:
+        return self._vectorize(text)
+
+    def encode_batch(self, texts: list[str]) -> list[np.ndarray]:
+        return [self._vectorize(t) for t in texts]
+
+
 # ── Auto-detection ──────────────────────────────────────────────────
 
 def _detect_provider() -> BaseProvider:
-    """Detect embedding provider from environment, with local fallback."""
+    """Detect embedding provider from environment, LAN-aiserv first."""
     forced = os.environ.get("EMBEDDING_PROVIDER", "").strip().lower()
     if forced:
         return _create_provider(forced)
 
-    # Auto-detect from API keys
+    # Explicit cloud keys win (user opted into a remote provider).
     if os.environ.get("GEMINI_API_KEY"):
         return GeminiProvider()
-    if os.environ.get("OPENAI_API_KEY"):
+    openai_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if openai_key and openai_key != _AISERV_LOCAL_KEY:
+        return OpenAIProvider()
+
+    # LAN default: local aiserv gateway (no external key / no HF download).
+    if _aiserv_reachable():
+        os.environ.setdefault("OPENAI_BASE_URL", f"{_aiserv_root()}/v1")
+        os.environ.setdefault("OPENAI_API_KEY", _AISERV_LOCAL_KEY)
+        return OpenAIProvider()
+
+    # Explicit local-dev key with no reachable aiserv — still try openai path
+    # (caller may have set OPENAI_BASE_URL to something else on the LAN).
+    if openai_key == _AISERV_LOCAL_KEY:
         return OpenAIProvider()
 
     # Check if Ollama is running locally AND has an embedding model
     try:
-        import httpx
         base = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
         r = httpx.get(f"{base}/api/tags", timeout=2, trust_env=False)
         if r.status_code == 200:
             models = r.json().get("models", [])
-            # Check if any model is an embedding model (nomic-embed-text, mxbai-embed, etc.)
             embed_keywords = ("embed", "e5", "bge-", "gte-", "jina-embed")
             has_embed = any(
                 any(kw in m.get("name", "").lower() for kw in embed_keywords)
@@ -412,7 +534,7 @@ def _detect_provider() -> BaseProvider:
     except Exception:
         pass
 
-    # Default: local sentence-transformers
+    # Last resort: local sentence-transformers (may download on first use)
     return LocalProvider()
 
 
@@ -422,6 +544,7 @@ def _create_provider(name: str) -> BaseProvider:
         "ollama": OllamaProvider,
         "openai": OpenAIProvider,
         "gemini": GeminiProvider,
+        "hashing": HashingProvider,
     }
     cls = providers.get(name)
     if cls is None:
