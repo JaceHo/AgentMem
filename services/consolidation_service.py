@@ -62,20 +62,28 @@ async def do_consolidate(
     now_ms = int(time.time() * 1000)
     NINETY_DAYS_MS = 90 * 86_400_000
 
+    # Enumerate through the element-ID shadow index when it is populated.
+    # vscan (zero-vector VSIM) is an approximate HNSW traversal and silently
+    # loses most of a degraded vectorset — on this instance mem:procedures
+    # yields only ~13% of its elements per call, so consolidation used to run
+    # over a fraction of the corpus without knowing it.
+    async def _scan_facts() -> list[dict]:
+        shadow = int(await redis.scard(mem_store.idx_key(mem_store.FACT_KEY)))
+        if shadow > 0:
+            return await mem_store.enumerate_elements(redis, mem_store.FACT_KEY)
+        return await vscan(redis, mem_store.FACT_KEY, max_count=5000)
+
     try:
-        scanned = await asyncio.wait_for(
-            vscan(redis, mem_store.FACT_KEY, max_count=5000),
-            timeout=60.0,
-        )
+        scanned = await asyncio.wait_for(_scan_facts(), timeout=60.0)
     except asyncio.TimeoutError:
-        log.warning("[consolidate] vscan timed out (60s), retrying with smaller batch")
+        log.warning("[consolidate] scan timed out (60s), retrying with smaller batch")
         try:
             scanned = await asyncio.wait_for(
                 vscan(redis, mem_store.FACT_KEY, max_count=2000),
                 timeout=30.0,
             )
         except asyncio.TimeoutError:
-            log.error("[consolidate] vscan timed out again, skipping consolidation")
+            log.error("[consolidate] scan timed out again, skipping consolidation")
             return {"merged": 0, "decayed": 0, "pruned": 0, "ms": int((time.time() - t0) * 1000)}
 
     if not scanned:
@@ -132,27 +140,43 @@ async def do_consolidate(
     merged_count = 0
     superseded_elements: set[str] = set()
 
-    # Encode fact contents in chunks — a single batch over ~1k+ facts times out
-    # on remote embedding APIs (ReadTimeout at 15s).
-    fact_contents = [f["attrs"]["content"] for f in all_facts]
-    fact_vecs = await async_encode_batch_chunked(fact_contents)
-    if fact_vecs is None:
-        log.warning("[consolidate] encode_batch failed, skipping merge phase")
+    # Read cached embeddings for the whole tier in one HGETALL.  Only the
+    # pre-cache legacy rows (written before the vector cache existed) fall
+    # through to a chunked re-embedding — the hourly run over an already-cached
+    # corpus issues zero embedding-API calls.  (Redis vectorset has no VGET, so
+    # without this cache consolidation re-embedded every fact every run.)
+    elem_order = [f["element"] for f in all_facts]
+    fact_by_element: dict[str, dict] = {f["element"]: f for f in all_facts}
+    cached, missing = await mem_store.get_cached_vectors(
+        redis, mem_store.FACT_KEY, elem_order,
+    )
 
-    if fact_vecs is not None:
-        fact_embeddings: dict[str, np.ndarray] = {
-            f["element"]: vec for f, vec in zip(all_facts, fact_vecs)
-        }
+    fact_embeddings: dict[str, np.ndarray] = dict(cached)
+    if missing:
+        log.info("[consolidate] re-embedding %d uncached facts", len(missing))
+        miss_contents = [fact_by_element[m]["attrs"]["content"] for m in missing]
+        miss_vecs = await async_encode_batch_chunked(miss_contents)
+        if miss_vecs is not None:
+            for m, vec in zip(missing, miss_vecs):
+                fact_embeddings[m] = vec
+            # Warm the cache so the next run is fully cache-hit.
+            await mem_store.cache_vectors(redis, mem_store.FACT_KEY, fact_embeddings)
+        elif cached:
+            log.warning("[consolidate] encode_batch failed; merging on cache hits only")
+            elem_order = [e for e in elem_order if e in fact_embeddings]
+            all_facts = [f for f in all_facts if f["element"] in fact_embeddings]
+        else:
+            log.warning("[consolidate] encode_batch failed, skipping merge phase")
+            all_facts = []
 
+    if all_facts and fact_embeddings:
         # Pre-compute normalized embedding matrix for fast cosine similarity
         # (avoids O(n) knn_search calls — uses numpy vectorized ops instead)
-        elem_order = [f["element"] for f in all_facts]
         emb_matrix = np.stack([fact_embeddings[e] for e in elem_order]).astype(np.float32)
         norms = np.linalg.norm(emb_matrix, axis=1, keepdims=True)
         norms = np.maximum(norms, 1e-8)  # avoid division by zero
         emb_normed = emb_matrix / norms
 
-        fact_by_element: dict[str, dict] = {f["element"]: f for f in all_facts}
 
         for idx, fact in enumerate(all_facts):
             if fact["element"] in superseded_elements:
@@ -294,7 +318,10 @@ async def do_hard_prune(redis, bm25_index: BM25Index, spawn_fn) -> dict:
 
     async def _hard_prune_vset(vset_key: str, max_scan: int = 2000) -> int:
         nonlocal pruned_fact_ids
-        items = await vscan(redis, vset_key, max_count=max_scan)
+        shadow = int(await redis.scard(mem_store.idx_key(vset_key)))
+        items = (await mem_store.enumerate_elements(redis, vset_key)
+                 if shadow > 0
+                 else await vscan(redis, vset_key, max_count=max_scan))
         if not items:
             return 0
 
@@ -316,7 +343,7 @@ async def do_hard_prune(redis, bm25_index: BM25Index, spawn_fn) -> dict:
         removed = 0
         for elem_str in to_remove:
             try:
-                await redis.execute_command("VREM", vset_key, elem_str)
+                await mem_store.remove_element(redis, vset_key, elem_str)
                 removed += 1
                 if vset_key == mem_store.FACT_KEY:
                     pruned_fact_ids.add(elem_str)
@@ -447,7 +474,10 @@ async def crystallize_session_inline(
     Returns digest dict or None if crystallization fails.
     """
     try:
-        scanned = await vscan(redis, mem_store.FACT_KEY, max_count=5000)
+        shadow = int(await redis.scard(mem_store.idx_key(mem_store.FACT_KEY)))
+        scanned = (await mem_store.enumerate_elements(redis, mem_store.FACT_KEY)
+                   if shadow > 0
+                   else await vscan(redis, mem_store.FACT_KEY, max_count=5000))
 
         facts = []
         all_entities: set[str] = set()

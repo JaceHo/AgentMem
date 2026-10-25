@@ -33,6 +33,7 @@ from core.search import encode, vscan
 from utils.text_processing import (
     flatten_message_content,
     estimate_tokens,
+    truncate_to_tokens,
     redact_secrets,
     contains_secret,
     strip_platform_noise,
@@ -95,8 +96,24 @@ def format_prepend(
         tokens_used += cost
         return True
 
+    def _add_fitted(text: str) -> bool:
+        """Add a priority-1 block, clipped to the remaining budget (see main.py)."""
+        nonlocal tokens_used
+        text = redact_secrets(text)
+        remaining = token_budget - tokens_used
+        if remaining <= 0:
+            return False
+        if estimate_tokens(text) > remaining:
+            text = truncate_to_tokens(text, remaining)
+            if not text:
+                return False
+        cost = estimate_tokens(text)
+        sections.append(text)
+        tokens_used += cost
+        return True
+
     # Priority 1: persona (user profile — most stable context)
-    if persona_ctx and _add(persona_ctx):
+    if persona_ctx and _add_fitted(persona_ctx):
         _add("")
 
     # Priority 1.5: last session summary (cross-session continuity bridge)
@@ -539,6 +556,7 @@ async def do_store(messages: list[Message], session_id: str) -> None:
                 ep_type="general",
                 prev_episode_id=prev_ep_id,
             )
+            await state.bm25_index.add(new_ep_uid, turn_text[:2000], {"category": "episode"}, "episodes")
             ep_saved = 1
 
         # 5. Hybrid fact extraction
@@ -607,10 +625,13 @@ async def do_store(messages: list[Message], session_id: str) -> None:
             if not existing or existing[0].get("score", 0.0) < 0.90:
                 content_lower = pf.content.lower()
                 tools_in_proc = [t for t in _KNOWN_TOOLS if t in content_lower]
-                await mem_store.save_procedure(
+                proc_uid = await mem_store.save_procedure(
                     state.redis, task=pf.content, procedure=pf.content,
                     embedding=p_emb, tools_used=tools_in_proc[:8],
                     domain=domain, language=lang,
+                )
+                await state.bm25_index.add(
+                    proc_uid, pf.content, {"category": "procedure"}, "procedures"
                 )
 
         # 7. Knowledge graph edges
@@ -689,10 +710,13 @@ async def do_compress_session(session_id: str) -> dict:
     similar = await mem_store.knn_search(r, mem_store.EPISODE_KEY, ep_emb, k=1)
     ep_saved = 0
     if not similar or similar[0].get("score", 0.0) < 0.95:
-        await mem_store.save_episode(
+        ep_uid = await mem_store.save_episode(
             r, session_id,
             f"[Session Summary] {session_summary[:2000]}",
             ep_emb, lang, domain,
+        )
+        await state.bm25_index.add(
+            ep_uid, session_summary[:2000], {"category": "episode"}, "episodes"
         )
         ep_saved = 1
 
@@ -782,6 +806,7 @@ async def observe_internal(session_id: str, _project: str, _cwd: str,
         r, session_id, content, emb,
         ep_type=hook_type,
     )
+    await state.bm25_index.add(uid, content, {"category": "episode"}, "episodes")
 
     try:
         facts = await extractor.extract_facts(content, session_id)
