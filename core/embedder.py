@@ -244,13 +244,29 @@ class LocalProvider(BaseProvider):
         # Respect EMBEDDING_MODEL env var or settings if set
         model_override = os.environ.get("EMBEDDING_MODEL")
         if model_override:
-            LocalProvider._MODEL_NAME = model_override
+            LocalProvider._MODEL_NAME = os.path.expanduser(model_override)
+        # Short name for the embed signature — a full cache path in
+        # /kb/status would be unreadable and machine-specific.
+        self.model = os.path.basename(self._MODEL_NAME.rstrip("/"))
+        # MiniLM is tiny and CPU wins; a 0.6B model is ~10x faster on Apple
+        # silicon's GPU (measured 2026-10-27: 1.6 vs 16.6 texts/s on 64 chunks).
+        self.device = os.environ.get("EMBEDDING_DEVICE") or None
+        if not dims_override:
+            # Class default is MiniLM's 384; a different model has a different
+            # width, and a stale dims value corrupts the embed signature that
+            # /kb/status uses to detect incomparable vectors.
+            try:
+                from transformers import AutoConfig
+                cfg = AutoConfig.from_pretrained(self._MODEL_NAME)
+                self.dims = int(getattr(cfg, "hidden_size", self.dims))
+            except Exception:
+                pass
 
     def _get_model(self):
         with self._model_lock:
             if self._model is None:
                 from sentence_transformers import SentenceTransformer
-                LocalProvider._model = SentenceTransformer(self._MODEL_NAME)
+                LocalProvider._model = SentenceTransformer(self._MODEL_NAME, device=self.device)
             return self._model
 
     def encode(self, text: str) -> np.ndarray:

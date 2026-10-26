@@ -199,7 +199,13 @@ class BM25Index:
         # nothing searchable, so config keys and env names never matched a query
         # that named them exactly (measured 2026-10-27 on the KB corpus).
         en = re.findall(r'\b[a-z][a-z0-9_]{2,}\b', text)
-        zh = re.findall(r'[\u4e00-\u9fff\u3400-\u4dbf]{2,}', text)
+        # CJK runs must be split into overlapping bigrams. Matching a whole run
+        # (`[\u4e00-\u9fff]{2,}`) made one token out of "管理控制台在哪个地址", so a
+        # query phrased differently shared no token with the passage at all
+        # (measured 2026-10-27: every Chinese eval question missed in BM25).
+        zh = [run[i:i + 2]
+              for run in re.findall(r'[\u4e00-\u9fff\u3400-\u4dbf]+', text)
+              for i in range(len(run) - 1)]
         return en + zh
 
     def _build_corpus(self, docs: list[tuple[str, str, dict]]):
