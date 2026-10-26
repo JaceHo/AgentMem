@@ -96,6 +96,21 @@ def _get_provider() -> BaseProvider:
         return _provider
 
 
+def embed_signature() -> str:
+    """Fingerprint of the provider actually in use: name + dims + model.
+
+    Vectors from two signatures are not comparable. Nothing used to record which
+    provider wrote a chunk, so swapping the provider (or its model) left the old
+    rows in place and turned `/kb/search` into a flat ordering with no error —
+    measured 2026-10-27, every query scored exactly 1/(60+0). Chunks now carry
+    this string so the mismatch is countable instead of invisible.
+    """
+    p = _get_provider()
+    model = (getattr(p, "model", None) or getattr(p, "model_name", None)
+             or getattr(p, "_MODEL_NAME", None) or "")
+    return f"{getattr(p, 'name', type(p).__name__)}:{getattr(p, 'dims', '?')}:{model}"
+
+
 def _reset_provider(name: str = "local") -> None:
     """Force-switch to a specific provider (used by dimension guard)."""
     global _provider, DIMS

@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+from .embedder import embed_signature
 from .search import BM25Index, encode, encode_batch
 from .store import knn_search
 
@@ -277,8 +278,6 @@ class KBStore:
         title = parsed["title"]
 
         doc_id = old_doc_id or ("kb_" + hashlib.sha1(abspath.encode()).hexdigest()[:12])
-        if old_doc_id:
-            await self.remove_doc(r, old_doc_id)
 
         # Contextual enrichment — cap LLM calls per document (cost guard).
         # Per-chunk failures degrade to a plain header prefix; ingest never dies.
@@ -293,6 +292,12 @@ class KBStore:
                     c["text"] = f"[{title} › {c['section']}]\n\n{c['text']}"
 
         embeddings = encode_batch([c["text"] for c in chunks])
+        # Drop the old copy only now that the replacement is fully built. Doing it
+        # earlier let one transient embed/enrich failure delete a document outright
+        # (measured 2026-10-27: a forced re-ingest of 179 files lost CFO.md and
+        # CFO-LATEST.md, and /kb/status showed docs falling 33 → 29).
+        if old_doc_id:
+            await self.remove_doc(r, old_doc_id)
         await self._seed(r)
         elem_ids = []
         for c, emb in zip(chunks, embeddings):
@@ -318,6 +323,7 @@ class KBStore:
             "sections": [s["title"] for s in parsed["sections"]],
             "chunks": len(chunks), "enriched_chunks": enriched,
             "library": library, "ingested_at": time.time(),
+            "embed_sig": embed_signature(),
         }
         await r.hset(KB_DOC_KEY, doc_id, json.dumps(meta, ensure_ascii=False))
         await r.hset(KB_PATH_KEY, abspath, doc_id)
@@ -372,7 +378,12 @@ class KBStore:
             elem = item["_element"]
             fused[elem] = {"attrs": item["attrs"], "score": 1.0 / (60 + rank)}
         for rank, item in enumerate(bres):
-            elem = item.get("uid") or (item.get("attrs") or {}).get("_uid", "")
+            # BM25Index.search() keys its rows `_element`; reading only `uid`/`_uid`
+            # dropped every keyword hit, so `/kb/search` was vector-only while its
+            # docstring claimed hybrid fusion (measured 2026-10-27: a query for an
+            # exact filename returned unrelated docs at a flat 1/(60+0)).
+            elem = (item.get("uid") or item.get("_element")
+                    or (item.get("attrs") or {}).get("_uid", ""))
             if not elem:
                 continue
             entry = fused.setdefault(elem, {"attrs": item.get("attrs") or {"content": item.get("content", "")}, "score": 0.0})

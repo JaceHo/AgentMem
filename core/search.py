@@ -195,7 +195,10 @@ class BM25Index:
     def _tokenize(self, text: str) -> list[str]:
         """Tokenize for BM25: English words >=3 chars + CJK bigrams."""
         text = text.lower()
-        en = re.findall(r'\b[a-z]{3,}\b', text)
+        # Identifiers keep their underscores: `[a-z]{3,}` split ESCALATE_AT into
+        # nothing searchable, so config keys and env names never matched a query
+        # that named them exactly (measured 2026-10-27 on the KB corpus).
+        en = re.findall(r'\b[a-z][a-z0-9_]{2,}\b', text)
         zh = re.findall(r'[\u4e00-\u9fff\u3400-\u4dbf]{2,}', text)
         return en + zh
 

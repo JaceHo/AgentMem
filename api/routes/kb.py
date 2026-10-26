@@ -118,5 +118,18 @@ async def kb_status():
     r = _redis()
     docs = await r.hlen(kb_mod.KB_DOC_KEY)
     chunks = await r.hlen(kb_mod.KB_TEXT_KEY)
+    # Docs written by another embedding provider are not comparable with today's
+    # queries; they still occupy the vectorset and, left unreported, make search
+    # look merely bad instead of broken. Re-ingest with force to clear this.
+    import json as _json
+    current = kb_mod.embed_signature()
+    stale = 0
+    for raw in await r.hvals(kb_mod.KB_DOC_KEY):
+        try:
+            if _json.loads(raw).get("embed_sig", "") != current:
+                stale += 1
+        except Exception:  # noqa: BLE001 — a corrupt meta row is stale by definition
+            stale += 1
     return {"docs": docs, "chunks": chunks,
+            "embed_sig": current, "stale_embed": stale,
             "bm25_ready": len(kb_mod.get_kb().bm25._docs) if hasattr(kb_mod.get_kb().bm25, "_docs") else None}
