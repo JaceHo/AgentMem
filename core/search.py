@@ -381,6 +381,16 @@ class BM25Index:
             corpus.append(self._tokenize(text))
         return _BM25Okapi(corpus), len(docs)
 
+    async def _build_and_install(self, docs_snapshot) -> None:
+        new_bm25, n = await asyncio.to_thread(self._build_corpus, docs_snapshot)
+        if new_bm25 is None:
+            return
+        # Atomic reference swap — readers see either old or new, never partial
+        self._bm25 = new_bm25
+        self._built_at_len = n
+        # Update snapshot atomically so search() always gets consistent (bm25, docs) pair
+        self._snap = (new_bm25, docs_snapshot)
+
     async def _rebuild_async(self) -> None:
         """Rebuild BM25 index in a thread pool without blocking reads or the event loop."""
         if self._rebuild_lock.locked():
@@ -389,14 +399,22 @@ class BM25Index:
             docs_snapshot = list(self._docs)  # snapshot avoids holding add_lock during build
             if not docs_snapshot:
                 return
-            new_bm25, n = await asyncio.to_thread(self._build_corpus, docs_snapshot)
-            if new_bm25 is None:
+            await self._build_and_install(docs_snapshot)
+
+    async def force_rebuild(self) -> None:
+        """Build from every doc in the list and wait for it.
+
+        add() only coalesces a rebuild once 10 docs have accumulated, so a caller
+        that has finished appending (warm-up) must not assume the tail made it
+        into the index: after a restart the service reported 1775 docs but had
+        built from 1771, and *which* four were missing followed hgetall order —
+        every restart searched a slightly different corpus.
+        """
+        async with self._rebuild_lock:
+            docs_snapshot = list(self._docs)
+            if not docs_snapshot:
                 return
-            # Atomic reference swap — readers see either old or new, never partial
-            self._bm25 = new_bm25
-            self._built_at_len = n
-            # Update snapshot atomically so search() always gets consistent (bm25, docs) pair
-            self._snap = (new_bm25, docs_snapshot)
+            await self._build_and_install(docs_snapshot)
 
     async def search(self, query: str, k: int = 10) -> list[dict]:
         """Return top-k facts by BM25 score. Non-blocking: reads current index snapshot."""

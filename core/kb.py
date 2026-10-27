@@ -221,7 +221,7 @@ async def _llm(system: str, prompt: str, timeout: float = 45.0) -> str:
                 json={"model": "aiserv/fast", "messages": [
                     {"role": "system", "content": system},
                     {"role": "user", "content": prompt},
-                ], "max_tokens": 400, "temperature": 0.2},
+                ], "max_tokens": 400, "temperature": 0.0},
             )
             resp.raise_for_status()
             return str(resp.json()["choices"][0]["message"]["content"] or "")
@@ -511,6 +511,17 @@ class KBStore:
         else:
             bres_w = 1.0
         fused: Dict[str, Dict[str, Any]] = {}
+        # Cosine between the asked query and the chunk. Fusion discards it and
+        # keeps only w/(60+rank), which is rank mass, not a confidence — so a
+        # caller that needs "is this relevant at all" (abstention, reranking)
+        # has nothing calibrated to read. Carry it from the original-query dense
+        # leg only: the expanded leg's cosine is against a different text and
+        # would not be comparable.
+        dense: Dict[str, float] = {}
+        for item in vres:
+            elem, s = item["_element"], float(item.get("score") or 0.0)
+            if s > dense.get(elem, -2.0):
+                dense[elem] = s
 
         def add(rank: int, elem: str, attrs: Dict[str, Any], w: float = 1.0) -> None:
             entry = fused.get(elem)
@@ -539,12 +550,18 @@ class KBStore:
             if entry["attrs"].get("path", "").endswith("AGENTS.md"):
                 entry["score"] *= 1.2
         out = []
-        for elem, entry in sorted(fused.items(), key=lambda kv: kv[1]["score"], reverse=True)[:k]:
+        # Ties on the fused score were broken by dict insertion order, which
+        # follows the order the legs returned: stable inside one process, but a
+        # restart re-warms BM25 from hgetall and reshuffles it, so the same
+        # query answered differently run to run (doc-hit@1 moved 32%↔34% with no
+        # code change). elem id is unique, so it makes the order total.
+        for elem, entry in sorted(fused.items(), key=lambda kv: (-kv[1]["score"], kv[0]))[:k]:
             a = entry["attrs"]
             out.append({"doc": a.get("doc", ""), "title": a.get("title", ""),
                         "section": a.get("section", ""), "seq": a.get("seq", 0),
                         "path": a.get("path", ""), "text": a.get("content", ""),
-                        "enriched": a.get("enriched", False), "score": round(entry["score"], 5)})
+                        "enriched": a.get("enriched", False), "score": round(entry["score"], 5),
+                        "dense": round(dense.get(elem, 0.0), 5)})
         return out
 
     async def warm(self, r) -> int:
@@ -565,6 +582,10 @@ class KBStore:
             await self.bm25.add(elem, content, {"content": content, "doc": doc_id,
                                                 "title": meta.get("title", ""), "path": meta.get("path", "")})
             n += 1
+        # add() rebuilds every 10 docs in the background, so the last 0-9 chunks
+        # never reach the index and search() will not rebuild for a gap that
+        # small. /kb/status showed 1771 indexed of 1775 right after a restart.
+        await self.bm25.force_rebuild()
         return n
 
 

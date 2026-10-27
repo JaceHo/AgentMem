@@ -149,4 +149,9 @@ async def kb_status():
     return {"docs": docs, "chunks": chunks,
             "embed_sig": current, "stale_embed": stale,
             "bm25_ready": len(kb_mod.get_kb().bm25._docs) if hasattr(kb_mod.get_kb().bm25, "_docs") else None,
+            # What the BM25 index was actually BUILT from. warm() appends to the
+            # doc list and rebuilds asynchronously in 10-doc batches, so the tail
+            # of the warm-up can stay out of the index — and bm25_ready above
+            # keeps reporting the full list length while it does.
+            "bm25_indexed": getattr(kb_mod.get_kb().bm25, "_built_at_len", None),
             **dims_block}
