@@ -95,7 +95,7 @@ from contextlib import asynccontextmanager
 
 import httpx
 import numpy as np
-from fastapi import FastAPI, BackgroundTasks, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, BackgroundTasks, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -106,7 +106,13 @@ from api.schemas.consolidation import (
 )
 
 # ── Search utilities (extracted to core/search.py) ───────────────────────────
-from core.search import encode as _encode, vscan as _vscan, populate_bm25_from_redis
+from core.search import (
+    encode as _encode,
+    vscan as _vscan,
+    populate_bm25_from_redis,
+    async_encode,
+    async_encode_batch,
+)
 
 # ── Shared state (single source of truth) ────────────────────────────────────
 from api import state
@@ -116,6 +122,7 @@ from config.settings import settings
 from utils.text_processing import (
     flatten_message_content,
     estimate_tokens,
+    truncate_to_tokens,
     redact_secrets,
     contains_secret,
     strip_platform_noise,
@@ -138,6 +145,7 @@ _flatten_message_content = flatten_message_content
 _estimate_tokens = estimate_tokens
 
 from core import capability as cap_mod
+from core import dim_guard
 from core import embedder
 from core import extractor
 from core import graph as graph_mod
@@ -235,34 +243,27 @@ _bm25_index = state.bm25_index
 
 
 async def _encode_batch_async(texts: list[str]) -> list[np.ndarray]:
-    """Batch-encode texts off the event loop using a single model forward pass.
+    """Batch-encode texts via the dedicated, bounded embedding pool.
 
-    Uses asyncio.to_thread so the CPU-bound inference doesn't block the event loop.
-    Falls back to per-text encoding if batch fails (handles partial provider failures).
+    Delegates to core.search.async_encode_batch, which runs the CPU-bound
+    inference on the embed thread pool (separate from the default pool used by
+    BM25 rebuilds) under a semaphore — the recall concurrency ceiling.  Same
+    contract as before: propagates EmbeddingUnavailable, degrades partial
+    failures to zero vectors so the pipeline never crashes.
     """
     if not texts:
         return []
     if embedder.embedding_unavailable():
         raise embedder.EmbeddingUnavailable("embedding circuit open")
     try:
-        return list(await asyncio.to_thread(embedder.encode_batch, texts))
+        return await async_encode_batch(texts)
     except embedder.EmbeddingUnavailable:
         raise
     except Exception as e:
-        log.warning("[encode_batch] batch encode failed (%s: %s), falling back to per-text", type(e).__name__, e)
-        # Fallback: try encoding texts individually — some may succeed
-        results = []
-        for text in texts:
-            try:
-                vec = await asyncio.to_thread(embedder.encode, text)
-                results.append(vec)
-            except embedder.EmbeddingUnavailable:
-                raise
-            except Exception:
-                # Last resort: zero vector so the pipeline doesn't crash
-                log.warning("[encode_batch] single encode failed, using zero vector")
-                results.append(np.zeros(embedder.DIMS, dtype=np.float32))
-        return results
+        # async_encode_batch already fell back per-text; re-raise circuit trips
+        # but swallow other unexpected errors as zeros to keep callers safe.
+        log.warning("[encode_batch] pool encode failed (%s: %s); zero-filling", type(e).__name__, e)
+        return [np.zeros(embedder.DIMS, dtype=np.float32) for _ in texts]
 
 # ── Session handoff: pinned last-session summary ───────────────────────────────
 # Key stores the most recent session summary so the NEXT session can always
@@ -334,6 +335,30 @@ async def _backfill_crystallized_index(r) -> None:
         log.warning(f"[crystallize] index backfill failed: {e}")
 
 
+async def _startup_bm25_populate(r, bm25_index) -> None:
+    """Recover procedures, then build the BM25 corpus from a trustworthy enumeration.
+
+    mem:procedures' HNSW graph is degraded, so VSIM-based enumeration sees only
+    ~13% of it.  The element IDs survive in mem:proc_by_tool:* / mem:proc_tasks,
+    so recover them first — otherwise the BM25 corpus would silently exclude
+    ~51% of the procedural tier.  The recovery is guarded and idempotent: two
+    round trips when the shadow index is already complete.
+    """
+    try:
+        rec = await mem_store.ensure_procedures_recovered(r)
+        if rec:
+            log.info(
+                "[proc-recovery] %d live / %d collected, %d newly registered, "
+                "%d stale refs pruned — shadow %d/%d (%.1f%%)",
+                rec["live"], rec["ids_collected"], rec["newly_registered"],
+                rec["stale_refs_pruned"], rec["shadow_after"], rec["vcard"],
+                rec["coverage"] * 100,
+            )
+    except Exception as e:
+        log.warning(f"[proc-recovery] skipped: {e}")
+    await populate_bm25_from_redis(r, bm25_index)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _redis
@@ -353,30 +378,38 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         log.warning("[kb] warm skipped: %s", exc)
 
-    # Dimension guard: if existing vectorset has different dims than current
-    # provider, force local (384-dim) to avoid corrupting vector search.
-    try:
-        for vset_key in (mem_store.FACT_KEY, mem_store.EPISODE_KEY, mem_store.PROC_KEY):
-            info = await _get_redis().execute_command("VINFO", vset_key)
-            if not info:
-                continue
-            info_dict = dict(zip(info[::2], info[1::2]))
-            existing_dims = int(info_dict.get(b"vector-dim", info_dict.get("vector-dim", 0)))
-            provider_dims = embedder._get_provider().dims
-            if existing_dims and existing_dims != provider_dims:
-                log.warning("Dimension mismatch in %s: existing=%d, provider=%s dims=%d — forcing local provider",
-                            vset_key, existing_dims, embedder._get_provider().name, provider_dims)
-                embedder._reset_provider("local")
-                break  # no need to check further
-    except Exception:
-        pass  # no existing vectorset, safe to use any provider
+    # Width integrity: the index is the source of truth, the model is measured.
+    # This used to check three hard-coded keys and, on mismatch, force-switch the
+    # provider — a config error became a silent model downgrade, and sets added
+    # later (mem:tools, kb chunks) were never checked at all.
+    await dim_guard.enforce(_get_redis())
 
     log.info("Ensuring vectorset indexes…")
     await mem_store.ensure_indexes(_get_redis())
+    # Persona hygiene: reject rules only guard *future* writes. Anything already
+    # in mem:persona (e.g. the national-ID-card path that was being injected into
+    # every agent's context on every recall) is re-filtered here once per boot,
+    # so a stale profile can never outlive the rule that should have blocked it.
+    try:
+        _dropped = await persona_mod.sanitize_stored(_get_redis())
+        if _dropped:
+            log.info("[persona] startup hygiene removed stale entries from %d field(s): %s",
+                     len(_dropped), _dropped)
+    except Exception as exc:
+        log.warning("[persona] startup hygiene skipped: %s", exc)
+    # Pre-load the heat-bump Lua so the first recall does not pay a NOSCRIPT
+    # round trip (and so a flushed script cache is visible at startup, loudly).
+    try:
+        await _get_redis().execute_command(
+            "SCRIPT LOAD", heat_mod.BUMP_HEAT_LUA_SRC)
+        log.info("[heat] bump script cached: sha=%s", heat_mod.bump_script_sha())
+    except Exception as exc:
+        log.warning("[heat] SCRIPT LOAD failed (%s) — bumps will use per-element "
+                    "EVAL fallback", exc)
     _spawn(_periodic_consolidate(), "consolidate")
     _spawn(_auto_crystallize(), "crystallize")  # Auto-crystallize sessions every 6h
     # Populate BM25 corpus from existing Redis facts (non-blocking, best-effort)
-    _spawn(populate_bm25_from_redis(_get_redis(), state.bm25_index), "bm25-populate")
+    _spawn(_startup_bm25_populate(_get_redis(), state.bm25_index), "bm25-populate")
     # Backfill crystallized sorted-set index from existing keys (idempotent, skips if populated)
     _spawn(_backfill_crystallized_index(_get_redis()), "crystallize-index-backfill")
     log.info("AgentMem v%s ready (session-handoff+hard-prune+auto-graph+batch-MCP+compat+auto-crystallize)", APP_VERSION)
@@ -715,8 +748,32 @@ def _format_prepend(
         tokens_used += cost
         return True
 
+    def _add_fitted(text: str) -> bool:
+        """Add a block, truncated to whatever budget is left rather than dropped.
+
+        Priority-1 blocks (the persona) must survive a small budget: `_add`
+        refuses them wholesale, and history showed the opposite failure too —
+        `estimate_tokens` scored the Chinese persona as ~1 token, so a 600-token
+        budget shipped ~1 600 real tokens. Truncating to the remaining budget is
+        the only behaviour that is both lossless-within-budget and honest about
+        the budget.
+        """
+        nonlocal tokens_used
+        text = _redact_secrets(text)
+        remaining = token_budget - tokens_used
+        if remaining <= 0:
+            return False
+        if _estimate_tokens(text) > remaining:
+            text = truncate_to_tokens(text, remaining)
+            if not text:
+                return False
+        cost = _estimate_tokens(text)
+        sections.append(text)
+        tokens_used += cost
+        return True
+
     # Priority 1: persona (user profile — most stable context)
-    if persona_ctx and _add(persona_ctx):
+    if persona_ctx and _add_fitted(persona_ctx):
         _add("")
 
     # Priority 1.5: last session summary (cross-session continuity bridge)
@@ -813,13 +870,26 @@ def _format_prepend(
         return ""
 
     # SimpleMem XML wrapper — clearly delineates injected memory from user content
-    return (
-        "<cross_session_memory>\n"
-        "The following is relevant context from long-term memory.\n"
-        "Use it to inform your responses but do not repeat it verbatim.\n\n"
-        + body
-        + "\n</cross_session_memory>"
-    )
+    prefix = ("<cross_session_memory>\n"
+              "The following is relevant context from long-term memory.\n"
+              "Use it to inform your responses but do not repeat it verbatim.\n\n")
+    suffix = "\n</cross_session_memory>"
+    out = prefix + body + suffix
+
+    # Final budget assertion. A single oversized line (one huge fact, one long
+    # procedure body) can still slip past the per-item check because _add only
+    # refuses items that overshoot. Overshooting silently is exactly what
+    # happened for months, so: clamp, and say so loudly.
+    _WRAPPER_TOKENS = 30
+    cost = _estimate_tokens(out)
+    if cost > token_budget:
+        log.warning("[recall] token_budget overflow: packed %d tokens > budget %d"
+                    " — clamping (%d facts, %d episodes, persona=%d chars)",
+                    cost, token_budget, len(facts), len(episodes), len(persona_ctx))
+        body = truncate_to_tokens(body, max(16, token_budget - _WRAPPER_TOKENS))
+        out = prefix + body + suffix
+
+    return out
 
 
 # ── Query complexity estimator (SimpleMem-inspired, zero-cost) ────────────────
@@ -1302,6 +1372,8 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
                 ep_type="general",        # placeholder; updated after fact extraction below
                 prev_episode_id=prev_ep_id,
             )
+            # Episodes used to be keyword-invisible: BM25 only ever indexed facts.
+            await _bm25_index.add(new_ep_uid, turn_text[:2000], {"category": "episode"}, "episodes")
             ep_saved = 1
 
         # 5. Hybrid fact extraction (regex + LLM) → dedup → save → update persona
@@ -1311,41 +1383,56 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
         facts = await extractor.extract_hybrid(raw_msgs, turn_text)
         fact_saved = 0
 
-        # Batch-encode all fact contents off the event loop in one pass
-        # instead of calling _encode() per fact (N sequential MiniLM inferences)
-        fact_contents = [f.content for f in facts if not _contains_secret(f.content)]
-        fact_embs = await _encode_batch_async(fact_contents)
-        emb_iter = iter(fact_embs)
+        # Separate secret-bearing facts (never persisted) from the rest so the
+        # embeddings and dedup searches stay positionally aligned.
+        normal_facts = [f for f in facts if not _contains_secret(f.content)]
+        # Batch-encode all remaining fact contents off the event loop in one pass
+        # instead of one MiniLM inference per fact (N sequential forward passes).
+        normal_embs = await _encode_batch_async([f.content for f in normal_facts])
+        # One VSIM pipeline for every fact's dedup check instead of N serial
+        # round trips (mem:facts is small, but this is on the store hot path).
+        dedup_hits = await mem_store.knn_search_batch(
+            _get_redis(), mem_store.FACT_KEY, normal_embs, k=1,
+        )
 
-        for fact in facts:
-            if _contains_secret(fact.content):
-                continue
-            f_emb = next(emb_iter)
-            existing = await mem_store.knn_search(_get_redis(), mem_store.FACT_KEY, f_emb, k=1)
-            if existing and existing[0].get("score", 0.0) > 0.95:
-                # A-MEM memory evolution: similar fact exists → async-update its keywords/topic
-                # (arXiv:2502.12110 §3: new memories trigger context refinement on neighbors)
-                if fact.keywords and existing[0].get("score", 0.0) > 0.80:
+        # Decide save/dedup/evolve/contradiction in memory — no Redis calls here.
+        to_save: list[tuple] = []  # (fact, emb)
+        for fact, emb, hits in zip(normal_facts, normal_embs, dedup_hits):
+            top = hits[0] if hits else None
+            score = top.get("score", 0.0) if top else 0.0
+            if score > 0.95:
+                # A-MEM memory evolution: similar fact exists → async-update its
+                # keywords/topic (arXiv:2502.12110 §3: new memories trigger
+                # context refinement on neighbours).
+                if fact.keywords and score > 0.80:
                     _spawn(_evolve_similar_fact(
-                        existing[0].get("_element", ""),
-                        fact.keywords,
-                        fact.topic,
+                        top.get("_element", ""), fact.keywords, fact.topic,
                     ), "evolve")
                 continue
-            # LLM Wiki v2: Contradiction detection — if a high-similarity fact exists
-            # (0.80-0.95 range) with opposing meaning, mark old as superseded.
-            if existing and existing[0].get("score", 0.0) > 0.80:
-                _spawn(_check_contradiction(
-                    existing[0], fact,
-                ), "contradiction")
-            uid = await mem_store.save_fact(
-                _get_redis(), fact.content, fact.category, fact.confidence, f_emb, lang, domain,
-                keywords=fact.keywords, persons=fact.persons, entities=fact.entities,
-                importance=fact.importance, topic=fact.topic, location=fact.location,
-                source_episode_id=new_ep_uid or None,
-                triple_s=fact.triple_s, triple_p=fact.triple_p, triple_o=fact.triple_o,
-            )
-            # Add to in-memory BM25 corpus for hybrid recall
+            # LLM Wiki v2: contradiction detection — a high-similarity fact
+            # (0.80-0.95) with opposing meaning marks the old one superseded.
+            if score > 0.80:
+                _spawn(_check_contradiction(top, fact), "contradiction")
+            to_save.append((fact, emb))
+
+        # One VADD+SADD pipeline for every fact instead of N x 2 serial writes.
+        save_specs = [{
+            "embedding": emb,
+            "content": fact.content, "category": fact.category,
+            "confidence": fact.confidence, "language": lang, "domain": domain,
+            "keywords": fact.keywords, "persons": fact.persons, "entities": fact.entities,
+            "importance": fact.importance, "topic": fact.topic, "location": fact.location,
+            "source_episode_id": new_ep_uid or None,
+            "triple_s": fact.triple_s, "triple_p": fact.triple_p, "triple_o": fact.triple_o,
+        } for fact, emb in to_save]
+        uids = await mem_store.save_facts_batch(_get_redis(), save_specs)
+
+        # BM25 insertion (in-memory) + persona merge, the latter batched into
+        # two round trips (one HGETALL, one HSET pipeline) instead of 2N.
+        persona_entries: list[tuple[str, str]] = []
+        for (fact, _emb), uid in zip(to_save, uids):
+            if not uid:
+                continue
             attrs = {
                 "content": fact.content, "category": fact.category,
                 "language": lang, "domain": domain,
@@ -1354,8 +1441,10 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
             if fact.triple_s and fact.triple_p and fact.triple_o:
                 attrs["triple_str"] = f"{fact.triple_s} | {fact.triple_p} | {fact.triple_o}"
             await _bm25_index.add(uid, fact.content, attrs)
-            await persona_mod.update(_get_redis(), fact.category, fact.content)
+            persona_entries.append((fact.category, fact.content))
             fact_saved += 1
+        if persona_entries:
+            await persona_mod.update_many(_get_redis(), persona_entries)
 
         # 5b. Back-fill ep_type on newly saved episode + complete causal chain
         if new_ep_uid:
@@ -1395,23 +1484,39 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
         if proc_facts:
             proc_contents = [pf.content for pf in proc_facts]
             proc_embs = await _encode_batch_async(proc_contents)
-            for pf, p_emb in zip(proc_facts, proc_embs):
-                existing = await mem_store.knn_search(_get_redis(), mem_store.PROC_KEY, p_emb, k=1)
-                if not existing or existing[0].get("score", 0.0) < 0.90:
-                    content_lower = pf.content.lower()
-                    tools_in_proc = [t for t in _KNOWN_TOOLS if t in content_lower]
-                    await mem_store.save_procedure(
-                        _get_redis(), task=pf.content, procedure=pf.content,
-                        embedding=p_emb, tools_used=tools_in_proc[:8],
-                        domain=domain, language=lang,
-                    )
+            # One VSIM pipeline for every procedure's dedup check.
+            proc_hits = await mem_store.knn_search_batch(
+                _get_redis(), mem_store.PROC_KEY, proc_embs, k=1,
+            )
+            for pf, p_emb, hits in zip(proc_facts, proc_embs, proc_hits):
+                top = hits[0] if hits else None
+                score = top.get("score", 0.0) if top else 0.0
+                if score >= 0.90:
+                    continue
+                content_lower = pf.content.lower()
+                tools_in_proc = [t for t in _KNOWN_TOOLS if t in content_lower]
+                proc_uid = await mem_store.save_procedure(
+                    _get_redis(), task=pf.content, procedure=pf.content,
+                    embedding=p_emb, tools_used=tools_in_proc[:8],
+                    domain=domain, language=lang,
+                )
+                # Procedures were keyword-invisible too — the largest tier by count.
+                await _bm25_index.add(
+                    proc_uid, pf.content, {"category": "procedure"}, "procedures"
+                )
 
-        # 7. Record knowledge graph edges from persons + entities co-occurrences
+        # 7. Record knowledge graph edges from persons + entities co-occurrences.
+        #    Pass every fact's entity group at once so the edge upserts run in a
+        #    single pipeline instead of N*(N-1) serial Lua round trips.
+        graph_groups: list[tuple[list[str], list[str]]] = []
         for fact in facts:
             if fact.persons or fact.entities:
                 all_ents = (fact.persons or []) + (fact.entities or [])
                 if len(all_ents) >= 2:
-                    await graph_mod.record_entities(_get_redis(), all_ents, [])
+                    graph_groups.append((all_ents, []))
+        if graph_groups:
+            await graph_mod.record_entities_many(_get_redis(), graph_groups)
+
 
         # 8. Accumulate rolling session summary (Tier 1 — layered controlled architecture)
         #    Append this turn's summary instead of overwriting, so Tier 1 grows across
@@ -1508,10 +1613,13 @@ async def _do_compress_session(session_id: str) -> dict:
     similar = await mem_store.knn_search(_get_redis(), mem_store.EPISODE_KEY, ep_emb, k=1)
     ep_saved = 0
     if not similar or similar[0].get("score", 0.0) < 0.95:
-        await mem_store.save_episode(
+        ep_uid = await mem_store.save_episode(
             _get_redis(), session_id,
             f"[Session Summary] {session_summary[:2000]}",
             ep_emb, lang, domain,
+        )
+        await _bm25_index.add(
+            ep_uid, session_summary[:2000], {"category": "episode"}, "episodes"
         )
         ep_saved = 1
 
@@ -1769,16 +1877,53 @@ async def system_prompt(agent: str = ""):
 
 
 
-_RECALL_AUGMENT_BUDGET_S = 2.5
+_RECALL_AUGMENT_BUDGET_S = float(_os.getenv("AGENTMEM_RECALL_AUGMENT_BUDGET", "2.5"))
+
+# A query scoring at least this many specificity points skips HyDE/MIRIX.
+# 3 points is roughly "three long/identifier/path tokens" — enough for the
+# symbolic and BM25 passes to act on without an LLM rewrite.
+_AUG_SPECIFICITY_FLOOR = 3
+
+# Tokens below this length carry little lexical signal on their own.
+_SPECIFIC_TOKEN_MIN_LEN = 5
 
 
-async def _recall_augmentations(req: RecallRequest) -> dict:
+def _query_specificity(q: str) -> int:
+    """Count high-signal tokens in a query, without any retrieval or LLM call.
+
+    "Specific" means a token that the symbolic and BM25 passes can act on
+    directly: long words, camelCase / snake_case identifiers, dotted paths,
+    version-ish numbers.  A query made of these does not need HyDE or a MIRIX
+    topic to be findable — and skipping the LLM calls removes the dominant
+    source of recall's P50 bimodality.
+    """
+    import re as _re
+
+    score = 0
+    for tok in _re.findall(r"[A-Za-z_][A-Za-z0-9_./\-]*", q):
+        if len(tok) >= _SPECIFIC_TOKEN_MIN_LEN:
+            score += 1
+        # identifiers / paths are strong signals even when short
+        if ("_" in tok and len(tok) >= 6) or ("/" in tok) or ("." in tok and len(tok) >= 6):
+            score += 1
+        if _re.search(r"[a-z][A-Z]", tok):  # camelCase
+            score += 1
+    return score
+
+
+async def _recall_augmentations(req: RecallRequest, *, skip_llm: bool = False) -> dict:
     """At most two LLM augmentations, under one wall-clock budget.
 
     HyDE, MIRIX topic, query-structure, and plan_queries used to run as
     separate stages with an 8s multi-model retry each. That held /recall
     for 13–24s after the Claude hook had already abandoned the request at 4s.
+
+    ``skip_llm`` short-circuits the whole thing for queries that already carry
+    enough lexical specificity for the symbolic + BM25 passes.  Every skipped
+    call is one fewer HTTP round trip to aiserv on the recall hot path.
     """
+    if skip_llm:
+        return {}
     tasks: dict[str, asyncio.Task] = {}
     q = req.query.strip()
     if req.enable_hyde and len(q) > 10:
@@ -1840,8 +1985,17 @@ async def recall(req: RecallRequest):
         return {"prependContext": "", "facts": [], "episodes": [], "latency_ms": ms, "error": "embedding service unavailable"}
 
     # Overlap the query embed with the augmentation LLM calls.
-    emb_task = asyncio.create_task(asyncio.to_thread(_encode, req.query))
-    aug_task = asyncio.create_task(_recall_augmentations(req))
+    emb_task = asyncio.create_task(async_encode(req.query))
+    # HyDE/MIRIX are the dominant recall-latency term: each is an HTTP round trip
+    # to the local aiserv LLM proxy, and the 2.5s budget is what turns a 7ms
+    # recall into a 2.1s one whenever aiserv is slow.  A query that already
+    # carries lexical specificity does not need them — the symbolic and BM25
+    # passes act on those tokens directly.
+    _aug_skip = _query_specificity(req.query) >= _AUG_SPECIFICITY_FLOOR
+    if _aug_skip:
+        log.debug("[recall] skipping LLM augmentation (specificity=%d >= %d)",
+                  _query_specificity(req.query), _AUG_SPECIFICITY_FLOOR)
+    aug_task = asyncio.create_task(_recall_augmentations(req, skip_llm=_aug_skip))
     emb_res, aug_res = await asyncio.gather(emb_task, aug_task, return_exceptions=True)
     if isinstance(emb_res, Exception):
         log.warning("[recall] embedding failed: %s", emb_res)
@@ -1858,7 +2012,7 @@ async def recall(req: RecallRequest):
 
     if _hyde_doc:
         try:
-            hyde_emb = await asyncio.to_thread(_encode, _hyde_doc)
+            hyde_emb = await async_encode(_hyde_doc)
             merged = (emb * 0.5 + hyde_emb * 0.5).astype(np.float32)
             norm = np.linalg.norm(merged)
             emb = merged / norm if norm > 0 else merged
@@ -2086,40 +2240,60 @@ async def recall(req: RecallRequest):
     supp_results = await asyncio.gather(*supplement_tasks)
     facts_global = supp_results[0] if isinstance(supp_results[0], list) else []
     eps_global   = supp_results[1] if isinstance(supp_results[1], list) else []
-    bm25_facts   = supp_results[2] if isinstance(supp_results[2], list) else []
-    if bm25_facts:
-        log.debug(f"[bm25] {len(bm25_facts)} hits for: {req.query[:60]!r}")
+    bm25_hits    = supp_results[2] if isinstance(supp_results[2], list) else []
+    if bm25_hits:
+        log.debug(f"[bm25] {len(bm25_hits)} hits for: {req.query[:60]!r}")
 
-    # Dynamic Weighted RRF (arXiv:2511.18194 wRRF):
-    # Adjust per-source weights based on what the query structure reveals.
-    # Entity/person queries → boost symbolic + BM25 passes (exact name matches).
-    # Temporal queries → boost symbolic (timestamps stored there).
-    # Pure semantic queries → reduce symbolic/BM25 weight (no metadata to match).
-    _has_entities = bool(sym_entities)
-    _has_temporal  = bool(query_struct.get("time_expression"))
-    if _has_entities and _has_temporal:
-        _rrf_weights = [0.8, 0.8, 1.4, 1.2]   # strong symbolic + BM25 boost
-    elif _has_entities:
-        _rrf_weights = [0.9, 0.9, 1.2, 1.1]   # moderate symbolic + BM25 boost
-    elif _has_temporal:
-        _rrf_weights = [0.9, 0.9, 1.2, 0.8]   # symbolic boost, light BM25
-    else:
-        _rrf_weights = [1.0, 1.0, 0.6, 0.9]   # semantic: moderate BM25, low symbolic
+    # BM25 now indexes every tier, so route each hit back to the tier it came
+    # from.  Before the multi-tier fix the corpus was facts-only, which left
+    # ~79% of the text-bearing memory unreachable by keyword search.
+    bm25_by_tier: dict[str, list[dict]] = {"facts": [], "episodes": [], "procedures": []}
+    for hit in bm25_hits:
+        tier = hit.get("tier") or "facts"
+        bm25_by_tier.setdefault(tier, []).append(hit)
+    bm25_facts     = bm25_by_tier.get("facts", [])
+    bm25_episodes  = bm25_by_tier.get("episodes", [])
+    bm25_procedures = bm25_by_tier.get("procedures", [])
 
-    def _merge(primary, supplement, symbolic, limit):
+    # Keyword hits on procedures feed the same MACLA-scored procedure list, so
+    # a lexical match surfaces a how-to even when its embedding is mediocre.
+    if bm25_procedures and isinstance(procs_raw, list):
+        seen_proc = {p.get("task") for p in procs_raw}
+        for hit in bm25_procedures:
+            attrs = hit.get("attrs") or {}
+            task = attrs.get("task") or ""
+            if task and task not in seen_proc:
+                seen_proc.add(task)
+                procs_raw.append({
+                    "task":          task,
+                    "procedure":     attrs.get("procedure", ""),
+                    "_adjusted_score": float(hit.get("score", 0.0)),
+                    "_cosine":       0.0,
+                    "_from_bm25":    True,
+                })
+        procs_raw.sort(key=lambda x: x.get("_adjusted_score", 0.0), reverse=True)
+
+    # Equal-weight RRF.  The query-type hand-tuned weight presets that used to
+    # live here ([0.8,0.8,1.4,1.2] / [0.9,0.9,1.2,1.1] / [0.9,0.9,1.2,0.8] /
+    # [1.0,1.0,0.6,0.9]) were measured against equal weights on a 7-scenario
+    # synthetic sweep: they lost nDCG@10 in 6 of 7 scenarios, by up to -12.6%.
+    # See docs/EVEROS_ASSESSMENT.md §4.1.
+    _rrf_weights = [1.0, 1.0, 1.0, 1.0]
+
+    def _merge(primary, supplement, symbolic, bm25, limit):
         p_ranked   = heat_mod.heat_rerank(primary)
         s_ranked   = heat_mod.heat_rerank(supplement) if supplement else []
         sym_ranked = heat_mod.heat_rerank(symbolic)   if symbolic   else []
         # BM25 hits are already scored by TF-IDF; pass as-is (no heat reranking)
         fused = _rrf_merge(
-            [p_ranked, s_ranked, sym_ranked, bm25_facts],
+            [p_ranked, s_ranked, sym_ranked, bm25],
             weights=_rrf_weights,
             limit=limit * 2,
         )
         return fused[:limit]
 
-    facts    = _merge(facts_scene, facts_global, sym_facts,  n_facts)
-    episodes = _merge(eps_scene,   eps_global,   [],         n_episodes)
+    facts    = _merge(facts_scene, facts_global, sym_facts,  bm25_facts,     n_facts)
+    episodes = _merge(eps_scene,   eps_global,   [],         bm25_episodes,  n_episodes)
 
     # SimpleMem Phase 3: lexical keyword boost (BM25-lite additive layer)
     # Note: BM25 above handles full TF-IDF scoring; this adds a lightweight keyword
@@ -2146,7 +2320,7 @@ async def recall(req: RecallRequest):
                 f"Find additional information about: {req.query}"
             )
             if extra_q:
-                reflection_emb = await asyncio.to_thread(_encode, extra_q[0])
+                reflection_emb = await async_encode(extra_q[0])
                 reflection_facts = await mem_store.knn_search(
                     _get_redis(), mem_store.FACT_KEY, reflection_emb,
                     k=max(3, n_facts // 2), bump_heat=True
@@ -2211,14 +2385,25 @@ async def recall(req: RecallRequest):
         top_tool_elem = tools_raw[0].get("_element", "")
         if top_tool_elem:
             try:
-                all_tig = await _get_redis().hgetall(mem_store.TOOL_GRAPH_KEY)
+                # HSCAN with MATCH lets Redis do the prefix filtering.  The old
+                # HGETALL pulled the whole transition graph into Python on every
+                # recall, so cost grew linearly with total historical tool calls.
                 prefix  = f"{top_tool_elem}:"
                 trans: dict[str, int] = {}
-                for k_b, v_b in all_tig.items():
-                    key_s = _decode_bytes(k_b)
-                    if key_s.startswith(prefix):
-                        target = key_s[len(prefix):]
-                        trans[target] = int(v_b)
+                cursor = 0
+                for _ in range(64):  # bounded; the graph is small in practice
+                    cursor, batch = await _get_redis().hscan(
+                        mem_store.TOOL_GRAPH_KEY, cursor=cursor,
+                        match=f"{prefix}*", count=200,
+                    )
+                    for k_b, v_b in batch.items():
+                        target = _decode_bytes(k_b)[len(prefix):]
+                        try:
+                            trans[target] = int(v_b)
+                        except (TypeError, ValueError):
+                            continue
+                    if int(cursor) == 0:
+                        break
                 if trans:
                     total_trans = sum(trans.values())
                     sorted_trans = sorted(trans.items(), key=lambda x: x[1], reverse=True)
@@ -2263,6 +2448,15 @@ async def recall(req: RecallRequest):
 
 @app.post("/store")
 async def store_memory(req: StoreRequest):
+    # A row this index cannot hold is not "queued" — say so while the caller can
+    # still act on it. The background task cannot report a VADD it was never able
+    # to attempt; measured 2026-10-27, a 768-d provider against 1024-d sets answered
+    # 200 forever while every write was rejected.
+    try:
+        await dim_guard.assert_writeable(_get_redis())
+    except embedder.DimensionMismatch as exc:
+        raise HTTPException(status_code=409,
+                            detail={"error": "dimension_mismatch", "message": str(exc)})
     _spawn(_do_store(req.messages, req.session_id), "store")
     await _ws_broadcast("store", {"session_id": req.session_id})
     return {"status": "queued"}

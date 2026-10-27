@@ -81,10 +81,60 @@ def _chunked_http_encode(
 
 # ── Public API (unchanged) ──────────────────────────────────────────
 
-DIMS: int = 384  # default for local MiniLM; overridden by provider
+DIMS: int = 384  # default for local MiniLM; replaced by the *measured* width on first vector
 
 _provider: Optional[BaseProvider] = None
 _provider_lock = threading.Lock()  # protects _provider and DIMS mutations
+
+
+class DimensionMismatch(RuntimeError):
+    """A vector width disagrees with the width the index was created with.
+
+    Redis vector sets fix their width on the first VADD and cannot be retyped, so
+    this is not a degraded-search condition — it is a write that can never land.
+    """
+
+
+def _measure_provider(p: "BaseProvider") -> None:
+    """Learn the width from one real vector; a declared width is only a hint.
+
+    Every provider used to *declare* its width (a class constant, a model table, or
+    ``EMBEDDING_DIMS``), and nothing compared the declaration to the bytes that came
+    back. Measured 2026-10-27: aiserv's ``/v1/embeddings`` ignores the requested
+    model and always proxies Jetson ``nomic-embed-text`` (768), so an
+    ``EMBEDDING_DIMS=1024`` process was declaring 1024 while every vector it stored
+    was 768 — the index rejected the write and the caller still got 200.
+    """
+    hint = getattr(p, "dims", None)
+    try:
+        vec = p.encode("dimension probe")
+        width = int(np.asarray(vec).shape[-1])
+    except Exception as exc:                                  # noqa: BLE001
+        p.dims_verified = False
+        log.warning("[embed] %s: width probe failed (%s: %s) — declared %s dims is "
+                    "unverified", getattr(p, "name", p), type(exc).__name__, exc, hint)
+        return
+    p.dims = width
+    p.dims_verified = True
+    if hint is not None and int(hint) != width:
+        log.warning("[embed] %s declared %s dims but returns %d — using the measured "
+                    "width (the declaration was a guess, not a measurement)",
+                    getattr(p, "name", p), hint, width)
+
+
+def _checked(vectors: list[np.ndarray]) -> list[np.ndarray]:
+    """Reject any vector whose width is not the width the embedder measured."""
+    width = int(getattr(_get_provider(), "dims", 0) or 0)
+    if not width:
+        return vectors
+    for vec in vectors:
+        got = int(np.asarray(vec).shape[-1])
+        if got != width:
+            raise DimensionMismatch(
+                f"{embed_signature()} produced a {got}-d vector but this embedder is "
+                f"{width}-d; writing it would fail every VADD and silently lose the row"
+            )
+    return vectors
 
 
 def _get_provider() -> BaseProvider:
@@ -92,6 +142,7 @@ def _get_provider() -> BaseProvider:
     with _provider_lock:
         if _provider is None:
             _provider = _detect_provider()
+            _measure_provider(_provider)
             DIMS = _provider.dims
         return _provider
 
@@ -122,7 +173,18 @@ def _reset_provider(name: str = "local") -> None:
             except Exception:
                 pass
         _provider = _create_provider(name)
+        _measure_provider(_provider)
         DIMS = _provider.dims
+
+
+def measured_dims() -> int:
+    """Width of the vectors this process actually produces (probes once if needed)."""
+    return int(_get_provider().dims)
+
+
+def dims_verified() -> bool:
+    """True once at least one real vector has confirmed the width."""
+    return bool(getattr(_get_provider(), "dims_verified", False))
 
 
 def close() -> None:
@@ -185,6 +247,7 @@ def encode(text: str) -> np.ndarray:
             _trip_embed_circuit(exc)
         raise
     _clear_embed_circuit()
+    _checked([vec])
     return vec
 
 
@@ -203,7 +266,7 @@ def encode_batch(texts: list[str]) -> list[np.ndarray]:
             _trip_embed_circuit(exc)
         raise
     _clear_embed_circuit()
-    return vecs
+    return _checked(list(vecs))
 
 
 # Alias for compatibility with tests that use embed()
@@ -236,6 +299,7 @@ class LocalProvider(BaseProvider):
     _MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
     _model = None
     _model_lock = threading.Lock()
+    _encode_lock = threading.Lock()
 
     def __init__(self):
         dims_override = os.environ.get("EMBEDDING_DIMS")
@@ -269,11 +333,62 @@ class LocalProvider(BaseProvider):
                 LocalProvider._model = SentenceTransformer(self._MODEL_NAME, device=self.device)
             return self._model
 
+    def _encode(self, texts: list[str], batch_size: int) -> np.ndarray:
+        """Serialize model use and survive an MPS allocator blow-up.
+
+        sentence-transformers is not thread-safe, and four concurrent ingests
+        fragmented the unified-memory pool until "other allocations" passed the
+        30 GiB device limit while a single batch held 1.1 GiB (measured
+        2026-10-27). A lock turns an OOM into a queue, and the retry at batch 1
+        turns whatever still overflows into a slow success instead of a
+        dropped document.
+        """
+        model = self._get_model()
+        out = []
+        # One encode() over the whole list is a single unit to the allocator:
+        # a 1676-item backfill grew the cached pool to 24 GiB and OOM'd at batch
+        # 40 of 52 (measured 2026-10-27). Slicing gives empty_cache() a chance
+        # to hand memory back while the job is still running.
+        chunk = max(batch_size * 4, 64)
+        with self._encode_lock:
+            try:
+                for i in range(0, len(texts), chunk):
+                    part = texts[i:i + chunk]
+                    try:
+                        out.extend(model.encode(part, normalize_embeddings=True,
+                                                batch_size=batch_size))
+                    except RuntimeError as exc:
+                        if "out of memory" not in str(exc).lower():
+                            raise
+                        import torch
+                        torch.mps.empty_cache()
+                        out.extend(model.encode(part, normalize_embeddings=True, batch_size=1))
+                    if (self.device or "") == "mps":
+                        try:
+                            import torch
+                            torch.mps.empty_cache()
+                        except Exception:
+                            pass
+                return np.asarray(out)
+            finally:
+                # The MPS allocator caches every distinct block size it ever
+                # allocated, so a long-lived ingest server drifts upward even
+                # when each batch is small. Give the cache back per batch.
+                if (self.device or "") == "mps":
+                    try:
+                        import torch
+                        torch.mps.empty_cache()
+                    except Exception:
+                        pass
+
     def encode(self, text: str) -> np.ndarray:
-        return self._get_model().encode(text, normalize_embeddings=True)
+        return self._encode([text], 1)[0]
 
     def encode_batch(self, texts: list[str]) -> list[np.ndarray]:
-        return self._get_model().encode(texts, normalize_embeddings=True, batch_size=32)
+        # MPS limits are device-wide, so a browser or IDE holding Metal memory
+        # shrinks what a bulk job can allocate. EMBEDDING_BATCH lets a backfill
+        # trade throughput for headroom instead of dying at 40/52 batches.
+        return self._encode(texts, int(os.environ.get("EMBEDDING_BATCH", "32")))
 
 
 # ── Ollama: local LLM embeddings ───────────────────────────────────

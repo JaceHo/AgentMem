@@ -17,6 +17,8 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from api import state
+from core import dim_guard
+from core import embedder
 from core import kb as kb_mod
 
 log = logging.getLogger("mem")
@@ -56,6 +58,9 @@ async def kb_ingest(req: KbIngestRequest):
     try:
         return await _kb().ingest_path(_redis(), req.path, enrich=req.enrich,
                                        force=req.force, library=req.library)
+    except embedder.DimensionMismatch as exc:
+        raise HTTPException(status_code=409,
+                            detail={"error": "dimension_mismatch", "message": str(exc)})
     except kb_mod.KBError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
@@ -106,7 +111,8 @@ async def kb_remove(req: KbRemoveRequest):
     r = _redis()
     doc_id = req.doc
     if not doc_id.startswith("kb_"):
-        doc_id = await r.hget(kb_mod.KB_PATH_KEY, req.doc) or ""
+        from core.utils import decode_bytes
+        doc_id = decode_bytes(await r.hget(kb_mod.KB_PATH_KEY, req.doc))
     if not doc_id:
         raise HTTPException(status_code=404, detail=f"no kb document for {req.doc}")
     removed = await kb.remove_doc(r, doc_id)
@@ -130,6 +136,17 @@ async def kb_status():
                 stale += 1
         except Exception:  # noqa: BLE001 — a corrupt meta row is stale by definition
             stale += 1
+    # The width the model actually produces, next to the width the sets were built
+    # with — a mismatch here is the one failure mode that blocks every write, so it
+    # belongs in the status payload instead of only in the boot log.
+    try:
+        guard = await dim_guard.snapshot(r)
+        dims_block = {"dims": guard["dims"], "dims_verified": guard["verified"],
+                      "dims_mismatched": sorted(guard["bad"])}
+    except Exception as exc:                                  # noqa: BLE001
+        dims_block = {"dims": None, "dims_verified": False, "dims_mismatched": [],
+                      "dims_error": str(exc)[:120]}
     return {"docs": docs, "chunks": chunks,
             "embed_sig": current, "stale_embed": stale,
-            "bm25_ready": len(kb_mod.get_kb().bm25._docs) if hasattr(kb_mod.get_kb().bm25, "_docs") else None}
+            "bm25_ready": len(kb_mod.get_kb().bm25._docs) if hasattr(kb_mod.get_kb().bm25, "_docs") else None,
+            **dims_block}

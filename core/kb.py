@@ -25,8 +25,10 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from .embedder import embed_signature
-from .search import BM25Index, encode, encode_batch
+from .search import BM25Index, async_encode, async_encode_batch_chunked, encode
+from . import store as store_mod
 from .store import knn_search
+from .utils import decode_bytes
 
 log = logging.getLogger("agentmem.kb")
 
@@ -57,6 +59,36 @@ def _strip_html(raw: str) -> str:
     text = re.sub(r"<[^>]+>", "\n", text)
     text = re.sub(r"&nbsp;|&amp;|&lt;|&gt;", lambda m: {"&nbsp;": " ", "&amp;": "&", "&lt;": "<", "&gt;": ">"}[m.group(0)], text)
     return re.sub(r"\n{3,}", "\n\n", text)
+
+
+_FM_TITLE = re.compile(r"(?m)^title:\s*(.+?)\s*$")
+# Looser variant: tolerates leading whitespace, optional quotes — the audit
+# probe tripped on indented / quoted `title:` that the strict form missed.
+_FM_TITLE_LOOSE = re.compile(r"(?m)^\s*title\s*:\s*[\"']?\s*(.+?)\s*[\"']?\s*$")
+
+
+def _split_frontmatter(raw: str) -> Tuple[str, Dict[str, Any]]:
+    """Separate a leading YAML frontmatter block from the body.
+
+    Deliberately regex-only: a KB document must not become unparseable because
+    pyyaml is missing or the frontmatter is malformed. Only `title:` is read,
+    because that is the one field a document's own index entry depends on.
+    """
+    if not raw.startswith("---"):
+        return raw, {}
+    end = raw.find("\n---", 3)
+    if end == -1:
+        return raw, {}
+    block = raw[3:end]
+    nl = raw.find("\n", end + 1)
+    body = raw[nl + 1:] if nl != -1 else ""
+    meta: Dict[str, Any] = {}
+    m = _FM_TITLE.search(block) or _FM_TITLE_LOOSE.search(block)
+    if m:
+        val = m.group(1).strip().strip('"\'')
+        if val and val.lower() not in ("true", "false", "~", "null"):
+            meta["title"] = val
+    return body, meta
 
 
 def parse_file(path: str) -> Dict[str, Any]:
@@ -92,26 +124,38 @@ def parse_file(path: str) -> Dict[str, Any]:
     if ext in (".html", ".htm"):
         raw = _strip_html(raw)
 
-    title = p.stem.replace("_", " ").replace("-", " ").strip()
-    m = re.search(r"^#\s+(.+)$", raw, re.MULTILINE)
-    if m:
-        title = m.group(1).strip()
+    body, meta = _split_frontmatter(raw) if ext in TEXT_EXTS else (raw, {})
 
+    title = p.stem.replace("_", " ").replace("-", " ").strip()
+    if meta.get("title"):
+        title = meta["title"]
+    else:
+        m = re.search(r"^#\s+(.+)$", body, re.MULTILINE)
+        if m:
+            title = m.group(1).strip()
+
+    # Sections come from ANY heading level (H1-H3). Two defects this closes:
+    #   1. H1 consumed as title missed everything else as "Overview" blob —
+    #      now ALL heading levels split sections; a leading H1 that matches
+    #      the extracted title is still emitted as its own section anchor.
+    #   2. Leading-whitespace headings (common in pasted markdown) missed the
+    #      regex anchor; `(?m)^\s{0,3}` now tolerates up to 3 leading spaces.
     sections: List[Dict[str, str]] = []
-    if ext in TEXT_EXTS and raw.count("\n# ") + raw.startswith("# ") >= 1:
+    if ext in TEXT_EXTS and re.search(r"(?m)^\s{0,3}#{1,3}\s+\S", body):
         cur_title, buf = "Overview", []
-        for line in raw.split("\n"):
-            hm = re.match(r"^(#{1,3})\s+(.+)$", line)
+        for line in body.split("\n"):
+            hm = re.match(r"^\s{0,3}(#{1,3})\s+(.+?)\s*$", line)
             if hm:
+                heading_text = hm.group(2).strip()
                 if buf and any(b.strip() for b in buf):
                     sections.append({"title": cur_title, "text": "\n".join(buf).strip()})
-                cur_title, buf = hm.group(2).strip(), []
+                cur_title, buf = heading_text, []
             else:
                 buf.append(line)
         if buf and any(b.strip() for b in buf):
             sections.append({"title": cur_title, "text": "\n".join(buf).strip()})
     if not sections:
-        text = raw.strip()
+        text = body.strip()
         if text:
             sections = [{"title": title, "text": text}]
     if not sections:
@@ -144,18 +188,36 @@ def chunk_sections(sections: List[Dict[str, str]],
 # ── LLM helpers (aiserv; every call degrades gracefully) ─────────────────────
 
 
+def _aiserv_key() -> str:
+    """Gateway key for aiserv chat calls — same source taskd/toolserv use.
+
+    _load_key() here returns the ZAI key (for GLM extraction calls); aiserv
+    rejects it, which silently degraded every KB digest/enrichment to fallback.
+    """
+    if k := os.getenv("AISERV_KEY", ""):
+        return k
+    for conf in (Path(HOME) / "code/aiserv/.aiserv.conf", Path(HOME) / ".aiserv.conf"):
+        try:
+            for line in conf.read_text().splitlines():
+                if line.startswith("GATEWAY_KEY="):
+                    return line.split("=", 1)[1].strip()
+        except OSError:
+            continue
+    return "sk-aiserv-local-dev"
+
+
 async def _llm(system: str, prompt: str, timeout: float = 45.0) -> str:
     """One aiserv chat call. Returns "" on any failure — callers fall back."""
     import httpx
 
-    from .extractor import AISERV_BASE, _load_key
+    from .extractor import AISERV_BASE
 
     try:
         async with httpx.AsyncClient(trust_env=False, timeout=timeout) as client:
             resp = await client.post(
                 f"{AISERV_BASE}/v1/chat/completions",
-                headers={"Authorization": f"Bearer {_load_key()}",
-                         "x-api-key": _load_key(), "Content-Type": "application/json"},
+                headers={"Authorization": f"Bearer {_aiserv_key()}",
+                         "x-api-key": _aiserv_key(), "Content-Type": "application/json"},
                 json={"model": "aiserv/fast", "messages": [
                     {"role": "system", "content": system},
                     {"role": "user", "content": prompt},
@@ -197,6 +259,41 @@ async def make_digest(title: str, sections: List[Dict[str, str]]) -> Tuple[str, 
             except json.JSONDecodeError:
                 pass
     return _fallback_desc(title, sections), _fallback_digest(sections)
+
+
+_CJK = re.compile(r"[\u3400-\u9fff]")
+_EXPANSIONS: Dict[str, str] = {}
+
+
+async def expand_query(query: str) -> str:
+    """Chinese question → English search terms, for a mostly-English corpus.
+
+    Measured 2026-10-27: qwen3-embedding-0.6b will not bridge "来源笔记里钉住版本的
+    是哪个字段" to `content_hash` on its own — a 6-character field name carries no
+    cross-lingual signal — but the same question in English lands that chunk at
+    rank 0. The corpus is bilingual while most field names, filenames and service
+    names are English, so a CJK query gets a second, English-keyed pass.
+    Empty string means "no second pass" (English query, or aiserv unavailable).
+    """
+    if os.getenv("KB_QUERY_EXPAND", "1") not in ("1", "true", "yes"):
+        return ""
+    if not _CJK.search(query):
+        return ""
+    if query in _EXPANSIONS:
+        return _EXPANSIONS[query]
+    # A translation, not a keyword bag: a keyword version ("source notes version
+    # field") matched worse AND promoted noise, because a short list is a weak
+    # ranking that still adds RRF mass to whatever it happens to hit.
+    out = await _llm(
+        "Translate the question into English. Output only the translation — "
+        "no quotes, no preamble.",
+        query, timeout=8,
+    )
+    out = " ".join(out.strip().strip('"').split())[:300]
+    if len(_EXPANSIONS) > 500:
+        _EXPANSIONS.clear()
+    _EXPANSIONS[query] = out
+    return out
 
 
 async def enrich_chunk(title: str, section: str, text: str) -> str:
@@ -265,7 +362,7 @@ class KBStore:
         raw_bytes = f.read_bytes()
         sha = hashlib.sha1(raw_bytes).hexdigest()
 
-        old_doc_id = await r.hget(KB_PATH_KEY, abspath)
+        old_doc_id = decode_bytes(await r.hget(KB_PATH_KEY, abspath)) or None
         if old_doc_id and not force:
             old_meta = await self._meta(r, old_doc_id)
             if old_meta and old_meta.get("sha") == sha:
@@ -290,8 +387,20 @@ class KBStore:
                 except Exception as exc:  # noqa: BLE001
                     log.warning("enrich failed (%s › %s): %s", title, c["section"], exc)
                     c["text"] = f"[{title} › {c['section']}]\n\n{c['text']}"
+        else:
+            # A bare chunk has no idea which document it came from: a topical
+            # query then matches on accident. The enrichment fallback already
+            # defines the cheap prefix, so the no-LLM path uses the same one.
+            for c in chunks:
+                c["text"] = f"[{title} › {c['section']}]\n\n{c['text']}"
 
-        embeddings = encode_batch([c["text"] for c in chunks])
+        # Off the event loop: a synchronous encode held the loop for the whole
+        # file, so /health returned nothing while a bulk ingest ran and
+        # ops/watchdog.sh restarted the daemon mid-run (measured 2026-10-27:
+        # 149 of 188 docs lost to "Connection refused").
+        embeddings = await async_encode_batch_chunked([c["text"] for c in chunks])
+        if embeddings is None:
+            raise KBError("embedding failed for every chunk batch")
         # Drop the old copy only now that the replacement is fully built. Doing it
         # earlier let one transient embed/enrich failure delete a document outright
         # (measured 2026-10-27: a forced re-ingest of 179 files lost CFO.md and
@@ -340,7 +449,7 @@ class KBStore:
         if elems_raw:
             for elem in json.loads(elems_raw):
                 try:
-                    await r.execute_command("VREM", KB_CHUNK_KEY, elem)
+                    await store_mod.remove_element(r, KB_CHUNK_KEY, elem)
                 except Exception:
                     pass
                 await r.hdel(KB_TEXT_KEY, elem)
@@ -368,26 +477,51 @@ class KBStore:
     async def search(self, r, query: str, k: int = 6, library: str = "") -> List[Dict[str, Any]]:
         """Tier 2 — hybrid vector + BM25, fused with weighted RRF."""
         k = max(1, min(k, 25))
-        vec = encode(query)
+        # Same event-loop hazard as ingest: a sync query encode stalls /health
+        # long enough for ops/watchdog.sh to declare the service down.
+        vec = await async_encode(query)
         filter_expr = f'.library == "{library}"' if library else None
         vres = await knn_search(r, KB_CHUNK_KEY, vec, k * 4, filter_expr=filter_expr)
         bres = await self.bm25.search(query, k * 4)
+        expanded = await expand_query(query)
+        vres_x = await knn_search(r, KB_CHUNK_KEY, await async_encode(expanded), k * 4,
+                                  filter_expr=filter_expr) if expanded else []
+        bres_x = await self.bm25.search(expanded, k * 4) if expanded else []
 
+        # Equal RRF weights. A 0.7 BM25 weight capped the keyword leg at
+        # 0.7/60 = 0.01167, below the *worst* vector hit (1/61 = 0.01639), so an
+        # exact-filename BM25 rank-1 could never outrank a weak semantic hit and
+        # the hybrid behaved as vector-only (eval 2026-10-27: hit@5 0.36 with
+        # keyword queries like "lockedwrite.py" scoring 6.16 in BM25 alone).
         fused: Dict[str, Dict[str, Any]] = {}
+
+        def add(rank: int, elem: str, attrs: Dict[str, Any], w: float = 1.0) -> None:
+            entry = fused.get(elem)
+            if entry is None:
+                fused[elem] = {"attrs": attrs, "score": w / (60 + rank)}
+            else:
+                entry["score"] += w / (60 + rank)
+
+        # The translated legs are deliberately under-weighted: they cover a real
+        # gap (CJK question → English field name) but a machine translation is
+        # lossier than the user's own words, and at full weight it outvoted
+        # correct original-language hits.
         for rank, item in enumerate(vres):
-            elem = item["_element"]
-            fused[elem] = {"attrs": item["attrs"], "score": 1.0 / (60 + rank)}
-        for rank, item in enumerate(bres):
-            # BM25Index.search() keys its rows `_element`; reading only `uid`/`_uid`
-            # dropped every keyword hit, so `/kb/search` was vector-only while its
-            # docstring claimed hybrid fusion (measured 2026-10-27: a query for an
-            # exact filename returned unrelated docs at a flat 1/(60+0)).
-            elem = (item.get("uid") or item.get("_element")
-                    or (item.get("attrs") or {}).get("_uid", ""))
-            if not elem:
-                continue
-            entry = fused.setdefault(elem, {"attrs": item.get("attrs") or {"content": item.get("content", "")}, "score": 0.0})
-            entry["score"] += 0.7 / (60 + rank)
+            add(rank, item["_element"], item["attrs"])
+        for rank, item in enumerate(vres_x):
+            add(rank, item["_element"], item["attrs"], w=0.6)
+        for bm in (bres, bres_x):
+            for rank, item in enumerate(bm):
+                # BM25Index.search() keys its rows `_element`; reading only `uid`/`_uid`
+                # dropped every keyword hit, so `/kb/search` was vector-only while its
+                # docstring claimed hybrid fusion (measured 2026-10-27: a query for an
+                # exact filename returned unrelated docs at a flat 1/(60+0)).
+                elem = (item.get("uid") or item.get("_element")
+                        or (item.get("attrs") or {}).get("_uid", ""))
+                if not elem:
+                    continue
+                add(rank, elem, item.get("attrs") or {"content": item.get("content", "")},
+                    w=1.0 if bm is bres else 0.6)
 
         out = []
         for elem, entry in sorted(fused.items(), key=lambda kv: kv[1]["score"], reverse=True)[:k]:
@@ -402,10 +536,18 @@ class KBStore:
         """Rebuild the in-RAM BM25 index from Redis after a service restart."""
         elems = await r.hgetall(KB_TEXT_KEY)
         n = 0
-        for elem, content in elems.items():
-            attrs_raw = await r.hget(KB_DOC_KEY, elem.split(":")[0])
+        for elem_raw, content_raw in elems.items():
+            # The pool runs with decode_responses=False, so BOTH the hash field
+            # and the value come back as bytes. ``bytes.split(":")`` raises
+            # TypeError, which used to abort the whole warm-up ("[kb] warm
+            # skipped: a bytes-like object is required, not 'str'") and leave
+            # every restart with an empty BM25 index.
+            elem = decode_bytes(elem_raw)
+            content = decode_bytes(content_raw)
+            doc_id = elem.split(":")[0]
+            attrs_raw = await r.hget(KB_DOC_KEY, doc_id)
             meta = json.loads(attrs_raw) if attrs_raw else {}
-            await self.bm25.add(elem, content, {"content": content, "doc": elem.split(":")[0],
+            await self.bm25.add(elem, content, {"content": content, "doc": doc_id,
                                                 "title": meta.get("title", ""), "path": meta.get("path", "")})
             n += 1
         return n
