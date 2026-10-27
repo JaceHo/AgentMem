@@ -171,6 +171,30 @@ class TestMemoryFootprint:
         self.r.flushdb()
         self.r.close()
 
+    def _keys_memory_bytes(self, pattern: str) -> int:
+        """Sum MEMORY USAGE over the keys this test wrote.
+
+        INFO memory reports *instance-wide* usage, so it also counts whatever
+        live data the dev box holds in other DBs — on a machine running the
+        real AgentMem instance (67MB of vectorsets in db=0) these footprint
+        tests failed with "Redis using 67.29MB, expected < 50MB" no matter what
+        the code under test did.  MEMORY USAGE is per key, so summing the test's
+        own keys measures the footprint they actually caused.
+        """
+        total = 0
+        cursor = 0
+        while True:
+            cursor, keys = self.r.scan(cursor, match=pattern, count=500)
+            if keys:
+                pipe = self.r.pipeline(transaction=False)
+                for k in keys:
+                    pipe.memory_usage(k)
+                for used in pipe.execute():
+                    total += used or 0
+            if int(cursor) == 0:
+                break
+        return total
+
     def test_redis_memory_usage_1k_facts(self):
         """Redis memory usage for 1K facts should be < 50MB."""
         import json
@@ -185,12 +209,9 @@ class TestMemoryFootprint:
             }
             self.r.hset(key, mapping=data)
 
-        # Check memory usage
-        info = self.r.info("memory")
-        used_mb = info["used_memory"] / (1024 * 1024)
-
         # Should be reasonable (< 50MB for 1K simple facts)
-        assert used_mb < 50, f"Redis using {used_mb:.2f}MB, expected < 50MB"
+        used_mb = self._keys_memory_bytes("mem:facts:test_*") / (1024 * 1024)
+        assert used_mb < 50, f"1K facts using {used_mb:.2f}MB, expected < 50MB"
 
     def test_redis_memory_usage_10k_facts(self):
         """Redis memory usage for 10K facts should be < 500MB."""
@@ -206,12 +227,9 @@ class TestMemoryFootprint:
             }
             self.r.hset(key, mapping=data)
 
-        # Check memory usage
-        info = self.r.info("memory")
-        used_mb = info["used_memory"] / (1024 * 1024)
-
         # Should be reasonable (< 500MB for 10K facts)
-        assert used_mb < 500, f"Redis using {used_mb:.2f}MB, expected < 500MB"
+        used_mb = self._keys_memory_bytes("mem:facts:test_*") / (1024 * 1024)
+        assert used_mb < 500, f"10K facts using {used_mb:.2f}MB, expected < 500MB"
 
 
 class TestCrossSessionRetrieval:
@@ -247,7 +265,7 @@ class TestConcurrencyBenchmark:
         self.r.close()
 
     @pytest.mark.benchmark(group="concurrent-recall")
-    def test_concurrent_recall_performance(self, benchmark):
+    def test_concurrent_recall_performance(self, benchmark, agentmem_server):
         """10 concurrent recall operations should complete in < 100ms total."""
         import httpx
 
@@ -255,8 +273,16 @@ class TestConcurrencyBenchmark:
             """Use sync httpx with thread pool for concurrent requests."""
             import concurrent.futures
 
+            # Warm the recall path once — on a freshly-booted server the very
+            # first request pays ~6s cold-start, and racing 10 of them
+            # concurrently trips server-side init races (non-200s).
+            warm = httpx.Client(base_url=agentmem_server, timeout=30)
+            warm.post("/recall", json={"query": "warmup", "session_id": "warmup",
+                                       "memory_limit_number": 1})
+            warm.close()
+
             def recall_task(i):
-                client = httpx.Client(base_url="http://localhost:18800", timeout=15)
+                client = httpx.Client(base_url=agentmem_server, timeout=30)
                 response = client.post("/recall", json={
                     "query": f"test query {i}",
                     "session_id": f"concurrent-{i}",
@@ -287,11 +313,14 @@ class TestRealWorldScenarios:
         self.r.close()
 
     @pytest.mark.benchmark(group="realworld-coding-session")
-    def test_coding_session_simulation(self, benchmark):
+    def test_coding_session_simulation(self, benchmark, agentmem_server):
         """Simulate a coding session with multiple store/recall cycles."""
         import httpx
 
-        client = httpx.Client(base_url="http://localhost:18800", timeout=15)
+        # No keep-alive pooling: the benchmark harness pauses between runs and
+        # uvicorn closes idle sockets after 5s — reuse then fails.
+        limits = httpx.Limits(max_keepalive_connections=0)
+        client = httpx.Client(base_url=agentmem_server, timeout=30, limits=limits)
         session_id = f"coding-session-{int(time.time())}"
 
         def simulate_session():

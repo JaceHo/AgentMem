@@ -186,26 +186,44 @@ class TestRetentionPerformance:
 
     @pytest.mark.benchmark(group="access-bump")
     def test_access_count_bump_performance(self, benchmark):
-        """bump_heat should complete in < 1ms."""
+        """bump_heat should complete in < 1ms.
+
+        It is an async API: this used to hand it the fixture's *sync* client, so every iteration
+        raised inside the script call, bump_heat's except swallowed it, and the benchmark timed a
+        no-op while caching a sync Script object for the rest of the suite.
+        """
         from core.heat import bump_heat
         import asyncio
+        import json
+        import redis.asyncio as aioredis
 
         vset_key = "mem:facts"
         element = "perf-test-element"
-        attrs = {"access_count": 0, "ts": int(time.time() * 1000)}
 
-        # Initialize
-        import json
-        self.r.execute_command("VSETATTR", vset_key, element, json.dumps(attrs))
+        loop = asyncio.new_event_loop()
+        client = aioredis.Redis(host="localhost", port=6379, db=15, decode_responses=True)
+
+        # VSETATTR alone does not create an element — the old setup "initialized" a row that never
+        # existed, so every iteration bumped nothing and VGETATTR read back None.
+        import numpy as np
+        vec = np.zeros(384, dtype=np.float32)
+        vec[7] = 1.0
+        attr = {"content": "perf fact", "access_count": 0, "ts": int(time.time() * 1000)}
+        loop.run_until_complete(client.execute_command(
+            "VADD", vset_key, "FP32", vec.tobytes(), element, "SETATTR", json.dumps(attr)))
 
         def bump_sync():
-            """Wrap async call in sync function for benchmarking."""
-            async def _bump():
-                await bump_heat(self.r, vset_key, element, attrs)
-            asyncio.run(_bump())
+            loop.run_until_complete(bump_heat(client, vset_key, element, attr))
+
+        bump_sync()
+        written = json.loads(loop.run_until_complete(
+            client.execute_command("VGETATTR", vset_key, element)))
+        assert written.get("access_count") == 1, f"the bump must actually write: {written}"
 
         result = benchmark(bump_sync)
         assert result is None
+        loop.run_until_complete(client.aclose())
+        loop.close()
 
     @pytest.mark.benchmark(group="retention-scan")
     def test_retention_scan_performance(self, benchmark):

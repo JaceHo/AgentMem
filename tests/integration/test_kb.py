@@ -22,8 +22,14 @@ from core import kb as kb_mod  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
-async def fresh_kb(async_redis_client):
-    """Isolate the KB singleton (its BM25 index lives in RAM across tests)."""
+async def fresh_kb():
+    """Isolate state per test: wipe the app's Redis db (the in-process app
+    binds REDIS_URL db14, shared with the integration server) and reset the
+    KB singleton (its BM25 index lives in RAM across tests)."""
+    import redis as sync_redis
+
+    from tests.conftest import TEST_REDIS_DB
+    sync_redis.Redis(host="localhost", port=6379, db=TEST_REDIS_DB).flushdb()
     kb_mod._kb = kb_mod.KBStore()
     yield
     kb_mod._kb = None
@@ -84,11 +90,11 @@ async def _write_docs(d):
 
 
 @pytest.mark.asyncio
-async def test_ingest_index_digest_search_daily_flow(agentmem_client, kb_home):
+async def test_ingest_index_digest_search_daily_flow(kb_client, kb_home):
     """The core daily loop: ingest → Tier0 → Tier1 → Tier2."""
     d = await _write_docs(kb_home)
 
-    r = await agentmem_client.post("/kb/ingest", json={"path": str(d), "enrich": True})
+    r = await kb_client.post("/kb/ingest", json={"path": str(d), "enrich": True})
     assert r.status_code == 200
     body = r.json()
     assert len(body["ingested"]) == 2 and not body["failed"]
@@ -96,63 +102,63 @@ async def test_ingest_index_digest_search_daily_flow(agentmem_client, kb_home):
     assert deploy["enriched"] > 0
 
     # Tier 0 — index lines carry id + description
-    idx = (await agentmem_client.get("/kb/index")).json()["docs"]
+    idx = (await kb_client.get("/kb/index")).json()["docs"]
     assert {x["title"] for x in idx} == {"Deployment Runbook", "Pricing Handbook"}
     assert all(x["description"] and x["chunks"] >= 1 for x in idx)
     deploy_id = next(x["id"] for x in idx if x["title"] == "Deployment Runbook")
 
     # Tier 1 — digest + section map
-    meta = (await agentmem_client.get(f"/kb/doc/{deploy_id}/digest")).json()
+    meta = (await kb_client.get(f"/kb/doc/{deploy_id}/digest")).json()
     assert "Test digest body" in meta["digest"]
     assert set(meta["sections"]) >= {"Rollout", "Rollback"}
     assert meta["path"].endswith("deploy.md")
 
     # Tier 2 — exact-keyword BM25 recall (unique anchor words). NB: with fake
     # hash vectors the vector leg is noise, so assert presence, not rank #1.
-    hits = (await agentmem_client.post("/kb/search", json={"query": "XYZZY-DEPLOY rollout sunday"})).json()["chunks"]
+    hits = (await kb_client.post("/kb/search", json={"query": "XYZZY-DEPLOY rollout sunday"})).json()["chunks"]
     assert any(h["title"] == "Deployment Runbook" and "XYZZY-DEPLOY" in h["text"] for h in hits)
-    hits2 = (await agentmem_client.post("/kb/search", json={"query": "KWLPRC pricing tiers"})).json()["chunks"]
+    hits2 = (await kb_client.post("/kb/search", json={"query": "KWLPRC pricing tiers"})).json()["chunks"]
     assert any(h["title"] == "Pricing Handbook" and "KWLPRC" in h["text"] for h in hits2)
 
 
 @pytest.mark.asyncio
-async def test_incremental_reingest_skip_update_stable_id(agentmem_client, kb_home):
+async def test_incremental_reingest_skip_update_stable_id(kb_client, kb_home):
     """Unchanged → skipped; edited → updated under the SAME doc id."""
     d = await _write_docs(kb_home)
-    first = (await agentmem_client.post("/kb/ingest", json={"path": str(d)})).json()
+    first = (await kb_client.post("/kb/ingest", json={"path": str(d)})).json()
     ids = {x["title"]: x["doc"] for x in first["ingested"]}
 
-    again = (await agentmem_client.post("/kb/ingest", json={"path": str(d)})).json()
+    again = (await kb_client.post("/kb/ingest", json={"path": str(d)})).json()
     assert not again["ingested"] and len(again["skipped"]) == 2
 
     f = d / "deploy.md"
     f.write_text(f.read_text() + "\n## New section\nPostroll verification via KZNEWSTEP hook.\n")
-    updated = (await agentmem_client.post("/kb/ingest", json={"path": str(d)})).json()
+    updated = (await kb_client.post("/kb/ingest", json={"path": str(d)})).json()
     assert len(updated["ingested"]) == 1
     assert updated["ingested"][0]["doc"] == ids["Deployment Runbook"]  # stable id
 
-    hits = (await agentmem_client.post("/kb/search", json={"query": "KZNEWSTEP"})).json()["chunks"]
+    hits = (await kb_client.post("/kb/search", json={"query": "KZNEWSTEP"})).json()["chunks"]
     assert hits and hits[0]["doc"] == ids["Deployment Runbook"]
-    stale = (await agentmem_client.post("/kb/search", json={"query": "Rollback helm release"})).json()["chunks"]
+    stale = (await kb_client.post("/kb/search", json={"query": "Rollback helm release"})).json()["chunks"]
     assert not [h for h in stale if h["section"] == "Rollback" and h["doc"] != ids["Deployment Runbook"]]
 
 
 @pytest.mark.asyncio
-async def test_remove_by_path(agentmem_client, kb_home):
+async def test_remove_by_path(kb_client, kb_home):
     d = await _write_docs(kb_home)
-    await agentmem_client.post("/kb/ingest", json={"path": str(d / "pricing.md")})
+    await kb_client.post("/kb/ingest", json={"path": str(d / "pricing.md")})
 
-    r = await agentmem_client.post("/kb/remove", json={"doc": str(d / "pricing.md")})
+    r = await kb_client.post("/kb/remove", json={"doc": str(d / "pricing.md")})
     assert r.json()["status"] == "removed"
 
-    idx = (await agentmem_client.get("/kb/index")).json()["docs"]
+    idx = (await kb_client.get("/kb/index")).json()["docs"]
     assert not [x for x in idx if x["title"] == "Pricing Handbook"]
-    hits = (await agentmem_client.post("/kb/search", json={"query": "KWLPRC"})).json()["chunks"]
+    hits = (await kb_client.post("/kb/search", json={"query": "KWLPRC"})).json()["chunks"]
     assert hits == []
 
 
 @pytest.mark.asyncio
-async def test_llm_outage_falls_back_extractive(agentmem_client, kb_home, monkeypatch):
+async def test_llm_outage_falls_back_extractive(kb_client, kb_home, monkeypatch):
     """When aiserv is down, ingest still succeeds with extractive digest."""
     async def dead_llm(system, prompt, timeout=45.0):
         raise ConnectionError("aiserv down")
@@ -161,22 +167,22 @@ async def test_llm_outage_falls_back_extractive(agentmem_client, kb_home, monkey
     d = kb_home / "single"
     d.mkdir()
     (d / "note.md").write_text("# Server Notes\nPrimary DB runs on the jetson box, port 5432.\n")
-    r = await agentmem_client.post("/kb/ingest", json={"path": str(d), "enrich": True})
+    r = await kb_client.post("/kb/ingest", json={"path": str(d), "enrich": True})
     body = r.json()
     assert len(body["ingested"]) == 1 and body["ingested"][0]["enriched"] == 0
 
     doc = body["ingested"][0]["doc"]
-    meta = (await agentmem_client.get(f"/kb/doc/{doc}/digest")).json()
+    meta = (await kb_client.get(f"/kb/doc/{doc}/digest")).json()
     assert "LLM digest unavailable" in meta["digest"]
-    hits = (await agentmem_client.post("/kb/search", json={"query": "jetson 5432"})).json()["chunks"]
+    hits = (await kb_client.post("/kb/search", json={"query": "jetson 5432"})).json()["chunks"]
     assert any("jetson" in h["text"] for h in hits)
 
 
 @pytest.mark.asyncio
-async def test_path_guard_and_missing_doc(agentmem_client, tmp_path):
+async def test_path_guard_and_missing_doc(kb_client, tmp_path):
     outside = tmp_path / "x.md"  # pytest tmp is under /private/var/... — outside home
     if str(outside.resolve()).startswith(kb_mod.HOME):
         pytest.skip("tmp is inside home on this machine")
-    r = await agentmem_client.post("/kb/ingest", json={"path": str(outside)})
+    r = await kb_client.post("/kb/ingest", json={"path": str(outside)})
     assert r.status_code == 400
-    assert (await agentmem_client.get("/kb/doc/kb_doesnotexist/digest")).status_code == 404
+    assert (await kb_client.get("/kb/doc/kb_doesnotexist/digest")).status_code == 404

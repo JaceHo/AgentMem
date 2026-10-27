@@ -10,6 +10,27 @@ import pytest
 from core.store import confidence_decay, reinforce_fact
 
 
+def _consolidation_args(redis_client):
+    """Build the (redis, bm25_index, spawn_fn) triple that do_consolidate /
+    do_hard_prune require.
+
+    do_consolidate and do_hard_prune gained a BM25Index argument (so they can
+    drop pruned entries from the keyword corpus) and a spawn_fn for
+    fire-and-forget quality reporting.  These tests only care about the Redis
+    side effects, so the spawner just consumes the coroutine to keep asyncio
+    quiet.
+    """
+    from core.search import BM25Index
+
+    def _spawn(coro, name: str = "bg") -> None:
+        try:
+            coro.close()
+        except Exception:
+            pass
+
+    return redis_client, BM25Index(), _spawn
+
+
 class TestEbbinghausDecay:
     """Test confidence decay based on Ebbinghaus forgetting curve."""
     
@@ -174,7 +195,7 @@ async def test_consolidation_merge_phase(async_redis_client):
         )
     
     # Run consolidation
-    result = await _do_consolidate()
+    result = await _do_consolidate(*_consolidation_args(async_redis_client))
     
     # Should have merged some facts
     assert result["merged"] >= 0  # may be 0 if similarity threshold not met
@@ -207,7 +228,7 @@ async def test_consolidation_prune_low_importance(async_redis_client):
     )
     
     # Run consolidation
-    result = await _do_consolidate()
+    result = await _do_consolidate(*_consolidation_args(async_redis_client))
     
     # Should have pruned the low-importance fact
     assert result["pruned"] >= 0
@@ -243,7 +264,7 @@ async def test_pinned_fact_never_pruned(async_redis_client):
     )
     
     # Run consolidation
-    result = await _do_consolidate()
+    result = await _do_consolidate(*_consolidation_args(async_redis_client))
     
     # Verify pinned fact still exists and is not superseded
     raw = await async_redis_client.execute_command("VGETATTR", mem_store.FACT_KEY, element_id)
@@ -277,7 +298,7 @@ async def test_hard_prune_removes_stale_episodes(async_redis_client):
     )
     
     # Run hard prune
-    result = await _do_hard_prune()
+    result = await _do_hard_prune(*_consolidation_args(async_redis_client))
     
     # Should have removed the stale episode
     assert result["removed_episodes"] >= 0

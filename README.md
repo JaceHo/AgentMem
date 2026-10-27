@@ -9,14 +9,14 @@ Works with Claude Code, Cursor, Windsurf, GitHub Copilot, Zed, Continue.dev, Aug
 ```
 LLM-F1: 76.69%†   │  Retrieval R@5: 95.2%   │  P50 recall: 19ms
 ~873 tokens/session │  405x context compression │  $0/month, 100% local
-6-tier cognitive stack  │  12 research papers  │  8 hooks  │  HyDE + MIRIX + session diversity
+6-tier cognitive stack  │  12 research papers  │  9 hook registrations  │  HyDE + MIRIX + session diversity
 ```
 
 ---
 
 ## What AgentMem does
 
-Every AI coding session starts cold — the agent re-reads the same files, re-discovers the same patterns, re-asks the same questions. AgentMem fixes this. Five hooks auto-capture what matters, compress it across 6 memory tiers, and inject the right context (~873 tokens) into every prompt:
+Every AI coding session starts cold — the agent re-reads the same files, re-discovers the same patterns, re-asks the same questions. AgentMem fixes this. Nine hook registrations auto-capture what matters, compress it across 6 memory tiers, and inject the right context (~873 tokens) into every prompt:
 
 ```xml
 <cross_session_memory>
@@ -51,7 +51,7 @@ health matrix only (score > 0). Reduced cloud timeouts to 60s.
 git clone https://github.com/JaceHo/AgentMem
 cd AgentMem
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-bash agentmem.sh setup          # service + all 8 Claude Code hooks
+bash agentmem.sh setup          # service + all 9 Claude Code hook registrations
 ```
 
 Open a new Claude Code session. Done.
@@ -129,7 +129,9 @@ MCP endpoints: `HTTP /mcp` · `SSE /mcp/sse` · `stdio python mcp_server.py`
 | **AgentMem v1.1** | **76.69%†** | internal bench on LLM-compressed memories — see disclaimer |
 | agentmemory (rohitg00) | not published | — |
 
-> **†** Internal dataset (3 convs, 17 Q/A), LLM-F1 with GLM-4.7-Flash answer extractor. Recall uses HyDE query expansion + SimpleMem retrieval planning. Not directly comparable to LoCoMo baselines (different dataset + backbone). Run `agentmem.sh bench start` then `scripts/bench-f1.py --flush-between-sessions` to reproduce.
+> **†** Internal dataset (**8 convs, 47 Q/A** — see `scripts/bench-f1.py::CONVERSATIONS`), LLM-F1 with GLM-4.7-Flash answer extractor. Recall uses HyDE query expansion + SimpleMem retrieval planning. Not directly comparable to LoCoMo baselines (different dataset + backbone). Run `agentmem.sh bench start` then `scripts/bench-f1.py --flush-between-sessions` to reproduce.
+>
+> **Reproducibility caveats (verified 2026-10-22):** the 95.2% R@5 figure quoted elsewhere in this repo comes from a TypeScript LongMemEval harness that is **not** in this repository (`BENCHMARK_RESULTS.md` says so itself), so it cannot be reproduced locally. The F1 number above is reproducible; the R@5 number is not. The recall latency figures below are measured with the LLM augmentation path either unavailable or fast — HyDE/MIRIX add 1–2 HTTP round trips to the local LLM proxy per recall, so P50 is bimodal in production (single-digit ms when the proxy is hot, up to the 2.5s budget when it is not).
 
 > **Note on agentmemory's 95.2% R@5 claim:** their benchmark (`benchmark/longmemeval-bench.ts`) stores each session as a single raw text blob and retrieves it — it does not test retrieval through their LLM compression pipeline that real users experience. A benchmark run against compressed memories would show significantly lower numbers. AgentMem's benchmarks run against the same representations that live deployments use.
 
@@ -173,7 +175,7 @@ Redis 8 HNSW gives O(log n) ANN search — at 10K facts: 50ms → **2ms**; at 10
 | **Fully local** | ✅ | ✅ | ❌ | ✅ option | ✅ |
 | **Memory injection per prompt** | **✅ every prompt** | MCP call only⁴ | manual | manual | manual |
 | **Auto-consolidation (always-on)** | **✅ A-MAC gate** | opt-in¹ | manual | manual | none |
-| **Auto-capture hooks** | 8 | **12** | manual | self-edits | manual |
+| **Auto-capture hooks** | 6 | **12** | manual | self-edits | manual |
 | **Context-injecting hooks** | **3** | 0⁴ | n/a | n/a | n/a |
 | **Web dashboard / viewer** | **✅** | ✅ | cloud only | cloud only | ❌ |
 | **MCP tools** | **54** | 8 default / 53 all² | — | — | — |
@@ -200,7 +202,7 @@ Redis 8 HNSW gives O(log n) ANN search — at 10K facts: 50ms → **2ms**; at 10
 > ³ agentmemory's `diversifyBySession()` has `maxPerSession=3` hardcoded at the call site (`hybrid-search.ts`). AgentMem's session diversity limit is configurable via recall parameters.  
 > ⁴ agentmemory's `UserPromptSubmit` hook calls `POST /observe` (fire-and-forget, no `additionalContext` return). Memory is injected only when Claude explicitly calls the `mem::recall` MCP tool — not automatically per prompt.
 
-**Where agentmemory wins:** no external DB required, `npm install -g` one-liner, more hooks by raw count (12 vs 8).
+**Where agentmemory wins:** no external DB required, `npm install -g` one-liner, more hooks by raw count (12 vs 9).
 
 **Where AgentMem wins:** published LLM-F1 on real compressed data (76.34%), measured recall latency (19ms P50), 2x more token-efficient injection (873 vs 1,900), **3 hooks actively inject context** (agentmemory's 12 hooks inject zero — all are fire-and-forget observers), always-on consolidation from session 1 (agentmemory requires `CONSOLIDATION_ENABLED=true` AND ≥5 sessions), HyDE + MIRIX + session diversity retrieval quality, 6-tier architecture, ToolMem + TIG + AWO + MACLA features unique in open source, Redis 8 HNSW O(log n) at scale, **54 MCP tools vs 53** (agentmemory's max), **100% open-source stack** (agentmemory hard-depends on closed-source `iii engine`).
 
@@ -327,6 +329,98 @@ Result: stable ~200MB footprint @ 10K facts, improving quality over time
 
 ---
 
+## Enumeration Integrity (shadow index)
+
+Redis 8 vectorsets have **no enumerate command** — `VSCAN` does not exist, and
+`VSIM` is an approximate HNSW traversal that does *not* guarantee returning
+`COUNT` results. Measured on this instance (13,260 procedures):
+
+| vectorset | VCARD | VSIM reaches | |
+|---|---|---|---|
+| mem:facts | 1,140 | 1,139 | 99.9% |
+| mem:episodes | 1,611 | 1,609 | 99.8% |
+| mem:procedures | 13,260 | ~1,730 | **13.0%** |
+
+A freshly built 16k-element set still returns 98.3%, so this is not a size
+limit — `mem:procedures`' HNSW graph has degraded and over half its elements
+were unreachable by *any* similarity query, which silently corrupted
+consolidation, procedure scans and BM25 population.
+
+The fix is an explicit element-ID shadow SET maintained at write time:
+
+```
+mem:idx:facts / mem:idx:episodes / mem:idx:procedures   → Set of element IDs
+```
+
+`SSCAN` is exact and complete, and `VGETATTR` resolves by ID regardless of
+graph health, so enumeration through the shadow index stays correct even for a
+degraded vectorset. Every write path registers on `VADD`, every delete goes
+through `core.store.remove_element` (which also drops the ID from
+`mem:proc_by_tool:*` and `mem:proc_tasks` — 90,429 dangling references had
+piled up there because nothing used to clean them).
+
+Procedure recovery — the element IDs of graph-unreachable procedures survive in
+the reverse indexes, so `POST /shadow-index/backfill` harvests
+`mem:proc_by_tool:*` + `mem:proc_tasks`, validates each ID with `VGETATTR`, and
+registers the live ones. On this instance that restored **13,249 of 13,260
+elements (99.9%)** in 0.7s, versus the 13% `VSIM` alone could reach. The same
+pass runs guarded and idempotently at boot (0.22s steady state) before the BM25
+corpus is built.
+
+```
+GET  /shadow-index/stats      coverage per vectorset + BM25 tier counts
+POST /shadow-index/backfill   rebuild from VSIM + procedure recovery
+```
+
+## Store write-path batching
+
+`_do_store` used to issue one Redis round trip per extracted fact: a dedup
+VSIM, a `VADD`+`SADD` save, a `HGET`+`HSET` persona merge, and `N*(N-1)`
+serial Lua edge upserts per fact that carried entities. Each is now a single
+pipelined flight:
+
+```
+knn_search_batch()      N fact dedup VSIMs      → 1 pipeline
+save_facts_batch()      N fact writes           → 2 pipelines (VADD, SADD)
+persona.update_many()  N persona merges        → 2 round trips (HGETALL, HSET)
+record_entities_many() N fact entity groups    → 1 pipeline of EVALSHA
+```
+
+The dedup decisions are still made per fact against an in-memory view of the
+batch — batching the I/O changes nothing about which facts get saved, which
+persona entries merge, or which edges form, only the number of network
+round trips (down from `O(N)`/`O(N²)` to constant).
+
+## Recall concurrency ceiling (dedicated embed pool)
+
+Recall is served by a single uvicorn worker on purpose: the BM25 index and
+`TaskManager` live in-process and would be shredded by multi-worker sharding.
+But the recall path used to throw every embedding onto the *default* asyncio
+thread pool — the same pool BM25 rebuilds use — with no real concurrency
+ceiling. Under a burst of concurrent recalls, unbounded embedding threads
+piled onto the CPU (or the embedding service) until latency exploded and
+requests timed out; the practical ceiling was implicit and collapsed under
+load.
+
+Embeddings now run on a **dedicated, bounded thread pool** gated by a
+**semaphore** (`core.search.async_encode` / `async_encode_batch`):
+
+```
+async_encode(text)        → semaphore → embed pool (1 slot)
+async_encode_batch(texts) → semaphore → embed pool (1 slot, batched)
+```
+
+The event loop stays free to accept and serve many concurrent recall requests
+(the I/O-bound Redis and augmentation work runs concurrently); only the
+CPU-bound embedding is serialized behind a fixed, tunable number of slots.
+The ceiling is a single knob — `AGENTMEM_RECALL_CONCURRENCY`
+(`settings.recall_concurrency`, default 8). For a local CPU-bound embedder
+keep it near the core count; for a remote (HTTP) embedder raise it to absorb
+network latency. Raising it directly raises the recall concurrency ceiling
+*without* going multi-worker.
+
+---
+
 ## Claude Code Hooks (8)
 
 3 hooks actively inject context into every response. agentmemory's 12 hooks inject zero.
@@ -342,7 +436,7 @@ Result: stable ~200MB footprint @ 10K facts, improving quality over time
 | `subagent-start.sh` | SubagentStart | **Injects** memory context into subagent spawn |
 | `store.sh` | Stop + SubagentStop | Store + compress + TIG + AWO meta-tool synthesis |
 
-**Key advantage over agentmemory:** 3 of AgentMem's 8 hooks actively return `additionalContext` — memory is injected before Claude responds at UserPromptSubmit, PreCompact, and SubagentStart. agentmemory's `prompt-submit.mjs` calls `POST /observe` as a fire-and-forget side-effect and returns nothing. None of agentmemory's 12 hooks inject context — retrieval only happens if Claude explicitly calls the `mem::recall` MCP tool.
+**Key advantage over agentmemory:** 3 of AgentMem's 9 hook registrations actively return `additionalContext` — memory is injected before Claude responds at UserPromptSubmit, PreCompact, and SubagentStart. agentmemory's `prompt-submit.mjs` calls `POST /observe` as a fire-and-forget side-effect and returns nothing. None of agentmemory's 12 hooks inject context — retrieval only happens if Claude explicitly calls the `mem::recall` MCP tool.
 
 ---
 
