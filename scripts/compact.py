@@ -109,9 +109,19 @@ def compact_session(session_path: Path, dry_run: bool = False) -> dict:
 
     if old_messages and not dry_run:
         try:
+            # /store is write-gated behind X-API-Key (S1 fix, 2026-10-24).
+            key = os.getenv("AGENTMEM_API_KEY", "").strip()
+            if not key:
+                try:
+                    with open(os.path.expanduser("~/.agentmem_api_key")) as f:
+                        key = f.read().strip()
+                except OSError:
+                    key = ""
+            headers = {"X-API-Key": key} if key else {}
             resp = httpx.post(
                 f"{MEMORY_BASE}/store",
                 json={"messages": old_messages, "session_id": f"compact:{session_path.stem}"},
+                headers=headers,
                 timeout=10,
             )
             stored = resp.status_code == 200

@@ -4,11 +4,22 @@ import os, re, json, glob, sys, urllib.request, urllib.error
 
 AGENTMEM = "http://127.0.0.1:18800"
 
+def api_headers():
+    # agentmem gates every mutating method behind an API key (S1 fix, 2026-10-24).
+    # /register-tools is a write, so it needs the key; reads stay open.
+    h = {"Content-Type": "application/json"}
+    try:
+        with open(os.path.expanduser("~/.agentmem_api_key")) as f:
+            h["X-API-Key"] = f.read().strip()
+    except OSError:
+        pass
+    return h
+
 def post(payload):
     data = json.dumps(payload).encode()
     req = urllib.request.Request(
         f"{AGENTMEM}/register-tools",
-        data=data, headers={"Content-Type": "application/json"}, method="POST"
+        data=data, headers=api_headers(), method="POST"
     )
     with urllib.request.urlopen(req, timeout=5) as r:
         return json.loads(r.read())

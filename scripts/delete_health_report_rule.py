@@ -7,6 +7,7 @@ import sys
 
 import numpy as np
 
+import store as mem_store
 from store import FACT_KEY, DIMS, get_client
 
 
@@ -37,7 +38,7 @@ async def main():
             continue
         content = attrs.get("content", "")
         if "Always send a report" in content or "always send a report" in content.lower():
-            await r.execute_command("VREM", FACT_KEY, elem_str)
+            await mem_store.remove_element(r, FACT_KEY, elem_str)
             removed += 1
             print(f"Removed: {content[:80]}...")
     await r.aclose()
