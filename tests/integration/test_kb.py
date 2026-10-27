@@ -1,12 +1,13 @@
-"""KB plane tests — daily-use scenes against the real app + test Redis (db 15).
+"""KB plane tests — daily-use scenes against an in-process app on private db 15.
 
 Progressive disclosure: ingest → index (Tier 0) → digest (Tier 1) → search
 (Tier 2) → incremental re-ingest → remove. LLM calls are monkeypatched so the
-suite is deterministic and runs without aiserv.
+suite is deterministic, runs without aiserv, and stays isolated on Redis db 15.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shutil
@@ -15,6 +16,9 @@ from pathlib import Path
 
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+# Private DB for the KB test app — the default REDIS_URL points at db 0 (live
+# agentmem) or db 14 (agentmem_server tests); db 15 is exclusively ours.
+os.environ["REDIS_URL"] = "redis://localhost:6379/15"
 
 import pytest  # noqa: E402
 
@@ -28,8 +32,16 @@ async def fresh_kb():
     KB singleton (its BM25 index lives in RAM across tests)."""
     import redis as sync_redis
 
-    from tests.conftest import TEST_REDIS_DB
-    sync_redis.Redis(host="localhost", port=6379, db=TEST_REDIS_DB).flushdb()
+    from core.kb import KB_CHUNK_KEY
+    sync_r = sync_redis.Redis(host="localhost", port=6379, db=15)
+    sync_r.flushdb()
+    # VSIM keys (kb:chunks) carry their own dim — flushdb alone may not drop
+    # the index if a concurrent writer (agentmem_server on db 14) re-creates it.
+    # Force-delete the key so the new KBStore rebuilds at the fake width.
+    try:
+        sync_r.delete(KB_CHUNK_KEY)
+    except Exception:
+        pass
     kb_mod._kb = kb_mod.KBStore()
     yield
     kb_mod._kb = None
@@ -67,8 +79,13 @@ def fake_llm(monkeypatch):
         norm = float(np.linalg.norm(v)) or 1.0
         return v / norm
 
-    monkeypatch.setattr(kb_mod, "encode", fake_vec)
-    monkeypatch.setattr(kb_mod, "encode_batch", lambda texts: [fake_vec(t) for t in texts])
+    async def _fake_encode(text, *a, **kw):
+        return fake_vec(text)
+    monkeypatch.setattr(kb_mod, "async_encode", _fake_encode)
+
+    async def _fake_batch(texts, *a, **kw):
+        return [fake_vec(t) for t in texts]
+    monkeypatch.setattr(kb_mod, "async_encode_batch_chunked", _fake_batch)
 
 
 async def _write_docs(d):

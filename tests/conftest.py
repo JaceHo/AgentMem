@@ -225,7 +225,8 @@ async def kb_client():
     from httpx import ASGITransport, AsyncClient
 
     import redis.asyncio as aioredis
-    r = aioredis.Redis(host="localhost", port=6379, db=TEST_REDIS_DB)
+    _kb_db = int(os.environ.get("REDIS_URL", "redis://localhost:6379").rsplit("/", 1)[-1])
+    r = aioredis.Redis(host="localhost", port=6379, db=_kb_db)
     await r.flushdb()
     await r.aclose()
 

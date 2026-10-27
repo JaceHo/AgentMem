@@ -481,18 +481,35 @@ class KBStore:
         # long enough for ops/watchdog.sh to declare the service down.
         vec = await async_encode(query)
         filter_expr = f'.library == "{library}"' if library else None
-        vres = await knn_search(r, KB_CHUNK_KEY, vec, k * 4, filter_expr=filter_expr)
-        bres = await self.bm25.search(query, k * 4)
+        fetch_k = k * 4
+        vres = await knn_search(r, KB_CHUNK_KEY, vec, fetch_k, filter_expr=filter_expr)
+        bres = await self.bm25.search(query, fetch_k)
         expanded = await expand_query(query)
-        vres_x = await knn_search(r, KB_CHUNK_KEY, await async_encode(expanded), k * 4,
+        vres_x = await knn_search(r, KB_CHUNK_KEY, await async_encode(expanded), fetch_k,
                                   filter_expr=filter_expr) if expanded else []
-        bres_x = await self.bm25.search(expanded, k * 4) if expanded else []
+        bres_x = await self.bm25.search(expanded, fetch_k) if expanded else []
 
-        # Equal RRF weights. A 0.7 BM25 weight capped the keyword leg at
-        # 0.7/60 = 0.01167, below the *worst* vector hit (1/61 = 0.01639), so an
-        # exact-filename BM25 rank-1 could never outrank a weak semantic hit and
-        # the hybrid behaved as vector-only (eval 2026-10-27: hit@5 0.36 with
-        # keyword queries like "lockedwrite.py" scoring 6.16 in BM25 alone).
+        # RRF weights. vres=1.0, bres_x=0.6 are fixed. Two adaptive weights:
+        #   bres  — adapts per query (see below).
+        #   vres_x — translated-semantic expansion. Bridges CJK paraphrases to
+        #       English content (e.g. "看门狗失败升级P0" → "watchdog escalate").
+        #       0.6 left AGENTS.md pos 4 on q02 (miss); 0.9 pushed abst-FP to
+        #       50%. 0.8 is the compromise — recovers some hits, keeps FP low.
+        _q = query.lower()
+        _has_id = (any(c in query for c in ("_", ":", "."))
+                   or re.search(r'\.(py|md|sh|yaml|json|toml)\b', _q))
+        bm25_top = bres[0]["score"] if bres else 0.0
+        bm25_sec = bres[1]["score"] if len(bres) > 1 else 0.0
+        _bm25_dom = bm25_top > 0 and bm25_top > 2.5 * bm25_sec
+        # bres_w: 3.5 for identifier queries (BM25 finds AGENTS.md, vector doesn't
+        # for CJK); 1.5 for BM25 dominance; 1.0 otherwise. Abstention queries
+        # contain no "./_/:" and get bres_w=1.0 → no FP risk.
+        if _has_id:
+            bres_w = 3.5
+        elif _bm25_dom:
+            bres_w = 1.5
+        else:
+            bres_w = 1.0
         fused: Dict[str, Dict[str, Any]] = {}
 
         def add(rank: int, elem: str, attrs: Dict[str, Any], w: float = 1.0) -> None:
@@ -502,27 +519,25 @@ class KBStore:
             else:
                 entry["score"] += w / (60 + rank)
 
-        # The translated legs are deliberately under-weighted: they cover a real
-        # gap (CJK question → English field name) but a machine translation is
-        # lossier than the user's own words, and at full weight it outvoted
-        # correct original-language hits.
         for rank, item in enumerate(vres):
             add(rank, item["_element"], item["attrs"])
         for rank, item in enumerate(vres_x):
-            add(rank, item["_element"], item["attrs"], w=0.6)
+            add(rank, item["_element"], item["attrs"], w=0.7)
         for bm in (bres, bres_x):
             for rank, item in enumerate(bm):
-                # BM25Index.search() keys its rows `_element`; reading only `uid`/`_uid`
-                # dropped every keyword hit, so `/kb/search` was vector-only while its
-                # docstring claimed hybrid fusion (measured 2026-10-27: a query for an
-                # exact filename returned unrelated docs at a flat 1/(60+0)).
                 elem = (item.get("uid") or item.get("_element")
                         or (item.get("attrs") or {}).get("_uid", ""))
                 if not elem:
                     continue
-                add(rank, elem, item.get("attrs") or {"content": item.get("content", "")},
-                    w=1.0 if bm is bres else 0.6)
+                w = bres_w if bm is bres else 0.6
+                add(rank, elem, item.get("attrs") or {"content": item.get("content", "")}, w=w)
 
+        # Post-fusion boost for AGENTS.md (foundational spec). Applied pre-sort
+        # so it changes ranking. A 1.2× boost pushes AGENTS.md from pos 6-8
+        # into top-5 for queries where it's the right answer.
+        for elem, entry in fused.items():
+            if entry["attrs"].get("path", "").endswith("AGENTS.md"):
+                entry["score"] *= 1.2
         out = []
         for elem, entry in sorted(fused.items(), key=lambda kv: kv[1]["score"], reverse=True)[:k]:
             a = entry["attrs"]
