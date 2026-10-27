@@ -20,6 +20,7 @@ This ensures consistent lookup regardless of capitalisation.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -116,8 +117,117 @@ redis.call('HSET', key, field, cjson.encode(new_edge))
 return 0
 """
 
-_edge_script = None  # cached Script object
-_edge_script_lock = asyncio.Lock()  # protects _edge_script initialization
+_edge_script_lock = asyncio.Lock()  # serializes per-client script_load
+
+# Precompute the script SHA1 so we can issue EVALSHA straight into a pipeline
+# (redis-py's AsyncScript.__call__ is a coroutine and cannot be scheduled
+# synchronously into a pipeline; EVALSHA with the known SHA can).
+_UPSERT_EDGE_SHA = hashlib.sha1(_UPSERT_EDGE_LUA.encode("utf-8")).hexdigest()
+
+
+async def _ensure_edge_script(r: aioredis.Redis) -> None:
+    """Load the edge-upsert Lua onto the server once per client (idempotent).
+
+    The flag lives on the client, not in a module global: with a global, a second client would
+    skip script_load and its pipelined EVALSHA would fail with NOSCRIPT.
+    """
+    if getattr(r, "_graph_edge_sha_loaded", False):
+        return
+    async with _edge_script_lock:
+        if getattr(r, "_graph_edge_sha_loaded", False):
+            return
+        try:
+            await r.script_load(_UPSERT_EDGE_LUA)
+        except Exception as e:  # pragma: no cover - best-effort
+            log.warning("graph: script_load failed: %s", e)
+            return
+        setattr(r, "_graph_edge_sha_loaded", True)
+
+
+def _edge_upserts(
+    groups: list[tuple[list[str], list[str]]],
+) -> list[tuple[str, str]]:
+    """Flatten (entities, persons) groups into (hash key, field) edge upserts.
+
+    Both directions of every pair are emitted, matching the undirected
+    storage the graph layer has always used.  Pairs whose slugs collide are
+    dropped — the same self-edge guard ``record_entities`` applies.
+    """
+    ops: list[tuple[str, str]] = []
+    for entities, persons in groups:
+        all_ents = list(dict.fromkeys((entities or []) + (persons or [])))
+        for i, a in enumerate(all_ents):
+            for b in all_ents[i + 1:]:
+                if _slug(a) == _slug(b):
+                    continue
+                ops.append((_key(a), _slug(b)))
+                ops.append((_key(b), _slug(a)))
+    return ops
+
+
+async def _run_edge_upserts(
+    r: aioredis.Redis,
+    ops: list[tuple[str, str]],
+    relationship_type: str,
+    confidence: float,
+    source: str,
+    now_ms: int,
+) -> int:
+    """Apply edge upserts in one pipeline; fall back to per-op on failure.
+
+    Each op is an independent atomic Lua upsert, so pipelining them yields
+    exactly the same Redis state as awaiting them one by one — including the
+    case where the same edge appears in several ops (the scripts still execute
+    in order inside the pipeline, so source_count increments accumulate).
+    """
+    if not ops:
+        return 0
+    await _ensure_edge_script(r)
+    args = [relationship_type, str(confidence), str(now_ms), source or ""]
+
+    pipe = r.pipeline(transaction=False)
+    for key, field in ops:
+        # EVALSHA (not the AsyncScript object) so the command is scheduled into
+        # the pipeline synchronously; the script was pre-loaded in _ensure.
+        pipe.evalsha(_UPSERT_EDGE_SHA, 1, key, field, *args)
+    try:
+        await pipe.execute()
+        return len(ops)
+    except Exception as e:
+        log.warning("graph edge pipeline failed (%s) — falling back to per-op", e)
+
+    done = 0
+    for key, field in ops:
+        try:
+            await r.evalsha(_UPSERT_EDGE_SHA, 1, key, field, *args)
+            done += 1
+        except Exception as e:
+            log.warning("record_entities Lua failed for %s/%s: %s", key, field, e)
+    return done
+
+
+async def record_entities_many(
+    r: aioredis.Redis,
+    groups: list[tuple[list[str], list[str]]],
+    relationship_type: str = "related_to",
+    confidence: float = 0.8,
+    source: str = "",
+) -> int:
+    """Record co-occurrence edges for many entity groups in ONE round trip.
+
+    ``record_entities`` awaits one Lua EVALSHA per direction per pair, so a
+    fact with N entities costs N*(N-1) serial round trips — and the store path
+    calls it once per extracted fact, multiplying that by the fact count.
+    ``groups`` is a list of (entities, persons) pairs, one per fact.
+    """
+    if relationship_type not in RELATIONSHIP_TYPES:
+        relationship_type = "related_to"
+    ops = _edge_upserts(groups)
+    if not ops:
+        return 0
+    return await _run_edge_upserts(
+        r, ops, relationship_type, confidence, source, int(time.time() * 1000),
+    )
 
 
 def _slug(entity: str) -> str:
@@ -175,29 +285,10 @@ async def record_entities(
     if len(all_ents) < 2:
         return
 
-    global _edge_script
-    if _edge_script is None:
-        async with _edge_script_lock:
-            if _edge_script is None:
-                _edge_script = r.register_script(_UPSERT_EDGE_LUA)
-
-    now_ms = int(time.time() * 1000)
-
-    for i, a in enumerate(all_ents):
-        for b in all_ents[i + 1:]:
-            slug_a = _slug(a)
-            slug_b = _slug(b)
-            if slug_a == slug_b:
-                continue
-            # Atomic upsert for both directions using Lua script
-            for key, field in [(_key(a), slug_b), (_key(b), slug_a)]:
-                try:
-                    await _edge_script(
-                        keys=[key],
-                        args=[field, relationship_type, str(confidence), str(now_ms), source or ""],
-                    )
-                except Exception as e:
-                    log.warning("record_entities Lua failed for %s/%s: %s", key, field, e)
+    await _run_edge_upserts(
+        r, _edge_upserts([(all_ents, [])]), relationship_type, confidence, source,
+        int(time.time() * 1000),
+    )
 
 
 async def add_typed_edge(
@@ -238,26 +329,13 @@ async def add_typed_edge(
     if slug_s == slug_t:
         return
 
-    global _edge_script
-    if _edge_script is None:
-        async with _edge_script_lock:
-            if _edge_script is None:
-                _edge_script = r.register_script(_UPSERT_EDGE_LUA)
-
-    now_ms = int(time.time() * 1000)
-
-    async def _upsert_edge(key: str, field: str) -> None:
-        try:
-            await _edge_script(
-                keys=[key],
-                args=[field, relationship_type, str(confidence), str(now_ms), source or ""],
-            )
-        except Exception as e:
-            log.warning("add_typed_edge Lua failed for %s/%s: %s", key, field, e)
-
-    await _upsert_edge(_key(source_entity), slug_t)
+    ops = [(_key(source_entity), slug_t)]
     if bidirectional:
-        await _upsert_edge(_key(target_entity), slug_s)
+        ops.append((_key(target_entity), slug_s))
+
+    await _run_edge_upserts(
+        r, ops, relationship_type, confidence, source, int(time.time() * 1000),
+    )
 
 
 async def traverse(

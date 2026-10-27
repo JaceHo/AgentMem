@@ -157,7 +157,7 @@ def _regex_extract(user_text: str) -> list[ExtractedFact]:
 # aiserv rotates across Cerebras, Groq, ZAI, Google, etc. and auto-heals
 # when provider keys are restored. Fallback: hardcoded "fast" tier.
 
-AISERV_BASE  = "http://127.0.0.1:4000"
+AISERV_BASE  = os.getenv("AISERV_URL", "http://127.0.0.1:4000")
 AISERV_URL   = f"{AISERV_BASE}/v1/chat/completions"
 AISERV_KEY   = "sk-aiserv-local"
 AISERV_ROLE  = "nlp"                    # maps to /v1/role/nlp

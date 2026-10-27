@@ -41,7 +41,26 @@ def decode_attrs(raw: str | bytes | None) -> dict:
 
 
 def force_str(value: object) -> str:
-    """Convert a value to string safely."""
+    """Coerce a Redis reply (or any scalar) to ``str`` — bytes-aware.
+
+    The shared pool is opened with ``decode_responses=False`` on purpose (binary
+    FP32 blobs round-trip through it), so *every* value coming back from Redis —
+    VSIM element names, hash fields, SET/SMEMBERS payloads — is ``bytes``.
+
+    ``str(b"01M3AB")`` is ``"b'01M3AB'"``, not ``"01M3AB"``. That repr is a name
+    that matches no element in any vectorset, so every write keyed on it (heat
+    bumps, ``VSETATTR`` in A-MEM evolution, task→procedure lookups) silently
+    no-oped for the whole of v1.0.x. Decode explicitly instead of ``str()``-ing.
+
+    Non-text scalars (ints from ``HLEN``, floats, ...) keep the old ``str()``
+    behaviour so this stays usable as the generic "make it a string" helper.
+    """
     if value is None:
         return ""
+    if isinstance(value, bytes):
+        # utf-8 with replacement so a malformed element name degrades to a
+        # visibly-weird key rather than raising inside a fire-and-forget task.
+        return value.decode("utf-8", errors="replace")
+    if isinstance(value, str):
+        return value
     return str(value)

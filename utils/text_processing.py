@@ -6,8 +6,23 @@ Extracted from main.py to reduce duplication and improve testability.
 
 import ast
 import json
+import math
 import re
 from typing import Any
+
+
+# ── Token estimation ───────────────────────────────────────────────────────
+# CJK-family scripts (Han incl. extensions, kana, Hangul, CJK punctuation,
+# fullwidth forms) are unsegmented: word-splitting scores a 1 000-character
+# Chinese block as a handful of tokens. Each such character is charged ~1 token.
+_CJK_RE = re.compile(
+    r"[　-〿㐀-䶿一-鿿豈-﫿"
+    r"︰-﹯＀-￯぀-ヿ가-힯]"
+)
+# Non-CJK text is charged 1 token per this many non-whitespace characters
+# (~1.3 tokens per average English word).
+_LATIN_CHARS_PER_TOKEN = 3.8
+_NON_CJK_WS_RE = re.compile(r"[\s\u3000]+")
 
 
 # ── Platform Tag Patterns ──────────────────────────────────────────────────
@@ -102,18 +117,70 @@ def flatten_message_content(content: Any) -> str:
 
 def estimate_tokens(text: str) -> int:
     """
-    Fast word-count token estimate.
-    
-    Simple approximation: split on whitespace and count words.
-    More accurate than character count for English text.
-    
+    CJK-aware token estimate.
+
+    ``len(text.split())`` (the v1.0 behaviour) scores a 4 000-character Chinese
+    block as *one* token because Chinese is written without spaces.  That made
+    every ``token_budget`` check in context packing a no-op for the persona /
+    fact blocks this deployment actually serves, so a 600-token budget returned
+    ~1 600 real tokens.
+
+    Model (deliberately conservative, cheap, no tokenizer dependency):
+      * CJK-family characters  -> ~1 token each (cl100k/o200k split Han at
+        roughly 1–1.5 chars per token; 1.0 keeps the estimate honest rather
+        than optimistic).
+      * everything else        -> character count / 3.8 (average English word
+        is ~4.75 chars plus a separator, i.e. ~1.25 tokens per word).
+
     Args:
-        text: Text to estimate tokens for
-        
+        text: Text to estimate token count for
+
     Returns:
-        Estimated token count
+        Estimated token count (>= 0)
     """
-    return len(text.split())
+    if not text:
+        return 0
+    if not isinstance(text, str):
+        text = str(text)
+    cjk = len(_CJK_RE.findall(text))
+    other = len(_NON_CJK_WS_RE.sub("", text))
+    return cjk + math.ceil(other / _LATIN_CHARS_PER_TOKEN)
+
+
+def truncate_to_tokens(text: str, max_tokens: int) -> str:
+    """Clip ``text`` so that ``estimate_tokens(result) <= max_tokens``.
+
+    Packing that *drops* an over-budget block is as useless as packing that
+    ignores the budget: the persona block is priority-1 context and must arrive,
+    just smaller.  Prefers a line boundary, then a sentence boundary, then hard
+    character cutting; a trailing ``…`` is added when anything was removed.
+    Returns "" for a non-positive budget.
+    """
+    if not text or max_tokens <= 0:
+        return ""
+    if estimate_tokens(text) <= max_tokens:
+        return text
+
+    # Char budget implied by the token budget. Worst case is all-CJK (1 char
+    # per token); latin inflates faster, so iterate rather than guess once.
+    limit = max(1, min(len(text), int(max_tokens * _LATIN_CHARS_PER_TOKEN)))
+    cut = text[:limit]
+    if "\n" in cut:
+        nl = cut.rfind("\n")
+        if nl >= limit // 2:
+            cut = cut[:nl]
+    elif len(cut) < len(text):
+        for sep in ("。", ". ", "；", "; ", "，", ", "):
+            idx = cut.rfind(sep)
+            if idx >= int(limit * 0.6):
+                cut = cut[: idx + len(sep.rstrip())]
+                break
+    cut = cut.rstrip()
+    while cut and estimate_tokens(cut + "…") > max_tokens:
+        cut = cut[: max(1, len(cut) - 16)].rstrip()
+    if not cut:
+        return ""
+    return cut + ("…" if len(cut) < len(text) else "")
 
 
 def redact_secrets(text: str) -> str:
