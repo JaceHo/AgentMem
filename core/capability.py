@@ -28,7 +28,7 @@ import time
 
 import redis.asyncio as aioredis
 
-from .utils import decode_json, decode_bytes, force_str
+from .utils import decode_json, decode_bytes
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 TOOL_KEY   = "mem:tools"
@@ -63,15 +63,15 @@ if total >= 5 then
     elseif rate >= 0.40 then quality = 'mixed'
     else quality = 'often fails'
     end
-    attrs['capability_summary'] = quality .. ' (' .. (attrs['success_count'] or 0) .. '/' .. total .. '\\xe2\\x9c\\x93)'
+    -- Redis runs Lua 5.1, which has no \\x escape: '\\xe2\\x9c\\x93' was stored
+    -- literally as "xe2x9cx93" (44/47xe2x9cx93) in every capability summary.
+    attrs['capability_summary'] = quality .. ' (' .. (attrs['success_count'] or 0) .. '/' .. total .. '\\226\\156\\147)'
 end
 
 local new_json = cjson.encode(attrs)
 redis.call('VSETATTR', key, elem, new_json)
 return 1
 """
-
-_tool_feedback_script = None
 
 
 # ── Tool categories ────────────────────────────────────────────────────────────
@@ -232,7 +232,7 @@ async def recall_tools(
         score = results[i + 1]
         raw   = results[i + 2]
         i += 3
-        elem_str = force_str(elem)
+        elem_str = decode_bytes(elem)
         if elem_str == "__seed__":
             continue
         try:
@@ -296,7 +296,7 @@ async def list_all_tools(r: aioredis.Redis) -> list[dict]:
         elem = results[i]
         raw  = results[i + 2]
         i += 3
-        elem_str = force_str(elem)
+        elem_str = decode_bytes(elem)
         if elem_str == "__seed__":
             continue
         try:
@@ -483,11 +483,13 @@ async def atomic_tool_feedback(r: aioredis.Redis, elem_key: str, success: bool) 
     Returns:
         Updated attrs dict, or None if tool not found.
     """
-    global _tool_feedback_script
     try:
-        if _tool_feedback_script is None:
-            _tool_feedback_script = r.register_script(_TOOL_FEEDBACK_LUA)
-        result = await _tool_feedback_script(
+        # Per-client: a Script object is bound to the pool it was registered from.
+        script = getattr(r, "_tool_feedback_script", None)
+        if script is None:
+            script = r.register_script(_TOOL_FEEDBACK_LUA)
+            setattr(r, "_tool_feedback_script", script)
+        result = await script(
             keys=[TOOL_KEY],
             args=[elem_key, "1" if success else "0"],
         )

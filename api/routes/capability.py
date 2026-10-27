@@ -1,5 +1,6 @@
 """Capability routes — tools, environment, procedures, TIG, AWO, MACLA."""
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -14,10 +15,11 @@ from api.schemas.capability import (
     ProcedureFeedbackRequest,
 )
 from core import capability as cap_mod
+from core import embedder as embed_mod
 from core import persona as persona_mod
 from core import scene as scene_mod
 from core import store as mem_store
-from core.search import encode
+from core.search import async_encode, encode
 from core.utils import decode_attrs, decode_bytes
 
 log = logging.getLogger("mem")
@@ -42,7 +44,7 @@ async def register_tools(req: RegisterToolsRequest, background_tasks: Background
         count = 0
         for tool in req.tools:
             try:
-                emb = encode(f"{tool.name}: {tool.description}")
+                emb = await async_encode(f"{tool.name}: {tool.description}")
                 await cap_mod.register_tool(
                     state.redis,
                     name=tool.name,
@@ -160,41 +162,183 @@ async def recall_procedures(req: RecallToolsRequest):
     return {"procedures": procs, "count": len(procs), "latency_ms": ms}
 
 
+PROC_PENDING_KEY = "mem:proc_pending"   # durable parking lot for writes the embedder blocked
+_DRAIN_BATCH = 25
+# Every write outcome the endpoint can take is counted here, so "200 + nothing new stored" is
+# always attributable to one of stored / deduped / deferred instead of being a mystery.
+_proc_guard = {"deferred": 0, "errors": 0, "drained": 0, "stored": 0, "deduped": 0}
+_queue_task = None                      # the replay supervisor's handle
+
+
+def proc_guard_stats() -> dict:
+    return dict(_proc_guard)
+
+
+def _proc_payload(req: "StoreProcedureRequest") -> str:
+    return json.dumps({"task": req.task, "procedure": req.procedure,
+                       "tools_used": list(req.tools_used or []), "domain": req.domain,
+                       "session_id": req.session_id}, ensure_ascii=False)
+
+
+async def _defer_proc(r, req, reason: str) -> int:
+    """Park the write so an outage costs latency, never data."""
+    n = int(await r.rpush(PROC_PENDING_KEY, _proc_payload(req)) or 0)
+    _proc_guard["deferred"] += 1
+    log.warning("[proc] deferred store (%s) task=%r pending=%d", reason, req.task[:60], n)
+    return n
+
+
+async def _store_proc_now(r, req) -> str:
+    """Embed + persist one procedure. Raises if the embedder is down — callers must handle it."""
+    emb = encode(req.task)
+    sc = scene_mod.detect(req.task)
+    hit = await mem_store.find_procedure_by_task(r, emb, req.task)
+    dedup_score = 1.0
+    if not hit:
+        near = await mem_store.nearest_procedures(r, emb, k=1)
+        if near and near[0]["score"] > 0.90:
+            hit = near[0]
+            dedup_score = near[0]["score"]
+    if hit:
+        elem = hit.get("_element")
+        if elem:
+            attrs = dict(hit.get("attrs") or {})
+            attrs["success_count"] = attrs.get("success_count", 1) + 1
+            try:
+                await r.execute_command("VSETATTR", mem_store.PROC_KEY, elem, json.dumps(attrs))
+            except Exception as exc:
+                log.warning("[proc] dedup success_count bump failed for %s: %s", elem, exc)
+        # Loud on purpose: an accepted write that adds no element must still leave a trace,
+        # otherwise "already known" is indistinguishable from "silently lost".
+        log.info("[proc] deduped: %r -> existing %s (score=%.3f, known_task=%r)",
+                 req.task[:60], elem or "<no element>", dedup_score,
+                 (hit.get("attrs") or {}).get("task", "")[:60])
+        _proc_guard["deduped"] += 1
+        return "deduped"
+    await mem_store.save_procedure(
+        r, task=req.task, procedure=req.procedure, embedding=emb,
+        tools_used=req.tools_used, domain=req.domain or sc["domain"], language=sc["language"],
+    )
+    log.info("[proc] stored procedure: %s", req.task[:60])
+    _proc_guard["stored"] += 1
+    return "stored"
+
+
+async def drain_proc_pending(limit: int = _DRAIN_BATCH) -> int:
+    """Replay parked writes, oldest first, while the embedder is actually answering.
+
+    Stops without popping on EmbeddingUnavailable so nothing is dropped and order is kept; a
+    malformed record is discarded loudly rather than blocking the queue forever.
+    """
+    r = state.redis
+    if r is None or embed_mod.embedding_unavailable():
+        return 0
+    drained = 0
+    for _ in range(max(1, limit)):
+        raw = await r.lindex(PROC_PENDING_KEY, 0)
+        if raw is None:
+            break
+        try:
+            data = json.loads(decode_bytes(raw))
+            await _store_proc_now(r, StoreProcedureRequest(**data))
+        except embed_mod.EmbeddingUnavailable:
+            break
+        except Exception as exc:
+            await r.lpop(PROC_PENDING_KEY)
+            _proc_guard["errors"] += 1
+            log.error("[proc] dropped malformed pending record: %s", exc)
+            continue
+        await r.lpop(PROC_PENDING_KEY)
+        drained += 1
+    if drained:
+        _proc_guard["drained"] += drained
+        log.info("[proc] replayed %d deferred procedure(s) from %s", drained, PROC_PENDING_KEY)
+    return drained
+
+
+async def proc_queue_loop(interval_s: int = 60) -> None:
+    """Safety net: a deferred write must not wait for the next store call to be replayed."""
+    # Replay anything parked while the process was down, then keep watching.
+    try:
+        await asyncio.sleep(5)
+        await drain_proc_pending(limit=200)
+    except Exception as exc:
+        log.warning("[proc] startup replay failed: %s", exc)
+    while True:
+        await asyncio.sleep(interval_s)
+        try:
+            if state.redis is not None and await state.redis.llen(PROC_PENDING_KEY):
+                await drain_proc_pending()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("[proc] supervisor drain failed: %s", exc)
+
+
+def start_proc_queue_supervisor() -> None:
+    """Launch the replay loop as a private task.
+
+    Deliberately not wired through main.py's startup block: this module is imported by the app
+    factory, so a failure here must degrade to "no supervisor" instead of failing service boot.
+    """
+    global _queue_task
+    if _queue_task is not None and not _queue_task.done():
+        return
+    try:
+        loop = asyncio.get_running_loop()          # check BEFORE building the coroutine
+    except RuntimeError as exc:                    # no loop: imported under tests / CLI use
+        log.warning("[proc] supervisor not started: %s", exc)
+        return
+    _queue_task = loop.create_task(proc_queue_loop(), name="proc-queue-drain")
+    log.info("[proc] deferred-write supervisor started (pending key=%s)", PROC_PENDING_KEY)
+
+
+try:
+    start_proc_queue_supervisor()
+except Exception as _exc:                # never let this block break app import
+    log.warning("[proc] supervisor bootstrap failed: %s", _exc)
+
+
 @router.post("/store-procedure")
 async def store_procedure(req: StoreProcedureRequest, background_tasks: BackgroundTasks):
-    """Store a procedural memory (agent workflow / how-to pattern)."""
+    """Store a procedural memory (agent workflow / how-to pattern).
+
+    ``status`` is honest about what will happen to the write:
+      queued    — embedder is answering; the background task will persist it
+      deferred  — embedder circuit is open; the write is parked in Redis and will be replayed
+    Both are durable. The pre-2026-10-24 behaviour was neither: the background task's very first
+    statement was ``encode(task)``, which raises ``EmbeddingUnavailable`` whenever the circuit is
+    open, so the caller received 200 ``queued`` and the procedure silently never existed.
+    """
     r = state.redis
+    if embed_mod.embedding_unavailable():
+        n = await _defer_proc(r, req, "embedding circuit open")
+        return {"status": "deferred", "pending": n, "reason": "embedding circuit open"}
+
     async def _do_store_proc():
-        emb = encode(req.task)
-        sc = scene_mod.detect(req.task)
-        hit = await mem_store.find_procedure_by_task(r, emb, req.task)
-        if not hit:
-            near = await mem_store.nearest_procedures(r, emb, k=1)
-            if near and near[0]["score"] > 0.90:
-                hit = near[0]
-        if hit:
-            elem = hit.get("_element")
-            if elem:
-                attrs = dict(hit.get("attrs") or {})
-                attrs["success_count"] = attrs.get("success_count", 1) + 1
-                try:
-                    await r.execute_command("VSETATTR", mem_store.PROC_KEY, elem, json.dumps(attrs))
-                except Exception:
-                    pass
+        try:
+            await _store_proc_now(r, req)
+        except Exception as exc:
+            # Loud, and never at the cost of the write.
+            log.error("[proc] store failed (%s) — parking it instead of dropping it",
+                      exc, exc_info=True)
+            try:
+                await _defer_proc(r, req, f"{type(exc).__name__}: {str(exc)[:120]}")
+            except Exception as exc2:
+                _proc_guard["errors"] += 1
+                log.error("[proc] UNRECOVERABLE: store failed AND defer failed: %s", exc2)
             return
-        await mem_store.save_procedure(
-            r,
-            task=req.task,
-            procedure=req.procedure,
-            embedding=emb,
-            tools_used=req.tools_used,
-            domain=req.domain or sc["domain"],
-            language=sc["language"],
-        )
-        log.info(f"[proc] stored procedure: {req.task[:60]}")
+        try:
+            await drain_proc_pending()
+        except Exception as exc:
+            log.warning("[proc] inline drain failed: %s", exc)
 
     background_tasks.add_task(_do_store_proc)
-    return {"status": "queued"}
+    try:
+        pending = int(await r.llen(PROC_PENDING_KEY) or 0)
+    except Exception:
+        pending = -1
+    return {"status": "queued", "pending": pending}
 
 
 @router.post("/tool-feedback")

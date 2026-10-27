@@ -382,7 +382,7 @@ async def compat_forget(req: ForgetRequest, request: Request):
     for f in facts:
         elem = f.get("_element", "")
         if elem:
-            await r.execute_command("VREM", mem_store.FACT_KEY, elem)
+            await mem_store.remove_element(r, mem_store.FACT_KEY, elem)
             await state.bm25_index.remove({elem})
             deleted += 1
 

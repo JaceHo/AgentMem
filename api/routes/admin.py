@@ -76,7 +76,7 @@ async def admin_delete_facts_by_content(pattern: str = "Always send a report"):
             continue
         content = attrs.get("content", "")
         if pattern.lower() in content.lower():
-            await r.execute_command("VREM", mem_store.FACT_KEY, elem_str)
+            await mem_store.remove_element(r, mem_store.FACT_KEY, elem_str)
             await state.bm25_index.remove({elem_str})
             deleted += 1
     return {"deleted": deleted, "pattern": pattern}
@@ -112,7 +112,7 @@ async def provide_feedback(req: FeedbackRequest):
 
         # Also reinforce on positive feedback (resets Ebbinghaus decay)
         if req.rating >= 4:
-            await mem_store.reinforce_fact(r, req.element_id, source=f"user_feedback_{req.rating}")
+            await mem_store.reinforce_fact(r, req.element_id, new_source=f"user_feedback_{req.rating}")
 
         new_importance = updated.get("importance", old_importance)
         log.info(f"[feedback] {action} rating {req.rating}/5 for {req.element_id}, "
@@ -158,6 +158,70 @@ async def pin_fact(element_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.post("/shadow-index/backfill")
+async def backfill_shadow_index_endpoint():
+    """Rebuild the element-ID shadow index (mem:idx:*) for every vectorset.
+
+    Redis vectorset has no enumerate command, and VSIM is an approximate HNSW
+    traversal that does not guarantee COUNT results.  On this instance
+    mem:procedures' graph has degraded so badly that a single VSIM call reaches
+    only ~13% of its elements, which silently corrupted consolidation,
+    procedure scans and BM25 population.
+
+    The shadow index is an explicit SET of element IDs maintained at write time.
+    This endpoint registers whatever is currently reachable so the index becomes
+    complete for everything written from now on, and reports how much was
+    unrecoverable.
+
+    For mem:procedures the element IDs survive in the mem:proc_by_tool:* reverse
+    index and the mem:proc_tasks hash, so a dedicated recovery pass runs first
+    and restores ~99.9% of the set instead of the ~13% VSIM alone can reach.
+    """
+    r = state.redis
+    out = {}
+    for vset in (mem_store.FACT_KEY, mem_store.EPISODE_KEY, mem_store.PROC_KEY):
+        try:
+            entry: dict = {}
+            if vset == mem_store.PROC_KEY:
+                entry["recovered"] = await mem_store.recover_procedures_from_reverse_index(r)
+            registered = await mem_store.backfill_shadow_index(r, vset)
+            card = int(await r.execute_command("VCARD", vset))
+            entry.update({
+                "registered": registered, "vcard": card,
+                "unreachable": max(0, card - registered),
+            })
+            out[vset] = entry
+        except Exception as e:
+            log.error(f"[shadow-index] backfill failed for {vset}: {e}")
+            out[vset] = {"error": str(e)}
+
+    # Rebuild the BM25 corpus now that enumeration is trustworthy.
+    from core.search import populate_bm25_from_redis
+    try:
+        await populate_bm25_from_redis(r, state.bm25_index)
+        out["bm25"] = await state.bm25_index.stats()
+    except Exception as e:
+        out["bm25"] = {"error": str(e)}
+    return {"status": "ok", "tiers": out}
+
+
+@router.get("/shadow-index/stats")
+async def shadow_index_stats():
+    """Shadow-index coverage per vectorset — diagnostics for degraded graphs."""
+    r = state.redis
+    out = {}
+    for vset in (mem_store.FACT_KEY, mem_store.EPISODE_KEY, mem_store.PROC_KEY):
+        try:
+            card = int(await r.execute_command("VCARD", vset))
+            shadow = int(await r.scard(mem_store.idx_key(vset)))
+            out[vset] = {"vcard": card, "shadow": shadow,
+                         "coverage": round(shadow / max(1, card), 4)}
+        except Exception as e:
+            out[vset] = {"error": str(e)}
+    out["bm25"] = await state.bm25_index.stats()
+    return {"status": "ok", "tiers": out}
+
+
 @router.delete("/facts/{element_id}")
 async def delete_fact(element_id: str):
     """User-initiated hard delete (immediate VREM)."""
@@ -169,7 +233,7 @@ async def delete_fact(element_id: str):
 
         content_preview = attrs.get("content", "")[:80]
 
-        await r.execute_command("VREM", mem_store.FACT_KEY, element_id)
+        await mem_store.remove_element(r, mem_store.FACT_KEY, element_id)
 
         # Incremental BM25 update instead of full reset
         await state.bm25_index.remove({element_id})
@@ -179,6 +243,32 @@ async def delete_fact(element_id: str):
 
     except Exception as e:
         log.error(f"[delete] error deleting fact: {e}")
+        from fastapi.exceptions import HTTPException
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/procedures/{element_id}")
+async def delete_procedure(element_id: str):
+    """Hard delete a procedure. remove_element also cleans mem:proc_tasks and the tool
+    reverse-index, which a bare VREM leaves dangling."""
+    r = state.redis
+    try:
+        attrs = await mem_store.get_attrs(r, mem_store.PROC_KEY, element_id)
+        if not attrs:
+            return {"status": "not_found", "element_id": element_id}
+        task_preview = (attrs.get("task") or "")[:80]
+
+        await mem_store.remove_element(r, mem_store.PROC_KEY, element_id)
+        try:
+            await state.bm25_index.remove({element_id})
+        except Exception as exc:
+            log.warning("[delete] bm25 remove failed for %s: %s", element_id, exc)
+
+        log.info("[delete] deleted procedure %s: %s", element_id, task_preview)
+        return {"status": "ok", "element_id": element_id, "action": "hard_deleted"}
+
+    except Exception as e:
+        log.error(f"[delete] error deleting procedure: {e}")
         from fastapi.exceptions import HTTPException
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -299,6 +389,20 @@ async def lifecycle_stats():
 @router.post("/crystallize")
 async def crystallize(req: CrystallizeRequest):
     """Crystallize a session — distill it into a structured digest."""
+    import json
+
     from services.consolidation_service import crystallize_session
     digest = await crystallize_session(state.redis, req.session_id, max_facts=req.max_facts)
+    # Persist like the auto-crystallization path does: recall fetches digests
+    # via mem:crystallized_index — without this the digest was computed and
+    # silently discarded, so it never surfaced in any later recall.
+    if digest and digest.get("fact_count", 0) > 0:
+        crystal_key = f"mem:crystallized:{req.session_id}"
+        digest.setdefault("crystallized_at", int(time.time() * 1000))
+        await state.redis.setex(
+            crystal_key, 90 * 86400, json.dumps(digest, ensure_ascii=False),
+        )
+        await state.redis.zadd(
+            "mem:crystallized_index", {crystal_key: digest["crystallized_at"]},
+        )
     return digest
