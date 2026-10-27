@@ -138,6 +138,24 @@ from mcp.server.fastmcp import FastMCP
 BASE_URL = os.getenv("AGENTMEMORY_URL", "http://127.0.0.1:18800").rstrip("/")
 TIMEOUT  = 12.0
 
+
+def _auth_headers() -> dict[str, str]:
+    """X-API-Key for agentmem's write-gated endpoints (S1 fix, 2026-10-24).
+
+    Env AGENTMEM_API_KEY first (launchd plists), then the shared key file —
+    the in-process mount does not necessarily inherit the .env that
+    pydantic-settings reads for the REST guard, so the file is the fallback
+    that keeps MCP tool writes (store_memory, forget_memory, ...) working.
+    """
+    key = os.getenv("AGENTMEM_API_KEY", "").strip()
+    if not key:
+        try:
+            with open(os.path.expanduser("~/.agentmem_api_key")) as f:
+                key = f.read().strip()
+        except OSError:
+            key = ""
+    return {"X-API-Key": key} if key else {}
+
 mcp = FastMCP(
     "agentmem",
     json_response=True,
@@ -186,21 +204,21 @@ async def close_client() -> None:
 
 async def _post(path: str, payload: dict) -> dict:
     client = await _get_client()
-    resp = await client.post(f"{BASE_URL}{path}", json=payload)
+    resp = await client.post(f"{BASE_URL}{path}", json=payload, headers=_auth_headers())
     resp.raise_for_status()
     return resp.json()
 
 
 async def _get(path: str, params: dict | None = None) -> dict:
     client = await _get_client()
-    resp = await client.get(f"{BASE_URL}{path}", params=params or {})
+    resp = await client.get(f"{BASE_URL}{path}", params=params or {}, headers=_auth_headers())
     resp.raise_for_status()
     return resp.json()
 
 
 async def _delete(path: str) -> dict:
     client = await _get_client()
-    resp = await client.delete(f"{BASE_URL}{path}")
+    resp = await client.delete(f"{BASE_URL}{path}", headers=_auth_headers())
     resp.raise_for_status()
     return resp.json()
 

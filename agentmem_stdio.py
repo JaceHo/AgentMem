@@ -22,11 +22,28 @@ MCP_URL = os.getenv("AGENTMEMORY_MCP_URL", "http://127.0.0.1:18800/mcp").rstrip(
 _session_id = ""
 
 
+def _auth_headers() -> dict[str, str]:
+    """X-API-Key forwarded to the gated /mcp endpoint (S1 fix, 2026-10-24).
+
+    MCP JSON-RPC POSTs are gated like any other mutating method; the stdio
+    client must present the key. Env first, then the shared key file.
+    """
+    key = os.getenv("AGENTMEM_API_KEY", "").strip()
+    if not key:
+        try:
+            with open(os.path.expanduser("~/.agentmem_api_key")) as f:
+                key = f.read().strip()
+        except OSError:
+            key = ""
+    return {"X-API-Key": key} if key else {}
+
+
 def _post(body: dict) -> dict:
     global _session_id
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream",
+        **_auth_headers(),
     }
     if _session_id:
         headers["mcp-session-id"] = _session_id

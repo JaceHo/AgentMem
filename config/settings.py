@@ -183,6 +183,20 @@ class Settings(BaseSettings):
         default=5.0,
         description="Timeout for task shutdown in seconds"
     )
+    recall_concurrency: int = Field(
+        default=8,
+        description=(
+            "Max concurrent embedding operations in the recall path. "
+            "Embeddings run on a dedicated, bounded thread pool (separate "
+            "from the default pool used by BM25 rebuilds) so the single-"
+            "process server — which holds in-process BM25 index and "
+            "TaskManager state that multi-worker would shard — can serve "
+            "many concurrent recalls without saturating. Raise this to "
+            "increase the recall concurrency ceiling (set via "
+            "AGENTMEM_RECALL_CONCURRENCY)."
+        ),
+        json_schema_extra={"env": "AGENTMEM_RECALL_CONCURRENCY"}
+    )
     
     # ── Trivial Message Filter ─────────────────────────────────────────────
     trivial_min_chars: int = Field(

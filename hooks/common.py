@@ -18,7 +18,6 @@ except ImportError:
     sys.exit(0)
 
 REST_URL = os.getenv("AGENTMEMORY_URL", "http://localhost:18800")
-SECRET = os.getenv("AGENTMEMORY_SECRET", "")
 
 # Module-level sync client — reused within a single hook invocation.
 # Each hook script is a separate process, so this doesn't leak across runs.
@@ -37,8 +36,18 @@ def _get_client() -> httpx.Client:
 
 def _auth_headers() -> dict[str, str]:
     headers = {"Content-Type": "application/json"}
-    if SECRET:
-        headers["Authorization"] = f"Bearer {SECRET}"
+    # agentmem gates every mutating method behind an API key (S1 fix, 2026-10-24).
+    # X-API-Key is the contract; env AGENTMEM_API_KEY first, then the shared
+    # key file (the hook process may not inherit the service's .env).
+    key = os.getenv("AGENTMEM_API_KEY", "").strip()
+    if not key:
+        try:
+            with open(os.path.expanduser("~/.agentmem_api_key")) as f:
+                key = f.read().strip()
+        except OSError:
+            key = ""
+    if key:
+        headers["X-API-Key"] = key
     return headers
 
 

@@ -16,6 +16,17 @@ try:
 except Exception:
     pass
 
+def api_headers():
+    # agentmem gates every mutating method behind an API key (S1 fix, 2026-10-24).
+    # /register-tools is a write, so it needs the key; reads stay open.
+    h = {"Content-Type": "application/json"}
+    try:
+        with open(os.path.expanduser("~/.agentmem_api_key")) as f:
+            h["X-API-Key"] = f.read().strip()
+    except OSError:
+        pass
+    return h
+
 # ── 1. Known Claude Code built-in tools ──────────────────────────────────────
 BUILTIN_TOOLS = [
     {"name": "Bash",            "description": "Execute shell commands in the user's environment",                          "category": "system",        "source": "builtin", "parameters": ["command"]},
@@ -111,7 +122,7 @@ payload = json.dumps({"tools": all_tools, "agent_id": session_id}).encode()
 req = urllib.request.Request(
     "http://localhost:18800/register-tools",
     data=payload,
-    headers={"Content-Type": "application/json"},
+    headers=api_headers(),
     method="POST",
 )
 try:

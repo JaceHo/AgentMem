@@ -5,6 +5,16 @@ import json, subprocess, os, platform, urllib.request
 def sh(cmd):
     try: return subprocess.check_output(cmd, shell=True, text=True, stderr=subprocess.DEVNULL).strip()
     except: return ""
+def api_headers():
+    # agentmem gates every mutating method behind an API key (S1 fix, 2026-10-24).
+    # /register-env is a write, so it needs the key; reads stay open.
+    h = {"Content-Type": "application/json"}
+    try:
+        with open(os.path.expanduser("~/.agentmem_api_key")) as f:
+            h["X-API-Key"] = f.read().strip()
+    except OSError:
+        pass
+    return h
 env = {
     "os": platform.system(),
     "os_version": platform.mac_ver()[0] or platform.version(),
@@ -17,7 +27,7 @@ env = {
 }
 payload = json.dumps(env).encode()
 req = urllib.request.Request("http://localhost:18800/register-env",
-    data=payload, headers={"Content-Type": "application/json"}, method="POST")
+    data=payload, headers=api_headers(), method="POST")
 try: urllib.request.urlopen(req, timeout=3)
 except: pass
 PYEOF

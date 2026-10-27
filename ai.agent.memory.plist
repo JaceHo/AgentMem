@@ -53,12 +53,23 @@
     <!-- uv: reuse existing venv/ instead of creating .venv — avoids re-install on kickstart -->
     <key>UV_PROJECT_ENVIRONMENT</key>
     <string>/Users/jace/code/agentmem/venv</string>
-    <!-- Preserve the existing 768-dimensional nomic-embed-text index by
-         routing embeddings through the local AIServ gateway. -->
+    <!-- Embedding width is MEASURED at boot (core/embedder.py `_measure_provider`),
+         never taken from a declared value: names below are hints for the loader, and
+         core/dim_guard.py fails the boot if the measured width disagrees with any
+         vectorset. This block used to say openai/nomic/768 while the live sets were
+         built at 1024, which made every write fail under a 200 {"status":"queued"}.
+         Keep this file equal to ~/Library/LaunchAgents/ai.agent.memory.plist — a
+         restore from git must not resurrect a width the index cannot hold. -->
     <key>EMBEDDING_PROVIDER</key>
-    <string>openai</string>
+    <string>local</string>
+    <key>EMBEDDING_MODEL</key>
+    <string>/Users/jace/.cache/models/qwen3-embedding-0.6b</string>
     <key>EMBEDDING_DIMS</key>
-    <string>768</string>
+    <string>1024</string>
+    <key>EMBEDDING_DEVICE</key>
+    <string>mps</string>
+    <key>EMBEDDING_BATCH</key>
+    <string>8</string>
     <key>OPENAI_API_KEY</key>
     <string>sk-aiserv-local-dev</string>
     <key>OPENAI_BASE_URL</key>

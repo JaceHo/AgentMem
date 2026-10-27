@@ -15,9 +15,19 @@ print(d.get('transcript_path', ''))
 " "$INPUT" 2>/dev/null || echo "")
 if [ -z "$TRANSCRIPT" ] || [ ! -f "$TRANSCRIPT" ]; then exit 0; fi
 python3 - "$SESSION" "$TRANSCRIPT" << 'PYEOF'
-import json, sys, urllib.request
+import json, os, sys, urllib.request
 session_id = sys.argv[1]
 transcript_path = sys.argv[2]
+def api_headers():
+    # agentmem gates every mutating method behind an API key (S1 fix, 2026-10-24).
+    # All five calls below are writes; reads stay open.
+    h = {"Content-Type": "application/json"}
+    try:
+        with open(os.path.expanduser("~/.agentmem_api_key")) as f:
+            h["X-API-Key"] = f.read().strip()
+    except OSError:
+        pass
+    return h
 messages = []
 tool_sequence = []  # AutoTool TIG: ordered tool names used in session
 with open(transcript_path) as f:
@@ -47,33 +57,33 @@ messages = messages[-50:]
 # 1. Store messages → long-term memory
 payload = json.dumps({"messages": messages, "session_id": session_id}).encode()
 req = urllib.request.Request("http://localhost:18800/store",
-    data=payload, headers={"Content-Type": "application/json"}, method="POST")
+    data=payload, headers=api_headers(), method="POST")
 try: urllib.request.urlopen(req, timeout=3)
 except: pass
 # 2. Compact Tier 1 KV before promotion (parity with OpenClaw plugin agent_end)
 if session_id:
     req_compact = urllib.request.Request("http://localhost:18800/session/compact",
         data=json.dumps({"session_id": session_id, "threshold_chars": 3000}).encode(),
-        headers={"Content-Type": "application/json"}, method="POST")
+        headers=api_headers(), method="POST")
     try: urllib.request.urlopen(req_compact, timeout=2)
     except: pass
 # 3. Promote session Tier 1 → Tier 2
 req2 = urllib.request.Request("http://localhost:18800/session/compress",
     data=json.dumps({"session_id": session_id, "wait": False}).encode(),
-    headers={"Content-Type": "application/json"}, method="POST")
+    headers=api_headers(), method="POST")
 try: urllib.request.urlopen(req2, timeout=2)
 except: pass
 # 4. Record tool sequence into TIG (AutoTool, v0.9.5)
 if len(tool_sequence) >= 2:
     req3 = urllib.request.Request("http://localhost:18800/record-tool-sequence",
         data=json.dumps({"sequence": tool_sequence, "session_id": session_id}).encode(),
-        headers={"Content-Type": "application/json"}, method="POST")
+        headers=api_headers(), method="POST")
     try: urllib.request.urlopen(req3, timeout=2)
     except: pass
     # 5. AWO meta-tool detection: synthesize composite procedures from TIG chains.
     #    Skipped when the chain set is unchanged, and exact-task dedup blocks dupes.
     req4 = urllib.request.Request("http://localhost:18800/tool-graph/detect-meta-tools?threshold=5",
-        data=b"{}", headers={"Content-Type": "application/json"}, method="POST")
+        data=b"{}", headers=api_headers(), method="POST")
     try: urllib.request.urlopen(req4, timeout=3)
     except: pass
 PYEOF
