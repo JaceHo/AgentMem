@@ -7,7 +7,25 @@ wrappers around these three methods: recall, store, compress_session.
 
 from __future__ import annotations
 
+import os
+
 import httpx
+
+
+def _default_api_key() -> str:
+    """agentmem write endpoints are API-key gated (S1 fix, 2026-10-24).
+
+    Env AGENTMEM_API_KEY first, then the shared key file, so SDK users get
+    writes for free on this machine without passing anything.
+    """
+    key = os.getenv("AGENTMEM_API_KEY", "").strip()
+    if key:
+        return key
+    try:
+        with open(os.path.expanduser("~/.agentmem_api_key")) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
 
 
 class MemoryClient:
@@ -19,6 +37,8 @@ class MemoryClient:
         session_id: Identifier that groups conversation turns into a session.
                     Pass the same value for every turn in one conversation.
         timeout:    HTTP timeout in seconds.
+        api_key:    API key for write endpoints (default: resolved from
+                    AGENTMEM_API_KEY / ~/.agentmem_api_key).
     """
 
     def __init__(
@@ -26,10 +46,15 @@ class MemoryClient:
         base_url: str = "http://127.0.0.1:18800",
         session_id: str = "",
         timeout: float = 5.0,
+        api_key: str = "",
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.session_id = session_id
         self.timeout = timeout
+        self.api_key = api_key or _default_api_key()
+
+    def _headers(self) -> dict[str, str]:
+        return {"X-API-Key": self.api_key} if self.api_key else {}
 
     async def recall(self, query: str, **kwargs) -> str | None:
         """
@@ -59,7 +84,7 @@ class MemoryClient:
             **kwargs,
         }
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            resp = await client.post(f"{self.base_url}/store", json=payload)
+            resp = await client.post(f"{self.base_url}/store", json=payload, headers=self._headers())
             resp.raise_for_status()
 
     async def store_text(self, text: str, role: str = "user") -> None:
@@ -75,6 +100,6 @@ class MemoryClient:
         """
         payload = {"session_id": self.session_id, "wait": True}
         async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(f"{self.base_url}/session/compress", json=payload)
+            resp = await client.post(f"{self.base_url}/session/compress", json=payload, headers=self._headers())
             resp.raise_for_status()
             return resp.json()

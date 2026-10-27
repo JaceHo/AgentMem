@@ -44,6 +44,16 @@ async def stats():
         proc_card = await r.execute_command("VCARD", state.mem_store.PROC_KEY)
         counts["procedures"] = max(0, int(proc_card or 0) - 1)
 
+        # Deferred-by-outage writes are only "not lost" if the backlog is observable: a queue
+        # nobody reads is the same silence that hid the dropped stores for 2 days.
+        try:
+            from api.routes import capability as _cap
+            counts["procedures_pending"] = int(await r.llen(_cap.PROC_PENDING_KEY) or 0)
+            counts["proc_guard"] = _cap.proc_guard_stats()
+        except Exception as exc:
+            counts["procedures_pending"] = -1
+            counts["proc_guard"] = {"error": str(exc)[:80]}
+
         env_raw = await r.hgetall(state.cap_mod.ENV_KEY)
         counts["env_fields"] = len(env_raw)
 
@@ -61,6 +71,12 @@ async def stats():
             "success_rate": round(w_successes / completed, 3) if completed > 0 else None,
             "avg_ms": round(w_latency / w_attempts) if w_attempts > 0 else None,
         }
+
+        # Heat-bump observability. ``missing`` > 0 means bumps are being keyed on
+        # element names that do not exist (the bytes-repr regression that left
+        # access_count at 0 on every fact); this is the counter that makes a
+        # silent no-op impossible to miss a second time.
+        counts["heat"] = state.heat_mod.stats_snapshot()
 
         return counts
     except Exception as e:
