@@ -135,8 +135,9 @@ async def recall_procedures(req: RecallProceduresRequest):
     blob = emb.astype("float32").tobytes()
     cmd = ["VSIM", mem_store.PROC_KEY, "FP32", blob,
            "COUNT", req.k + 1, "WITHSCORES", "WITHATTRIBS"]
-    if not scope.is_global:
-        cmd += ["FILTER", scope.filter()]
+    # No VSIM FILTER here: procedures are usually written without a track, and filtering them by
+    # `.user_id` made the whole tier unreachable for scoped callers (`Scope.sees`). Post-filter in
+    # Python so unowned rows stay visible and owned rows do not cross tracks.
     try:
         results = await r.execute_command(*cmd)
     except Exception:
@@ -155,6 +156,8 @@ async def recall_procedures(req: RecallProceduresRequest):
         except Exception:
             continue
         if attrs.get("_seed") or not attrs.get("task"):
+            continue
+        if not scope.sees(attrs.get("user_id") or attrs.get("agent_id")):
             continue
         procs.append({
             "task":          attrs.get("task", ""),

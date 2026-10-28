@@ -2122,8 +2122,9 @@ async def recall(req: RecallRequest):
         # Fetch more than needed so Beta reranking can reorder
         cmd  = ["VSIM", mem_store.PROC_KEY, "FP32", blob,
                 "COUNT", max(k * 3, 6), "WITHSCORES", "WITHATTRIBS"]
-        if scope_filter:
-            cmd += ["FILTER", scope_filter]
+        # No track FILTER: `/store-procedure` writes the shared how-to tier without an owner
+        # attribute, so filtering here hid every procedure from any caller that names a track
+        # (measured 2026-10-28). `Scope.sees` post-filters instead: unowned = shared, owned = own track.
         try:
             results = await _get_redis().execute_command(*cmd)
         except Exception:
@@ -2141,6 +2142,8 @@ async def recall(req: RecallRequest):
             except Exception:
                 continue
             if attrs.get("_seed") or not attrs.get("task"):
+                continue
+            if not scope.sees(attrs.get("user_id") or attrs.get("agent_id")):
                 continue
             cosine = float(score) if score else 0.0
             # MACLA Beta posterior: E[Beta(α,β)] = α/(α+β) with α=success+1, β=fail+1

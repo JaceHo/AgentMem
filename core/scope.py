@@ -71,6 +71,19 @@ class Scope:
             return {"agent_id": self.agent_id}
         return {}
 
+    def sees(self, owner: str | None) -> bool:
+        """May this track read a row written by ``owner`` (``None``/"" = no owner)?
+
+        The procedural tier is written by the documented protocol path (`/store-procedure` with no
+        track, because a how-to belongs to the mesh and not to one lane), so a strict track filter
+        hid **all 51 stored procedures** from every scoped reader — measured 2026-10-28:
+        `recall-procedures k=50` returns 51 rows unscoped and **0** with `user_id=jace` or
+        `agent_id=raven`. Unowned rows are therefore shared; owned rows stay on their own track.
+        """
+        if self.is_global or not owner:
+            return True
+        return owner in (self.user_id, self.agent_id)
+
     def filter(self) -> str:
         """The VSIM FILTER clause selecting this track, or ``""``."""
         if self.user_id:
