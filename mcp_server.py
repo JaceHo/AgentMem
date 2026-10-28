@@ -66,7 +66,7 @@ Knowledge CRUD (5):
 
 Search & Retrieval (4):
   search_memory        — compact vector search across facts + episodes
-  smart_search         — wRRF fused multi-tier search with scores
+  smart_search         — RRF fused multi-tier search with scores
   timeline             — chronological episode retrieval
   answer_from_memory   — LLM-extract a concise answer from recalled context
 
@@ -613,7 +613,7 @@ async def smart_search(
     limit: int = 10,
 ) -> str:
     """
-    wRRF-fused search across facts + episodes with per-result scores.
+    RRF-fused search across facts + episodes with per-result scores.
     Combines BM25 keyword and vector similarity for higher precision.
     Use when you want ranked results with explicit relevance scores.
     """

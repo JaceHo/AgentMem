@@ -32,7 +32,8 @@ Features (v1.1.0 — Refactored with atomic counters + centralized config):
  16. Auto-consolidation        — counter-triggered (every 50 stores) + hourly timer (v0.9.0)
  17. A-MAC admission gate      — 5-factor gate: semantic_novelty + entity_novelty +
                                  factual_confidence + temporal_signal + content_type_prior (v0.9.2)
- 18. Dynamic weighted RRF      — per-query-type wRRF weights: entity/temporal/semantic (v0.9.2)
+ 18. Equal-weight RRF fusion   — hand-tuned per-query-type wRRF presets removed after a
+                                 7-scenario sweep lost nDCG@10 in 6/7 scenarios (v1.1)
  19. Category importance floors — 15-tier floor map; identity/rule pinned ≥0.80 (v0.9.2)
  20. Episode type taxonomy    — 8-type classification per claude-mem: bugfix|feature|
                                  discovery|decision|change|procedure|preference|context (v0.9.3)
@@ -49,7 +50,7 @@ Features (v1.1.0 — Refactored with atomic counters + centralized config):
  26. Semantic triple extraction — Memori-style (s,p,o) triples extracted alongside
                                  lossless facts; triple_str stored for BM25 coverage (v1.1)
  27. Real BM25 hybrid search  — rank_bm25 BM25Okapi over in-memory fact corpus;
-                                 4th wRRF input alongside vector/symbolic/global (v1.1)
+                                 4th RRF input alongside vector/symbolic/global (v1.1)
  28. A-MEM memory evolution   — near-duplicate facts (cos 0.80-0.95) trigger async
                                  keyword/topic enrichment on existing fact (v1.1)
  29. Dual-layer fact linking  — source_episode_id links each fact to source episode
@@ -1111,17 +1112,13 @@ def _rrf_merge(
     limit: int = 20,
 ) -> list[dict]:
     """
-    Dynamic Weighted Reciprocal Rank Fusion.
-
-    Standard RRF (Cormack et al., SIGIR 2009):
+    Reciprocal Rank Fusion (Cormack et al., SIGIR 2009):
       RRF(d) = Σ_i  w_i / (k + rank_i(d))   k=60 smoothing constant
 
-    Weights are query-type adaptive (arXiv:2511.18194 wRRF for agents):
-      - Default equal weights [1.0, 1.0, 1.0] for [scene, global, symbolic]
-      - Caller passes adjusted weights based on query type
-      - Entity/person queries: [0.8, 0.8, 1.4] → upweight symbolic pass
-      - Temporal queries: [0.9, 0.9, 1.2] → upweight symbolic (has timestamps)
-      - Semantic/general: [1.0, 1.0, 0.6] → downweight symbolic if no entities
+    Accepts per-list weights, but production callers pass equal weights
+    ([1.0, 1.0, 1.0, 1.0]).  The hand-tuned per-query-type wRRF presets that
+    used to be documented here lost nDCG@10 in 6 of 7 scenarios of a held-out
+    sweep (worst -12.6%) and were removed — see docs/EVEROS_ASSESSMENT.md §4.1.
     """
     if weights is None:
         weights = [1.0] * len(lists)
