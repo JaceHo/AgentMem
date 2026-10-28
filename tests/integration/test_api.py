@@ -414,3 +414,124 @@ class TestIntegrationPerformance:
 
         result = benchmark(cycle)
         assert result == 200
+
+
+class TestScopeIsolation:
+    """A track id on a write and on a read must name the same, exclusive corpus."""
+
+    def _remember(self, client, content: str, **ids):
+        response = client.post("/remember", json={"content": content, **ids})
+        assert response.status_code == 200, response.text
+        return response.json()["id"]
+
+    def _recall(self, client, query: str, **ids):
+        response = client.post("/recall", json={
+            "query": query,
+            "memory_limit_number": 10,
+            **ids,
+        })
+        assert response.status_code == 200, response.text
+        # Empty result is the isolation working: the server sends a null context.
+        return response.json().get("prependContext") or ""
+
+    def test_facts_stay_inside_their_track(self, client):
+        stamp = str(int(time.time() * 1000))
+        alice_token = f"alice-{stamp}-zephyrine"
+        bob_token = f"bob-{stamp}-quokka"
+
+        self._remember(client, f"alice keeps the {alice_token} ledger", user_id="alice")
+        self._remember(client, f"bob keeps the {bob_token} ledger", user_id="bob")
+
+        alice_view = self._recall(client, alice_token, user_id="alice")
+        assert alice_token in alice_view
+        assert bob_token not in alice_view
+
+        bob_view = self._recall(client, bob_token, user_id="bob")
+        assert bob_token in bob_view
+        assert alice_token not in bob_view
+
+    def test_unscoped_caller_still_sees_scoped_rows(self, client):
+        stamp = str(int(time.time() * 1000))
+        token = f"scoped-{stamp}-narwhal"
+        self._remember(client, f"carol keeps the {token} ledger", user_id="carol")
+
+        assert token in self._recall(client, token)
+
+    def test_agent_track_is_separate_from_user_track(self, client):
+        stamp = str(int(time.time() * 1000))
+        agent_token = f"agent-{stamp}-pangolin"
+        self._remember(client, f"the agent notes {agent_token}", agent_id="raven-code")
+
+        assert agent_token in self._recall(client, agent_token, agent_id="raven-code")
+        assert agent_token not in self._recall(client, agent_token, user_id="alice")
+        assert agent_token not in self._recall(client, agent_token, agent_id="other-agent")
+
+    def test_both_ids_and_bad_ids_are_rejected(self, client):
+        for body in (
+            {"content": "x", "user_id": "alice", "agent_id": "raven-code"},
+            {"content": 'x', "user_id": 'bad"id'},
+        ):
+            response = client.post("/remember", json=body)
+            assert response.status_code == 422, response.text
+
+        response = client.post("/recall", json={
+            "query": "x", "user_id": "alice", "agent_id": "raven-code",
+        })
+        assert response.status_code == 422, response.text
+
+    def test_procedures_follow_the_agent_track(self, client):
+        stamp = str(int(time.time() * 1000))
+        marker = f"proc-{stamp}-axolotl"
+        task = f"{marker} rebuild the gateway config"
+
+        response = client.post("/store-procedure", json={
+            "task": task,
+            "procedure": f"1. read {marker}\n2. restart",
+            "agent_id": "scope-test-agent",
+        })
+        assert response.status_code == 200, response.text
+
+        def _tasks(**ids):
+            r = client.post("/recall-procedures", json={
+                "query": marker, "k": 5, **ids,
+            })
+            assert r.status_code == 200, r.text
+            return [p["task"] for p in r.json()["procedures"]]
+
+        for _ in range(20):
+            if any(marker in t for t in _tasks(agent_id="scope-test-agent")):
+                break
+            time.sleep(0.2)
+
+        assert any(marker in t for t in _tasks(agent_id="scope-test-agent"))
+        assert not any(marker in t for t in _tasks(agent_id="other-agent"))
+        assert not any(marker in t for t in _tasks(user_id="alice"))
+
+    def test_compressed_session_lands_in_its_track(self, client):
+        stamp = str(int(time.time() * 1000))
+        token = f"walrusprotocol{stamp}"
+        session_id = f"scope-compress-{stamp}"
+
+        client.post("/store", json={
+            "session_id": session_id,
+            "user_id": "jace",
+            "messages": [
+                {"role": "user", "content": f"remember that jace ships the {token} deploy on fridays"},
+                {"role": "assistant", "content": f"noted: {token} deploys are fridays"},
+            ],
+        })
+
+        for _ in range(40):
+            state = client.get(f"/session/{session_id}").json()
+            if state.get("length", 0) >= 80:
+                break
+            time.sleep(0.2)
+        assert client.get(f"/session/{session_id}").json()["length"] >= 80
+
+        result = client.post("/session/compress", json={
+            "session_id": session_id, "wait": True,
+        }).json()
+        assert result.get("status") == "ok", result
+
+        assert token in self._recall(client, token, user_id="jace")
+        assert token not in self._recall(client, token, user_id="bob")

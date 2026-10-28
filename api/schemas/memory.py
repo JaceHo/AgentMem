@@ -12,6 +12,11 @@ _STORE_MESSAGE_CAP = 50
 class RecallRequest(BaseModel):
     query: str
     session_id: str = ""
+    # Track ids (EverOS dual-track parity). Exactly one, or neither for the
+    # unscoped corpus. See core.scope for why a scoped read never widens to
+    # the global one.
+    user_id: str = ""
+    agent_id: str = ""
     memory_limit_number: int = 12
     include_tools: bool = True
     include_procedures: bool = False
@@ -34,6 +39,11 @@ class StoreRequest(BaseModel):
     messages: list[Message] = Field(max_length=_STORE_MESSAGE_CAP)
     session_id: str = ""
     metadata: dict[str, Any] | None = None
+    # Track ids. The MemoryBackend contract carries them per-call in a trace
+    # write's metadata; this is the same two ids, spelled as the fields the
+    # recall side already takes.
+    user_id: str = ""
+    agent_id: str = ""
 
     @field_validator("messages", mode="before")
     @classmethod

@@ -21,6 +21,7 @@ from api.schemas.compat import (
 from core import embedder
 from core import persona as persona_mod
 from core import store as mem_store
+from core.scope import BadScope, scope_of, strict_scope
 from core.search import encode
 from core.utils import decode_bytes, decode_attrs
 from services.store_service import (
@@ -29,6 +30,20 @@ from services.store_service import (
 
 log = logging.getLogger("mem")
 router = APIRouter(tags=["compat"])
+
+_PINNED_KEY = "mem:pinned:session_summary"
+
+
+def _scope_or_422(user_id: str = "", agent_id: str = ""):
+    try:
+        return strict_scope(user_id, agent_id)
+    except BadScope as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+def _pinned_key(scope) -> str:
+    """Handoff pin per track; the global one is the legacy, unscoped lane."""
+    return _PINNED_KEY + ("" if scope.is_global else ":" + scope.track_suffix())
 
 
 @router.post("/session/start")
@@ -47,9 +62,10 @@ async def compat_session_start(req: CompatSessionStartRequest, request: Request)
         "observations": 0,
     }), ex=14400)
 
-    persona_ctx = await persona_mod.get_context(r)
+    scope = _scope_or_422(req.user_id, req.agent_id)
+    persona_ctx = await persona_mod.get_context(r, key=scope.persona_key())
 
-    pinned_raw = await r.get("mem:pinned:session_summary")
+    pinned_raw = await r.get(_pinned_key(scope))
     last_summary = decode_bytes(pinned_raw)
 
     context_parts = []
@@ -153,19 +169,29 @@ async def compat_context(req: ContextRequest, request: Request):
     sid = _compat_sid(req)
     query = req.query or ""
     budget = req.token_budget or 1500
+    scope = _scope_or_422(req.user_id, req.agent_id)
 
-    persona_ctx = await persona_mod.get_context(r)
+    persona_ctx = await persona_mod.get_context(r, key=scope.persona_key())
     session_ctx = await mem_store.get_session_context(r, sid)
+    if not scope.is_global and session_ctx and sid:
+        owner = await mem_store.get_session_owner(r, sid)
+        if (owner.user_id and owner.user_id != scope.user_id) or (
+            owner.agent_id and owner.agent_id != scope.agent_id
+        ):
+            session_ctx = None
 
-    pinned_raw = await r.get("mem:pinned:session_summary")
+    pinned_raw = await r.get(_pinned_key(scope))
     last_summary = decode_bytes(pinned_raw)
 
     facts = []
     episodes = []
     if query:
         emb = encode(query)
-        facts = await mem_store.knn_search(r, mem_store.FACT_KEY, emb, k=8)
-        episodes = await mem_store.knn_search(r, mem_store.EPISODE_KEY, emb, k=6)
+        scope_filter = scope.filter() or None
+        facts = await mem_store.knn_search(r, mem_store.FACT_KEY, emb, k=8,
+                                           filter_expr=scope_filter)
+        episodes = await mem_store.knn_search(r, mem_store.EPISODE_KEY, emb, k=6,
+                                              filter_expr=scope_filter)
 
     prepend = format_prepend(
         facts=facts, episodes=episodes,
@@ -305,14 +331,27 @@ async def compat_search(req: SearchRequest, request: Request):
     r = state.redis
     sid = _compat_sid(req)
     emb = encode(req.query)
+    try:
+        scope = strict_scope(req.user_id, req.agent_id)
+    except BadScope as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    scope_filter = scope.filter() or None
 
-    facts = await mem_store.knn_search(r, mem_store.FACT_KEY, emb, k=req.limit)
-    episodes = await mem_store.knn_search(r, mem_store.EPISODE_KEY, emb, k=req.limit)
+    facts = await mem_store.knn_search(r, mem_store.FACT_KEY, emb, k=req.limit,
+                                       filter_expr=scope_filter)
+    episodes = await mem_store.knn_search(r, mem_store.EPISODE_KEY, emb, k=req.limit,
+                                          filter_expr=scope_filter)
 
-    persona_ctx = await persona_mod.get_context(r)
+    persona_ctx = await persona_mod.get_context(r, key=scope.persona_key())
     session_ctx = await mem_store.get_session_context(r, sid)
+    if not scope.is_global and session_ctx and sid:
+        owner = await mem_store.get_session_owner(r, sid)
+        if (owner.user_id and owner.user_id != scope.user_id) or (
+            owner.agent_id and owner.agent_id != scope.agent_id
+        ):
+            session_ctx = None
 
-    pinned_raw = await r.get("mem:pinned:session_summary")
+    pinned_raw = await r.get(_pinned_key(scope))
     last_summary = decode_bytes(pinned_raw)
 
     budget = req.token_budget or 1500
@@ -350,6 +389,10 @@ async def compat_remember(req: RememberRequest, request: Request):
     r = state.redis
     content = req.content
     emb = encode(content)
+    try:
+        scope = strict_scope(req.user_id, req.agent_id)
+    except BadScope as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     uid = await mem_store.save_fact(
         r,
@@ -359,6 +402,8 @@ async def compat_remember(req: RememberRequest, request: Request):
         embedding=emb,
         keywords=[c.strip() for c in req.concepts.split(",") if c.strip()] if req.concepts else None,
         importance=0.8,
+        user_id=scope.user_id,
+        agent_id=scope.agent_id,
     )
     return {"status": "ok", "id": uid}
 
@@ -369,7 +414,14 @@ async def compat_forget(req: ForgetRequest, request: Request):
 
     r = state.redis
     emb = encode(req.query)
-    facts = await mem_store.knn_search(r, mem_store.FACT_KEY, emb, k=req.limit)
+    try:
+        scope = strict_scope(req.user_id, req.agent_id)
+    except BadScope as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    # Forgetting is scoped like reading: a delete that matched another track's
+    # fact would be a write into someone else's memory.
+    facts = await mem_store.knn_search(r, mem_store.FACT_KEY, emb, k=req.limit,
+                                       filter_expr=scope.filter() or None)
 
     if req.dry_run:
         return {
@@ -610,11 +662,12 @@ async def compat_timeline(req: TimelineRequest, request: Request):
 
 
 @router.get("/profile")
-async def compat_profile():
+async def compat_profile(user_id: str = "", agent_id: str = ""):
     r = state.redis
     if r is None:
         return {"profile": {}}
-    persona_raw = await r.hgetall("mem:persona")
+    scope = _scope_or_422(user_id, agent_id)
+    persona_raw = await r.hgetall(scope.persona_key())
     fields = {
         decode_bytes(k): decode_bytes(v)
         for k, v in persona_raw.items()
@@ -659,18 +712,26 @@ async def compat_import(req: ImportRequest, request: Request):
     r = state.redis
     data = req.data
     imported = 0
+    try:
+        default = strict_scope(req.user_id, req.agent_id)
+    except BadScope as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     for item in data.get("episodes", []):
         content = item.get("content", "")
         if not content:
             continue
         emb = encode(content)
+        row = scope_of(item.get("user_id") or default.user_id,
+                       item.get("agent_id") or default.agent_id)
         await mem_store.save_episode(
             r,
             session_id=item.get("session_id", ""),
             content=content,
             embedding=emb,
             ep_type=item.get("ep_type", item.get("category", "general")),
+            user_id=row.user_id,
+            agent_id=row.agent_id,
         )
         imported += 1
 
@@ -679,6 +740,8 @@ async def compat_import(req: ImportRequest, request: Request):
         if not content:
             continue
         emb = encode(content)
+        row = scope_of(item.get("user_id") or default.user_id,
+                       item.get("agent_id") or default.agent_id)
         await mem_store.save_fact(
             r,
             content=content,
@@ -689,6 +752,8 @@ async def compat_import(req: ImportRequest, request: Request):
             domain=item.get("domain", "general"),
             keywords=item.get("keywords"),
             importance=item.get("importance", 0.5),
+            user_id=row.user_id,
+            agent_id=row.agent_id,
         )
         imported += 1
 

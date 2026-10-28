@@ -10,7 +10,7 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException
 
 from api import state
 from api.schemas.capability import (
-    RegisterToolsRequest, EnvState, RecallToolsRequest,
+    RegisterToolsRequest, EnvState, RecallToolsRequest, RecallProceduresRequest,
     StoreProcedureRequest, ToolFeedbackRequest, ToolSequenceRequest,
     ProcedureFeedbackRequest,
 )
@@ -19,6 +19,7 @@ from core import embedder as embed_mod
 from core import persona as persona_mod
 from core import scene as scene_mod
 from core import store as mem_store
+from core.scope import BadScope, strict_scope
 from core.search import async_encode, encode
 from core.utils import decode_attrs, decode_bytes
 
@@ -122,14 +123,20 @@ async def get_capabilities():
 
 
 @router.post("/recall-procedures")
-async def recall_procedures(req: RecallToolsRequest):
+async def recall_procedures(req: RecallProceduresRequest):
     """Semantic search over procedural memory (4th cognitive tier)."""
     t0 = time.time()
     r = state.redis
+    try:
+        scope = strict_scope(req.user_id, req.agent_id)
+    except BadScope as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     emb = encode(req.query)
     blob = emb.astype("float32").tobytes()
     cmd = ["VSIM", mem_store.PROC_KEY, "FP32", blob,
            "COUNT", req.k + 1, "WITHSCORES", "WITHATTRIBS"]
+    if not scope.is_global:
+        cmd += ["FILTER", scope.filter()]
     try:
         results = await r.execute_command(*cmd)
     except Exception:
@@ -177,7 +184,9 @@ def proc_guard_stats() -> dict:
 def _proc_payload(req: "StoreProcedureRequest") -> str:
     return json.dumps({"task": req.task, "procedure": req.procedure,
                        "tools_used": list(req.tools_used or []), "domain": req.domain,
-                       "session_id": req.session_id}, ensure_ascii=False)
+                       "session_id": req.session_id,
+                       "user_id": req.user_id, "agent_id": req.agent_id},
+                      ensure_ascii=False)
 
 
 async def _defer_proc(r, req, reason: str) -> int:
@@ -188,14 +197,17 @@ async def _defer_proc(r, req, reason: str) -> int:
     return n
 
 
-async def _store_proc_now(r, req) -> str:
+async def _store_proc_now(r, req, scope=None) -> str:
     """Embed + persist one procedure. Raises if the embedder is down — callers must handle it."""
+    if scope is None:
+        scope = strict_scope(req.user_id, req.agent_id)
     emb = encode(req.task)
     sc = scene_mod.detect(req.task)
-    hit = await mem_store.find_procedure_by_task(r, emb, req.task)
+    hit = await mem_store.find_procedure_by_task(r, emb, req.task, scope=scope)
     dedup_score = 1.0
     if not hit:
-        near = await mem_store.nearest_procedures(r, emb, k=1)
+        near = await mem_store.nearest_procedures(
+            r, emb, k=1, filter_expr=scope.filter() or None)
         if near and near[0]["score"] > 0.90:
             hit = near[0]
             dedup_score = near[0]["score"]
@@ -218,6 +230,7 @@ async def _store_proc_now(r, req) -> str:
     await mem_store.save_procedure(
         r, task=req.task, procedure=req.procedure, embedding=emb,
         tools_used=req.tools_used, domain=req.domain or sc["domain"], language=sc["language"],
+        user_id=scope.user_id, agent_id=scope.agent_id,
     )
     log.info("[proc] stored procedure: %s", req.task[:60])
     _proc_guard["stored"] += 1
@@ -311,13 +324,17 @@ async def store_procedure(req: StoreProcedureRequest, background_tasks: Backgrou
     open, so the caller received 200 ``queued`` and the procedure silently never existed.
     """
     r = state.redis
+    try:
+        scope = strict_scope(req.user_id, req.agent_id)
+    except BadScope as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     if embed_mod.embedding_unavailable():
         n = await _defer_proc(r, req, "embedding circuit open")
         return {"status": "deferred", "pending": n, "reason": "embedding circuit open"}
 
     async def _do_store_proc():
         try:
-            await _store_proc_now(r, req)
+            await _store_proc_now(r, req, scope)
         except Exception as exc:
             # Loud, and never at the cost of the write.
             log.error("[proc] store failed (%s) — parking it instead of dropping it",

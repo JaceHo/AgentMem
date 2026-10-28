@@ -8,6 +8,8 @@ class CompatSessionStartRequest(BaseModel):
     session_id: str = ""
     project: str = ""
     cwd: str = ""
+    user_id: str = ""
+    agent_id: str = ""
 
 
 class CompatSessionEndRequest(BaseModel):
@@ -50,6 +52,8 @@ class ContextRequest(BaseModel):
     cwd: str = ""
     query: str = ""
     token_budget: int = 1500
+    user_id: str = ""
+    agent_id: str = ""
 
 
 class SessionCommitRequest(BaseModel):
@@ -69,6 +73,8 @@ class SearchRequest(BaseModel):
     token_budget: int | None = None
     sessionId: str = ""
     session_id: str = ""
+    user_id: str = ""
+    agent_id: str = ""
 
 
 class RememberRequest(BaseModel):
@@ -78,12 +84,18 @@ class RememberRequest(BaseModel):
     files: str = ""
     sessionId: str = ""
     session_id: str = ""
+    # Writes carry the same track the reader will query, or the row lands in
+    # the unscoped corpus and a scoped recall will never see it back.
+    user_id: str = ""
+    agent_id: str = ""
 
 
 class ForgetRequest(BaseModel):
     query: str
     limit: int = 10
     dry_run: bool = True
+    user_id: str = ""
+    agent_id: str = ""
 
 
 class FileContextRequest(BaseModel):
@@ -121,3 +133,6 @@ class ClaudeBridgeSyncRequest(BaseModel):
 class ImportRequest(BaseModel):
     data: dict = {}
     version: str = ""
+    # Default track for restored rows; an item carrying its own ids keeps them.
+    user_id: str = ""
+    agent_id: str = ""

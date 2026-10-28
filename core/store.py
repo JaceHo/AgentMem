@@ -44,6 +44,7 @@ import redis.asyncio as aioredis
 import ulid as _ulid_mod
 
 from .utils import decode_bytes, decode_json
+from .scope import Scope, scope_of
 
 log = logging.getLogger(__name__)
 
@@ -946,9 +947,11 @@ async def save_episode(
     domain: str = "general",
     ep_type: str = "general",          # claude-mem taxonomy: bugfix|feature|discovery|decision|change|procedure|preference|context|general
     prev_episode_id: str = "",         # causal chain: predecessor episode UID
+    user_id: str = "",
+    agent_id: str = "",
 ) -> str:
     uid  = str(_ulid_mod.new())
-    attr = json.dumps({
+    attr: dict = {
         "content":         content[:2000],
         "category":        "episode",
         "ep_type":         ep_type,
@@ -961,9 +964,12 @@ async def save_episode(
         "superseded_by":   "",
         "prev_episode_id": prev_episode_id,
         "next_episode_id": "",         # filled in when a successor is stored
-    })
+    }
+    scoped = scope_of(user_id, agent_id)
+    if not scoped.is_global:
+        attr.update(scoped.attrs())
     await r.execute_command("VADD", EPISODE_KEY, "FP32", _blob(embedding), uid,
-                            "SETATTR", attr)
+                            "SETATTR", json.dumps(attr))
     await register_element(r, EPISODE_KEY, uid)
     try:
         await r.hset(vec_key(EPISODE_KEY), uid, _quantize_vec(embedding))
@@ -1028,6 +1034,9 @@ async def save_fact(
     source_count: int = 1,
     sources: list[str] | None = None,
     superseded_reason: str = "",
+    # Track scoping (EverOS parity): exactly one of these, or neither.
+    user_id: str = "",
+    agent_id: str = "",
 ) -> str:
     """
     Save a fact to the semantic memory vectorset.
@@ -1059,6 +1068,7 @@ async def save_fact(
         triple_s=triple_s, triple_p=triple_p, triple_o=triple_o,
         source_count=source_count, sources=sources,
         superseded_reason=superseded_reason,
+        user_id=user_id, agent_id=agent_id,
     )
 
     await r.execute_command("VADD", FACT_KEY, "FP32", _blob(embedding), uid,
@@ -1092,6 +1102,8 @@ def _build_fact_attrs(
     source_count: int = 1,
     sources: list[str] | None = None,
     superseded_reason: str = "",
+    user_id: str = "",
+    agent_id: str = "",
 ) -> dict:
     """Build the vectorset attribute payload for one fact.
 
@@ -1135,6 +1147,11 @@ def _build_fact_attrs(
         attr_dict["triple_str"] = f"{triple_s} | {triple_p} | {triple_o}"
     if sources:
         attr_dict["sources"] = sources[:10]
+    # Written only when a track was named, so unscoped rows keep the byte shape
+    # older builds wrote -- and stay readable as the global corpus.
+    scoped = scope_of(user_id, agent_id)
+    if not scoped.is_global:
+        attr_dict.update(scoped.attrs())
     return attr_dict
 
 
@@ -1363,16 +1380,18 @@ async def nearest_procedures(
     r: aioredis.Redis,
     embedding: np.ndarray,
     k: int = 5,
+    filter_expr: str | None = None,
 ) -> list[dict]:
     """Top-k procedures by vector score.
 
     Procedure rows store `task`, not `content`. knn_search drops them.
     """
+    cmd = ["VSIM", PROC_KEY, "FP32", _blob(embedding),
+           "COUNT", k + 1, "WITHSCORES", "WITHATTRIBS"]
+    if filter_expr:
+        cmd += ["FILTER", filter_expr]
     try:
-        results = await r.execute_command(
-            "VSIM", PROC_KEY, "FP32", _blob(embedding),
-            "COUNT", k + 1, "WITHSCORES", "WITHATTRIBS",
-        )
+        results = await r.execute_command(*cmd)
     except Exception as e:
         log.error("nearest_procedures VSIM failed: %s", e)
         return []
@@ -1407,8 +1426,14 @@ async def find_procedure_by_task(
     *,
     min_score: float = 0.80,
     k: int = 8,
+    scope: Scope = Scope(),
 ) -> dict | None:
-    """Return an existing procedure with this exact task, including legacy rows."""
+    """Return an existing procedure with this exact task, including legacy rows.
+
+    The task hash is global while procedures can be per-track, so a mapped hit
+    is only accepted when the row belongs to the caller's track; otherwise the
+    lookup falls through to a scoped vector search, which never crosses tracks.
+    """
     mapped = await r.hget(PROC_TASK_KEY, task[:300])
     if mapped:
         elem = decode_bytes(mapped)
@@ -1417,9 +1442,10 @@ async def find_procedure_by_task(
             attrs = decode_json(raw) or {}
         except Exception:
             attrs = {}
-        if attrs.get("task"):
+        if attrs.get("task") and scope.matches(attrs):
             return {"score": 1.0, "attrs": attrs, "_element": elem}
-    for item in await nearest_procedures(r, embedding, k=k):
+    for item in await nearest_procedures(r, embedding, k=k,
+                                         filter_expr=scope.filter() or None):
         if item["attrs"].get("task") == task and item["score"] >= min_score:
             try:
                 await r.hset(PROC_TASK_KEY, task[:300], item["_element"])
@@ -1437,6 +1463,8 @@ async def save_procedure(
     tools_used: list[str] | None = None,
     domain: str = "general",
     language: str = "en",
+    user_id: str = "",
+    agent_id: str = "",
 ) -> str:
     """
     Store a successful procedure/workflow in mem:procedures.
@@ -1445,7 +1473,7 @@ async def save_procedure(
     uid = str(_ulid_mod.new())
     tools = (tools_used or [])[:10]
     task_key = task[:300]
-    attr = json.dumps({
+    attrs = {
         "task":          task_key,
         "content":       task_key,
         "procedure":     procedure[:1000],
@@ -1454,7 +1482,11 @@ async def save_procedure(
         "language":      language,
         "success_count": 1,
         "ts":            int(time.time() * 1000),
-    })
+    }
+    scoped = scope_of(user_id, agent_id)
+    if not scoped.is_global:
+        attrs.update(scoped.attrs())
+    attr = json.dumps(attrs)
     await r.execute_command("VADD", PROC_KEY, "FP32", _blob(embedding), uid,
                             "SETATTR", attr)
     await register_element(r, PROC_KEY, uid)
@@ -1487,6 +1519,39 @@ async def set_session_context(
     if not session_id:
         return
     await r.set(f"{SESSION_PRE}{session_id}:ctx", content.encode(), ex=ttl_s)
+
+
+def session_owner_key(session_id: str) -> str:
+    return f"{SESSION_PRE}{session_id}:owner"
+
+
+async def set_session_owner(
+    r: aioredis.Redis, session_id: str, scoped: Scope, ttl_s: int = 14400
+) -> None:
+    """Remember which track opened a session, so compress and recall can agree.
+
+    A session key is a flat ``mem:session:<id>:*`` namespace, while the rows it
+    later promotes are per-track. Recording the owner at store time is what
+    lets a compress call (which carries only the session id) file the summary
+    under the same track the conversation was stored in.
+    """
+    if not session_id or scoped.is_global:
+        return
+    await r.set(session_owner_key(session_id), json.dumps(scoped.attrs()), ex=ttl_s)
+
+
+async def get_session_owner(r: aioredis.Redis, session_id: str) -> Scope:
+    """The track that opened ``session_id``, or an empty scope when unrecorded."""
+    if not session_id:
+        return Scope()
+    raw = await r.get(session_owner_key(session_id))
+    if not raw:
+        return Scope()
+    try:
+        attrs = decode_json(raw) or {}
+    except Exception:
+        return Scope()
+    return scope_of(attrs.get("user_id"), attrs.get("agent_id"))
 
 
 async def vcard(r: aioredis.Redis) -> dict:

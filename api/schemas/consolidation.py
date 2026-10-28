@@ -18,6 +18,10 @@ class AnswerRequest(BaseModel):
 class CompressSessionRequest(BaseModel):
     session_id: str
     wait: bool = False
+    # Optional: when omitted, the track recorded when the session was stored
+    # decides where the promoted rows land.
+    user_id: str = ""
+    agent_id: str = ""
 
 
 class FeedbackRequest(BaseModel):

@@ -267,6 +267,38 @@ agentmemory uses a 4-tier model. AgentMem adds Tier 0 (LLM context budget manage
 
 ---
 
+## Memory scopes (user / agent tracks)
+
+Every write can name a track: `user_id` for one person's episodes, facts and
+profile, or `agent_id` for one agent's procedures. The scope rides on the row
+itself, so a scoped read filters at the vector index and never widens into
+another track's rows.
+
+```bash
+# write into jace's track
+curl -X POST localhost:18800/store -H 'content-type: application/json' \
+  -d '{"session_id":"s1","user_id":"jace","messages":[...]}'
+
+# read only that track
+curl -X POST localhost:18800/recall -H 'content-type: application/json' \
+  -d '{"query":"deploy ring","user_id":"jace"}'
+
+# agent track (procedures)
+curl -X POST localhost:18800/recall-procedures -H 'content-type: application/json' \
+  -d '{"query":"release checklist","agent_id":"raven-code"}'
+```
+
+- One id per call; both together or a malformed id is a `422`.
+- Omitting both ids keeps the pre-scope behaviour: a global corpus readable by
+  every caller.
+- Persona (`mem:persona:<track>`), the pinned session summary
+  (`mem:pinned:session_summary:<track>`) and `/session/compress` all follow the
+  same track.
+- Procedures written before this change can be stamped with
+  `scripts/backfill_scope.py --user-id <id> --agent-id <id>` (idempotent).
+
+---
+
 ## Retrieval Pipeline
 
 ```

@@ -266,3 +266,27 @@ top-10 中来自当前不可见层的比例: 20/100 = 20%
 - 单 uvicorn worker 的并发天花板
 - `.env` 明文 API key：`git ls-files` 确认**未入库**（仅 `.env.example` 被跟踪），但明文在磁盘上，建议轮换
 - `mem:procedures` 中已不可达的 ~51% 元素：没有元素 ID 就无法 `VGETATTR`，只能靠后续写入自然补齐
+
+## 10. 双轨作用域移植（2026-10-28）
+
+EverOS 的核心模型是双轨：**user track = episodes + profile**，**agent track = agent_case + agent_skill**。移植前 agentmem 是单一全局语料，任一调用者的读写都落在同一池子里。本次把该模型落成“作用域”，并对全部接口向后兼容。
+
+| 层 | 实现 |
+|---|---|
+| 事实源 | `core/scope.py`：`Scope(user_id, agent_id)`，XOR 语义；id 经白名单正则校验（id 会被拼进 `FILTER` 表达式） |
+| 写入 | facts / episodes / procedures 的 attrs 打 `user_id` / `agent_id`；会话记录 owner（`mem:session:<id>:owner`，4h TTL） |
+| 读取 | 向量腿在索引层 `FILTER`；BM25 / 图谱 / 结晶腿取回后 `matches()` 过滤 |
+| 兼容 | 不带作用域的调用保持旧全局行为；带作用域的读**绝不**放宽到全局语料 |
+| 按轨键 | `mem:persona:<track>`、`mem:pinned:session_summary:<track>` |
+| 压缩 | `/session/compress` 按请求作用域提升，未指定时用会话写入时记录的 owner |
+| 接口 | HTTP（`/recall` `/store` `/remember` `/import` `/session/*` `/context` `/profile` `/store-procedure` `/recall-procedures`）与 MCP 工具全部透传 `user_id` / `agent_id`，非法组合 422 |
+
+**迁移**：`scripts/backfill_scope.py`（一次幂等迁移）。db0 实测 1581 facts + 1700 episodes 打 `user_id=jace`，312 条可达 procedures 打 `agent_id=raven-code`，并复制人格与 pinned 摘要；VCARD 前后元素数不变。
+
+**验证**：
+
+- `tests/unit` 310 passed。
+- `tests/integration` 36 passed；4 条 KB 失败在 HEAD 洁净 worktree 下同样失败（embedding 维度 32 vs 384，与本次无关）。
+- `tests/integration/test_api.py::TestScopeIsolation` 6 项：跨轨不可见、无作用域仍可见、双 id / 非法 id 422、procedure 归 agent 轨、压缩落回写入轨。
+- Raven 侧适配器：`tests/test_agentmem_http_adapter.py` 5 项（写带轨、metadata 覆盖、camelCase 覆盖、无身分保持全局、读只带本轨）。
+- 活库往返：Raven 适配器写入 → jace 召回命中且 attrs 带 `user_id: jace`；陌生 user 0 命中；agent 轨 procedure 召回 6 条；健康检查 ready。

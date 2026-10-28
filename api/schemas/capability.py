@@ -47,6 +47,13 @@ class StoreProcedureRequest(BaseModel):
     tools_used: list[str] = []          # tools/skills involved
     domain: str = ""
     session_id: str = ""
+    user_id: str = ""                   # track the row (and its dedup lookups) belongs to
+    agent_id: str = ""
+
+
+class RecallProceduresRequest(RecallToolsRequest):
+    user_id: str = ""
+    agent_id: str = ""
 
 
 class ToolFeedbackRequest(BaseModel):

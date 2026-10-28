@@ -324,8 +324,13 @@ def _reject_logged(field: str, content: str) -> bool:
     return True
 
 
-async def update(r: aioredis.Redis, category: str, content: str) -> None:
-    """Merge a new fact into the persona profile, with quality filtering."""
+async def update(r: aioredis.Redis, category: str, content: str, *, key: str = PERSONA_KEY) -> None:
+    """Merge a new fact into the persona profile, with quality filtering.
+
+    ``key`` names the profile: the global one, or the per-track hash
+    ``core.scope`` derives. A scoped write that landed in the global hash
+    would be injected into every other track's prompt.
+    """
     field = _FACT_TO_FIELD.get(category)
     if not field:
         return
@@ -344,7 +349,7 @@ async def update(r: aioredis.Redis, category: str, content: str) -> None:
                     content[:120])
         return
 
-    existing_raw = await r.hget(PERSONA_KEY, field)
+    existing_raw = await r.hget(key, field)
     existing_entries = _parse_entries(
         decode_bytes(existing_raw)
     )
@@ -355,10 +360,10 @@ async def update(r: aioredis.Redis, category: str, content: str) -> None:
     # Prepend new (most recent is first) and keep best _MAX_ENTRIES_PER_FIELD
     merged = _best_entries([content] + existing_entries)
     new_val = _compose_field(merged)
-    await r.hset(PERSONA_KEY, field, new_val)
+    await r.hset(key, field, new_val)
 
 
-async def update_many(r: aioredis.Redis, entries: list[tuple[str, str]]) -> None:
+async def update_many(r: aioredis.Redis, entries: list[tuple[str, str]], *, key: str = PERSONA_KEY) -> None:
     """Merge many facts into the persona profile in two round trips.
 
     ``update`` costs one HGET + one HSET *per fact*, and the store path calls
@@ -392,7 +397,7 @@ async def update_many(r: aioredis.Redis, entries: list[tuple[str, str]]) -> None
         return
 
     # 2. One read of the current profile.
-    raw_all = await r.hgetall(PERSONA_KEY) or {}
+    raw_all = await r.hgetall(key) or {}
     raw_all = {decode_bytes(k): decode_bytes(v) for k, v in raw_all.items()}
 
     # 3. Replay each entry against the evolving in-memory view — this is what
@@ -412,11 +417,11 @@ async def update_many(r: aioredis.Redis, entries: list[tuple[str, str]]) -> None
     if writes:
         pipe = r.pipeline(transaction=False)
         for field, val in writes.items():
-            pipe.hset(PERSONA_KEY, field, val)
+            pipe.hset(key, field, val)
         await pipe.execute()
 
 
-async def sanitize_stored(r: aioredis.Redis) -> dict:
+async def sanitize_stored(r: aioredis.Redis, *, key: str = PERSONA_KEY) -> dict:
     """Re-apply today's hygiene rules to the persona that is ALREADY stored.
 
     New filters only guard future writes: a PII entry stored last month keeps
@@ -427,7 +432,7 @@ async def sanitize_stored(r: aioredis.Redis) -> dict:
 
     Returns {"field": n_entries_removed} for fields that changed.
     """
-    raw = await r.hgetall(PERSONA_KEY) or {}
+    raw = await r.hgetall(key) or {}
     current = {decode_bytes(k): decode_bytes(v) for k, v in raw.items()}
     removed: dict[str, int] = {}
     writes: dict[str, str] = {}
@@ -453,9 +458,9 @@ async def sanitize_stored(r: aioredis.Redis) -> dict:
     if writes or deletes:
         pipe = r.pipeline(transaction=False)
         for field, val in writes.items():
-            pipe.hset(PERSONA_KEY, field, val)
+            pipe.hset(key, field, val)
         for field in deletes:
-            pipe.hdel(PERSONA_KEY, field)
+            pipe.hdel(key, field)
         await pipe.execute()
         log.info("[persona] sanitized %d field(s): %s",
                  len(writes) + len(deletes),
@@ -463,9 +468,9 @@ async def sanitize_stored(r: aioredis.Redis) -> dict:
     return removed
 
 
-async def get_context(r: aioredis.Redis) -> str:
+async def get_context(r: aioredis.Redis, *, key: str = PERSONA_KEY) -> str:
     """Return persona as a formatted context block, or '' if empty."""
-    raw = await r.hgetall(PERSONA_KEY)
+    raw = await r.hgetall(key)
     if not raw:
         return ""
 

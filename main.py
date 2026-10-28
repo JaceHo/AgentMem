@@ -156,6 +156,7 @@ from core import persona as persona_mod
 from core import retrieval_planner
 from core import scene as scene_mod
 from core import store as mem_store
+from core.scope import BadScope, Scope, scope_of, strict_scope
 from core import summarizer
 from core.http import async_post_json
 from services.consolidation_service import (
@@ -1295,7 +1296,7 @@ async def _check_contradiction(existing_fact: dict, new_fact) -> None:
 
 
 # ── Background store ──────────────────────────────────────────────────────────
-async def _do_store(messages: list[Message], session_id: str) -> None:
+async def _do_store(messages: list[Message], session_id: str, scope: Scope = Scope()) -> None:
     global _store_attempts, _store_successes, _store_skips, _store_errors, _store_latency_sum_ms
     if _shutting_down:
         return
@@ -1303,6 +1304,11 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
     t0 = time.time()
     outcome = "error"
     try:
+        if session_id and not scope.is_global:
+            try:
+                await mem_store.set_session_owner(_get_redis(), session_id, scope)
+            except Exception as exc:
+                log.warning("[store] session owner write failed for %s: %s", session_id, exc)
         # 1. Filter system-injected and empty messages.
         #    _msg_text() strips <cross_session_memory> prefixes and [[platform_tags]]
         #    before returning text, so purely-noise messages collapse to "" here.
@@ -1356,7 +1362,12 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
 
         # 4. Embed + dedup-check + save episode (with type taxonomy + causal chain)
         ep_emb = await asyncio.to_thread(_encode, summary[:500])
-        similar = await mem_store.knn_search(_get_redis(), mem_store.EPISODE_KEY, ep_emb, k=1)
+        # Dedup is per-track: a turn identical to another track's episode is a
+        # new episode here, not a duplicate to drop.
+        similar = await mem_store.knn_search(
+            _get_redis(), mem_store.EPISODE_KEY, ep_emb, k=1,
+            filter_expr=scope.filter() or None,
+        )
         is_dup = bool(similar and similar[0].get("score", 0.0) > 0.95)
         ep_saved = 0
         new_ep_uid = ""
@@ -1368,6 +1379,7 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
                 _get_redis(), session_id, turn_text[:2000], ep_emb, lang, domain,
                 ep_type="general",        # placeholder; updated after fact extraction below
                 prev_episode_id=prev_ep_id,
+                user_id=scope.user_id, agent_id=scope.agent_id,
             )
             # Episodes used to be keyword-invisible: BM25 only ever indexed facts.
             await _bm25_index.add(new_ep_uid, turn_text[:2000], {"category": "episode"}, "episodes")
@@ -1390,6 +1402,7 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
         # round trips (mem:facts is small, but this is on the store hot path).
         dedup_hits = await mem_store.knn_search_batch(
             _get_redis(), mem_store.FACT_KEY, normal_embs, k=1,
+            filter_expr=scope.filter() or None,
         )
 
         # Decide save/dedup/evolve/contradiction in memory — no Redis calls here.
@@ -1421,6 +1434,7 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
             "importance": fact.importance, "topic": fact.topic, "location": fact.location,
             "source_episode_id": new_ep_uid or None,
             "triple_s": fact.triple_s, "triple_p": fact.triple_p, "triple_o": fact.triple_o,
+            "user_id": scope.user_id, "agent_id": scope.agent_id,
         } for fact, emb in to_save]
         uids = await mem_store.save_facts_batch(_get_redis(), save_specs)
 
@@ -1437,11 +1451,14 @@ async def _do_store(messages: list[Message], session_id: str) -> None:
             }
             if fact.triple_s and fact.triple_p and fact.triple_o:
                 attrs["triple_str"] = f"{fact.triple_s} | {fact.triple_p} | {fact.triple_o}"
+            attrs.update(scope.attrs())
             await _bm25_index.add(uid, fact.content, attrs)
             persona_entries.append((fact.category, fact.content))
             fact_saved += 1
         if persona_entries:
-            await persona_mod.update_many(_get_redis(), persona_entries)
+            await persona_mod.update_many(
+                _get_redis(), persona_entries, key=scope.persona_key(),
+            )
 
         # 5b. Back-fill ep_type on newly saved episode + complete causal chain
         if new_ep_uid:
@@ -1574,7 +1591,7 @@ async def _accumulate_session(session_id: str, turn_summary: str) -> None:
     await mem_store.set_session_context(_get_redis(), session_id, combined[:1500])
 
 
-async def _do_compress_session(session_id: str) -> dict:
+async def _do_compress_session(session_id: str, scope: Scope = Scope()) -> dict:
     """
     Promote Tier 1 session context → Tier 2 long-term vector memory.
     Called by /session/compress (explicit) or the JS plugin on agent_end.
@@ -1588,6 +1605,12 @@ async def _do_compress_session(session_id: str) -> dict:
     """
     if not session_id:
         return {"status": "skipped", "reason": "no session_id"}
+
+    # A compress call usually carries only the session id; the track recorded
+    # when the session was stored is what keeps the summary with its owner.
+    if scope.is_global:
+        scope = await mem_store.get_session_owner(_get_redis(), session_id)
+    scope_filter = scope.filter() or None
 
     ctx = await mem_store.get_session_context(_get_redis(), session_id)
     if not ctx or len(ctx) < 80:
@@ -1607,16 +1630,19 @@ async def _do_compress_session(session_id: str) -> dict:
 
     # Save as a session-summary episode (labelled so recall can distinguish)
     ep_emb  = await asyncio.to_thread(_encode, session_summary[:500])
-    similar = await mem_store.knn_search(_get_redis(), mem_store.EPISODE_KEY, ep_emb, k=1)
+    similar = await mem_store.knn_search(_get_redis(), mem_store.EPISODE_KEY, ep_emb, k=1,
+                                         filter_expr=scope_filter)
     ep_saved = 0
     if not similar or similar[0].get("score", 0.0) < 0.95:
         ep_uid = await mem_store.save_episode(
             _get_redis(), session_id,
             f"[Session Summary] {session_summary[:2000]}",
             ep_emb, lang, domain,
+            user_id=scope.user_id, agent_id=scope.agent_id,
         )
         await _bm25_index.add(
-            ep_uid, session_summary[:2000], {"category": "episode"}, "episodes"
+            ep_uid, session_summary[:2000],
+            {"category": "episode", **scope.attrs()}, "episodes"
         )
         ep_saved = 1
 
@@ -1637,7 +1663,8 @@ async def _do_compress_session(session_id: str) -> dict:
         if _contains_secret(fact.content):
             continue
         f_emb = next(emb_iter)
-        existing = await mem_store.knn_search(_get_redis(), mem_store.FACT_KEY, f_emb, k=1)
+        existing = await mem_store.knn_search(_get_redis(), mem_store.FACT_KEY, f_emb, k=1,
+                                              filter_expr=scope_filter)
         if existing and existing[0].get("score", 0.0) > 0.95:
             if fact.keywords and existing[0].get("score", 0.0) > 0.80:
                 _spawn(_evolve_similar_fact(
@@ -1651,17 +1678,20 @@ async def _do_compress_session(session_id: str) -> dict:
             keywords=fact.keywords, persons=fact.persons, entities=fact.entities,
             importance=fact.importance, topic=fact.topic, location=fact.location,
             triple_s=fact.triple_s, triple_p=fact.triple_p, triple_o=fact.triple_o,
+            user_id=scope.user_id, agent_id=scope.agent_id,
         )
         # Add to BM25 corpus
         attrs = {
             "content": fact.content, "category": fact.category,
             "language": lang, "domain": domain,
             "keywords": fact.keywords or [], "importance": fact.importance,
+            **scope.attrs(),
         }
         if fact.triple_s and fact.triple_p and fact.triple_o:
             attrs["triple_str"] = f"{fact.triple_s} | {fact.triple_p} | {fact.triple_o}"
         await _bm25_index.add(uid, fact.content, attrs)
-        await persona_mod.update(_get_redis(), fact.category, fact.content)
+        await persona_mod.update(_get_redis(), fact.category, fact.content,
+                                 key=scope.persona_key())
         fact_saved += 1
 
     # Delete Tier 1 KV — session has been crystallised into long-term memory
@@ -1670,9 +1700,12 @@ async def _do_compress_session(session_id: str) -> dict:
     # Pin the session summary for the NEXT session's recall (cross-session handoff).
     # Strip platform tags before persisting — summaries must contain real content only.
     # Stored without TTL so it persists until the next compress overwrites it.
+    # One pin per track: a summary of someone else's session is not this track's
+    # continuity bridge.
     clean_summary = _strip_platform_noise(session_summary)
     if clean_summary:
-        await _get_redis().set(_PINNED_SESSION_KEY, clean_summary[:600].encode())
+        key = _PINNED_SESSION_KEY + ("" if scope.is_global else ":" + scope.track_suffix())
+        await _get_redis().set(key, clean_summary[:600].encode())
 
     log.info(f"[compress] session={session_id} promoted → ep+{ep_saved} facts+{fact_saved}")
     return {
@@ -1959,6 +1992,8 @@ async def _recall_augmentations(req: RecallRequest, *, skip_llm: bool = False) -
 @app.post("/recall")
 async def recall(req: RecallRequest):
     t0 = time.time()
+    scope = _request_scope(req.user_id, req.agent_id)
+    scope_filter = scope.filter() or None
 
     if _is_brief_option_reply(req.query):
         hint = (
@@ -2029,6 +2064,11 @@ async def recall(req: RecallRequest):
     # Combines with lang_filter + domain_filter as a compound VSIM FILTER expression
     def _build_filter(base_filter: str | None, domain_f: str | None = None) -> str:
         parts = []
+        # The track is a hard constraint like language and time range: it goes
+        # into the VSIM expression, so the index returns only this track's rows
+        # rather than this track's rows surviving a later filter.
+        if scope_filter:
+            parts.append(scope_filter)
         if base_filter:
             parts.append(base_filter)
         if domain_f:
@@ -2055,13 +2095,16 @@ async def recall(req: RecallRequest):
     # + symbolic structured pass (async, no extra latency via gather)
     # + pinned last-session summary (cross-session handoff bridge, index 6)
     gather_tasks = [
-        persona_mod.get_context(_get_redis()),
+        persona_mod.get_context(_get_redis(), key=scope.persona_key()),
         cap_mod.get_env_context(_get_redis()),
         mem_store.get_session_context(_get_redis(), req.session_id),
         _fetch(mem_store.FACT_KEY,    n_facts,    lang_filter_sym or None),
         _fetch(mem_store.EPISODE_KEY, n_episodes, lang_filter_sym or None),
         asyncio.sleep(0),  # index 5 kept stable; structure LLM is outside the recall budget
-        _get_redis().get(_PINNED_SESSION_KEY),                       # handoff bridge (index 6)
+        # Handoff bridge (index 6): one pin per track, never another track's.
+        _get_redis().get(
+            _PINNED_SESSION_KEY + ("" if scope.is_global else ":" + scope.track_suffix())
+        ),
     ]
     if req.include_tools and is_cap_query:
         gather_tasks.append(cap_mod.recall_tools(_get_redis(), emb, k=6))
@@ -2079,6 +2122,8 @@ async def recall(req: RecallRequest):
         # Fetch more than needed so Beta reranking can reorder
         cmd  = ["VSIM", mem_store.PROC_KEY, "FP32", blob,
                 "COUNT", max(k * 3, 6), "WITHSCORES", "WITHATTRIBS"]
+        if scope_filter:
+            cmd += ["FILTER", scope_filter]
         try:
             results = await _get_redis().execute_command(*cmd)
         except Exception:
@@ -2156,6 +2201,15 @@ async def recall(req: RecallRequest):
     persona_ctx  = results[0]
     env_ctx      = results[1]
     session_ctx  = results[2]
+    # A flat session key belongs to whoever opened it; another track's live
+    # conversation must not ride along in this prompt. Unrecorded (legacy)
+    # sessions stay visible, which is the same rule unscoped rows follow.
+    if not scope.is_global and session_ctx and req.session_id:
+        owner = await mem_store.get_session_owner(_get_redis(), req.session_id)
+        if (owner.user_id and owner.user_id != scope.user_id) or (
+            owner.agent_id and owner.agent_id != scope.agent_id
+        ):
+            session_ctx = None
     facts_scene  = results[3]
     eps_scene    = results[4]
     query_struct = results[5] if isinstance(results[5], dict) else {}
@@ -2166,6 +2220,10 @@ async def recall(req: RecallRequest):
     tools_raw    = results[7] if isinstance(results[7], list) else []
     procs_raw    = results[8] if isinstance(results[8], list) else []
     crystal_digests = results[9] if isinstance(results[9], list) else []
+    # A digest summarizes a session; which track wrote it is recorded with it.
+    # Digests from before tracks existed carry no id and are global-only.
+    if not scope.is_global:
+        crystal_digests = [d for d in crystal_digests if scope.matches(d)]
 
     # Symbolic structured pass (AgentMem §3.3 extension):
     # If the query mentions specific persons or entities, do a targeted scan
@@ -2221,13 +2279,15 @@ async def recall(req: RecallRequest):
     # runs concurrently with the Redis supplement fetches at zero extra latency cost.
     supplement_tasks = []
     if len(facts_scene) < n_facts:
-        supplement_tasks.append(_fetch(mem_store.FACT_KEY, n_facts - len(facts_scene)))
+        supplement_tasks.append(
+            _fetch(mem_store.FACT_KEY, n_facts - len(facts_scene), scope_filter)
+        )
     else:
         supplement_tasks.append(asyncio.sleep(0))
 
     if len(eps_scene) < max(2, n_episodes // 2):
         supplement_tasks.append(
-            _fetch(mem_store.EPISODE_KEY, n_episodes - len(eps_scene))
+            _fetch(mem_store.EPISODE_KEY, n_episodes - len(eps_scene), scope_filter)
         )
     else:
         supplement_tasks.append(asyncio.sleep(0))
@@ -2238,6 +2298,10 @@ async def recall(req: RecallRequest):
     facts_global = supp_results[0] if isinstance(supp_results[0], list) else []
     eps_global   = supp_results[1] if isinstance(supp_results[1], list) else []
     bm25_hits    = supp_results[2] if isinstance(supp_results[2], list) else []
+    # BM25 ranks the in-memory corpus without knowing about tracks, so its hits
+    # carry their attributes and are filtered here.
+    if not scope.is_global:
+        bm25_hits = [h for h in bm25_hits if scope.matches(h.get("attrs"))]
     if bm25_hits:
         log.debug(f"[bm25] {len(bm25_hits)} hits for: {req.query[:60]!r}")
 
@@ -2320,7 +2384,8 @@ async def recall(req: RecallRequest):
                 reflection_emb = await async_encode(extra_q[0])
                 reflection_facts = await mem_store.knn_search(
                     _get_redis(), mem_store.FACT_KEY, reflection_emb,
-                    k=max(3, n_facts // 2), bump_heat=True
+                    k=max(3, n_facts // 2), filter_expr=scope_filter,
+                    bump_heat=True,
                 )
                 seen_reflect = {f["content"] for f in facts}
                 for rf in reflection_facts:
@@ -2353,6 +2418,8 @@ async def recall(req: RecallRequest):
                     log.warning("[recall] graph recall failed: %s", batch)
                     continue
                 for gf in batch:
+                    if not scope.matches(gf.get("attrs")):
+                        continue
                     if gf["content"] not in seen_contents:
                         facts.append(gf)
                         seen_contents.add(gf["content"])
@@ -2368,6 +2435,8 @@ async def recall(req: RecallRequest):
             if bridge_facts:
                 seen_bridge = {f["content"] for f in facts}
                 for bf in bridge_facts:
+                    if not scope.matches(bf.get("attrs")):
+                        continue
                     if bf["content"] not in seen_bridge:
                         facts.append(bf)
                         seen_bridge.add(bf["content"])
@@ -2443,6 +2512,28 @@ async def recall(req: RecallRequest):
     return {"prependContext": prepend if prepend else None, "latency_ms": ms}
 
 
+def _request_scope(user_id: object, agent_id: object) -> Scope:
+    """The track a request names, or 422 when the ids cannot mean one."""
+    try:
+        return strict_scope(user_id, agent_id)
+    except BadScope as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+def _store_scope(req: StoreRequest) -> Scope:
+    """The track a store names: the fields, else the per-call metadata override.
+
+    Raven's contract carries ``user_id`` / ``agent_id`` inside a trace write's
+    ``metadata`` when one process writes on behalf of another; the top-level
+    fields are the same two ids for callers that have them directly.
+    """
+    meta = req.metadata or {}
+    return _request_scope(
+        req.user_id or meta.get("user_id"),
+        req.agent_id or meta.get("agent_id"),
+    )
+
+
 @app.post("/store")
 async def store_memory(req: StoreRequest):
     # A row this index cannot hold is not "queued" — say so while the caller can
@@ -2454,7 +2545,7 @@ async def store_memory(req: StoreRequest):
     except embedder.DimensionMismatch as exc:
         raise HTTPException(status_code=409,
                             detail={"error": "dimension_mismatch", "message": str(exc)})
-    _spawn(_do_store(req.messages, req.session_id), "store")
+    _spawn(_do_store(req.messages, req.session_id, _store_scope(req)), "store")
     await _ws_broadcast("store", {"session_id": req.session_id})
     return {"status": "queued"}
 
@@ -2472,10 +2563,11 @@ async def compress_session(req: CompressSessionRequest, background_tasks: Backgr
 
     Set wait=true to block until promotion completes (returns full result).
     """
+    scope = _request_scope(req.user_id, req.agent_id)
     if req.wait:
-        result = await _do_compress_session(req.session_id)
+        result = await _do_compress_session(req.session_id, scope)
         return result
-    background_tasks.add_task(_do_compress_session, req.session_id)
+    background_tasks.add_task(_do_compress_session, req.session_id, scope)
     return {"status": "queued", "session_id": req.session_id}
 
 
@@ -2486,11 +2578,18 @@ async def get_session(session_id: str):
     Useful for debugging what the agent has accumulated in this session.
     """
     ctx = await mem_store.get_session_context(_get_redis(), session_id)
+    owner = await mem_store.get_session_owner(_get_redis(), session_id)
     return {
         "session_id": session_id,
         "context":    ctx,
         "length":     len(ctx) if ctx else 0,
         "tier":       "Tier 1 / Session KV",
+        # The track that wrote this session, so a caller can tell an owned
+        # session from one whose id it merely happens to know.
+        "owner":      None if owner.is_global else {
+            "user_id":  owner.user_id,
+            "agent_id": owner.agent_id,
+        },
     }
 
 

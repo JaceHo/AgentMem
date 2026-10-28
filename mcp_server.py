@@ -246,12 +246,16 @@ async def recall_memory(
     include_tools: bool = True,
     include_graph: bool = False,
     enable_hyde: bool = True,
+    user_id: str = "",
+    agent_id: str = "",
 ) -> str:
     """
     Retrieve relevant long-term memories, past conversation context,
     user preferences, and learned facts for a given query.
     Call at the start of a conversation or when you need background knowledge.
     HyDE + MIRIX active retrieval are enabled by default for higher recall quality.
+    user_id / agent_id name whose memory to read -- exactly one, or neither for
+    the shared corpus. A scoped read never widens to another track.
     """
     try:
         result = await _post("/recall", {
@@ -261,6 +265,8 @@ async def recall_memory(
             "include_tools": include_tools,
             "include_graph": include_graph,
             "enable_hyde": enable_hyde,
+            "user_id": user_id,
+            "agent_id": agent_id,
         })
         ctx = result.get("prependContext") or "(no relevant memories found)"
         return f"Memory context ({result.get('latency_ms', '?')}ms):\n\n{ctx}"
@@ -274,14 +280,21 @@ async def recall_memory(
 async def store_memory(
     messages: list[dict],
     session_id: str = "",
+    user_id: str = "",
+    agent_id: str = "",
 ) -> str:
     """
     Save a conversation turn or important information to long-term memory.
     Provide messages as a list with role ('user'/'assistant'/'system') and content.
     Call after each meaningful exchange to build persistent memory.
+    user_id / agent_id file the turn under one track so it is recallable by that
+    track and invisible to the others; omit both for the shared corpus.
     """
     try:
-        result = await _post("/store", {"messages": messages, "session_id": session_id})
+        result = await _post("/store", {
+            "messages": messages, "session_id": session_id,
+            "user_id": user_id, "agent_id": agent_id,
+        })
         return f"Memory stored: {result.get('status', 'ok')}"
     except httpx.ConnectError:
         return _dead()
@@ -321,14 +334,20 @@ async def recall_tools(
 async def recall_procedures(
     query: str,
     k: int = 3,
+    user_id: str = "",
+    agent_id: str = "",
 ) -> str:
     """
     Find how-to workflows and successful task patterns by description.
     MACLA Beta scoring re-ranks by success rate × similarity.
     Use this when approaching a task to check if there's a known procedure.
+    user_id / agent_id scope the search to one track; procedures are usually
+    the agent track's, so pass agent_id when looking up an agent's skills.
     """
     try:
-        result = await _post("/recall-procedures", {"query": query, "k": k})
+        result = await _post("/recall-procedures", {
+            "query": query, "k": k, "user_id": user_id, "agent_id": agent_id,
+        })
         procs = result.get("procedures", [])
         if not procs:
             return "No matching procedures found."
@@ -349,15 +368,20 @@ async def store_procedure(
     tools_used: list[str] = [],
     domain: str = "",
     session_id: str = "",
+    user_id: str = "",
+    agent_id: str = "",
 ) -> str:
     """
     Save a successful workflow or how-to pattern to procedural memory.
     Call after completing a multi-step task to remember the approach.
+    user_id / agent_id file the procedure under one track so only that track's
+    recall finds it; omit both for the shared corpus.
     """
     try:
         result = await _post("/store-procedure", {
             "task": task, "procedure": procedure,
             "tools_used": tools_used, "domain": domain, "session_id": session_id,
+            "user_id": user_id, "agent_id": agent_id,
         })
         return f"Procedure stored: {result.get('status', 'ok')}"
     except httpx.ConnectError:
@@ -383,14 +407,19 @@ async def get_stats() -> str:
 
 
 @mcp.tool()
-async def compress_session(session_id: str) -> str:
+async def compress_session(session_id: str, user_id: str = "", agent_id: str = "") -> str:
     """
     Promote the current session's accumulated context to long-term memory.
     Extracts facts and episodes from the session KV and stores them permanently.
     Call at the end of a conversation to crystallise session knowledge.
+    The promoted rows join the track that opened the session; pass user_id /
+    agent_id explicitly only when the session was stored without one.
     """
     try:
-        result = await _post("/session/compress", {"session_id": session_id, "wait": True})
+        result = await _post("/session/compress", {
+            "session_id": session_id, "wait": True,
+            "user_id": user_id, "agent_id": agent_id,
+        })
         return (
             f"Session compressed: ep_saved={result.get('ep_saved', 0)}, "
             f"facts_saved={result.get('facts_saved', 0)}, "
@@ -407,6 +436,8 @@ async def batch_recall_memory(
     queries: list[str],
     session_id: str = "",
     memory_limit_number: int = 4,
+    user_id: str = "",
+    agent_id: str = "",
 ) -> str:
     """
     Retrieve relevant memories for multiple queries in parallel.
@@ -419,6 +450,7 @@ async def batch_recall_memory(
                 "query": q, "session_id": session_id,
                 "memory_limit_number": memory_limit_number,
                 "enable_hyde": True,
+                "user_id": user_id, "agent_id": agent_id,
             })
             for q in qs
         ]
@@ -440,7 +472,11 @@ async def batch_recall_memory(
 
 
 @mcp.tool()
-async def batch_store_memory(batches: list[dict]) -> str:
+async def batch_store_memory(
+    batches: list[dict],
+    user_id: str = "",
+    agent_id: str = "",
+) -> str:
     """
     Save multiple conversation turns to long-term memory in parallel.
     Each batch is a dict with 'messages' (list) and optional 'session_id'.
@@ -451,6 +487,7 @@ async def batch_store_memory(batches: list[dict]) -> str:
             _post("/store", {
                 "messages": b.get("messages", []),
                 "session_id": b.get("session_id", ""),
+                "user_id": user_id, "agent_id": agent_id,
             })
             for b in batches
         ]
@@ -494,6 +531,8 @@ async def forget_memory(
     query: str,
     limit: int = 3,
     dry_run: bool = True,
+    user_id: str = "",
+    agent_id: str = "",
 ) -> str:
     """
     Fuzzy-delete memories that are semantically similar to the query.
@@ -503,6 +542,7 @@ async def forget_memory(
     try:
         result = await _post("/forget", {
             "query": query, "limit": limit, "dry_run": dry_run,
+            "user_id": user_id, "agent_id": agent_id,
         })
         if dry_run:
             would_delete = result.get("would_delete", 0)
@@ -583,6 +623,8 @@ async def search_memory(
     limit: int = 10,
     session_id: str = "",
     format: str = "compact",
+    user_id: str = "",
+    agent_id: str = "",
 ) -> str:
     """
     Compact vector search across facts and episodes tiers.
@@ -593,6 +635,7 @@ async def search_memory(
     try:
         result = await _post("/search", {
             "query": query, "limit": limit, "session_id": session_id, "format": format,
+            "user_id": user_id, "agent_id": agent_id,
         })
         results = result.get("results", [])
         if not results:
