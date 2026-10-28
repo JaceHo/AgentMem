@@ -216,10 +216,17 @@ async def _store_proc_now(r, req, scope=None) -> str:
         if elem:
             attrs = dict(hit.get("attrs") or {})
             attrs["success_count"] = attrs.get("success_count", 1) + 1
+            # Legacy rows predate the canonical key; writing it here makes the row reachable by
+            # every later spelling of the same task instead of only by the exact bytes it was saved with.
+            attrs.setdefault("task_key", mem_store.proc_task_key(attrs.get("task", "")))
             try:
                 await r.execute_command("VSETATTR", mem_store.PROC_KEY, elem, json.dumps(attrs))
             except Exception as exc:
                 log.warning("[proc] dedup success_count bump failed for %s: %s", elem, exc)
+            # Deliberately NOT mapping this task to the hit: a >0.90 paraphrase is a judgement call,
+            # and writing its key would make mem:proc_tasks claim a row exists whose task text is
+            # different — which is how a caller (and the memory canary) reads "persisted" for a write
+            # that was actually absorbed. proc_guard.deduped is the honest record of that outcome.
         # Loud on purpose: an accepted write that adds no element must still leave a trace,
         # otherwise "already known" is indistinguishable from "silently lost".
         log.info("[proc] deduped: %r -> existing %s (score=%.3f, known_task=%r)",

@@ -820,7 +820,7 @@ def _format_prepend(
             task      = p.get("task", "")
             procedure = p.get("procedure", "")
             # task may be "[skill:name] description" — strip the prefix tag for display
-            display = task.split("] ", 1)[-1] if task.startswith("[skill:") else task
+            display = task.split("] ", 1)[-1] if task.startswith("[skill") else task
             # Include first 200 chars of procedure body as a hint
             body_hint = procedure[:200].replace("\n", " ").strip()
             line = f"- **{display}**" + (f": {body_hint}" if body_hint else "")

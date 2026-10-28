@@ -36,7 +36,9 @@ import json
 import logging
 import math
 import os
+import re
 import time
+import unicodedata
 from typing import Optional
 
 import numpy as np
@@ -237,6 +239,21 @@ async def cache_vectors(
         log.warning("cache_vectors pipeline failed: %s", e)
 
 
+def proc_task_key(task: str) -> str:
+    """Canonical dedup key for a procedure's task.
+
+    The dedup hash used to be the raw string, so ``Task: rotate the vault.`` and ``task rotate the
+    vault`` were two rows for one workflow — the write-side half of the tier's duplicate mass. Case,
+    punctuation and whitespace are not meaning here, so they are folded out before the key is made.
+    The vector path (``nearest_procedures`` > 0.90) stays as a second net: two people can describe
+    the same workflow in genuinely different words.
+    """
+    t = unicodedata.normalize("NFKC", str(task or "")).casefold()
+    t = re.sub(r"[\s_]+", " ", t)
+    t = re.sub(r"[^\w\u4e00-\u9fff]+", " ", t)
+    return re.sub(r" +", " ", t).strip()[:300]
+
+
 async def _unlink_proc_side_indexes(
     r: aioredis.Redis,
     element_id: str,
@@ -256,6 +273,8 @@ async def _unlink_proc_side_indexes(
                 "SREM", f"{PROC_BY_TOOL_PRE}{str(tool).lower()}", element_id,
             )
     if task:
+        # Both shapes: rows written before the canonical key existed still hold the raw string.
+        pipe.execute_command("HDEL", PROC_TASK_KEY, proc_task_key(task))
         pipe.execute_command("HDEL", PROC_TASK_KEY, task[:300])
     try:
         await pipe.execute()
@@ -1434,8 +1453,11 @@ async def find_procedure_by_task(
     is only accepted when the row belongs to the caller's track; otherwise the
     lookup falls through to a scoped vector search, which never crosses tracks.
     """
-    mapped = await r.hget(PROC_TASK_KEY, task[:300])
-    if mapped:
+    key = proc_task_key(task)
+    for k_key in (key, task[:300]):          # canonical first, then the pre-migration shape
+        mapped = await r.hget(PROC_TASK_KEY, k_key)
+        if not mapped:
+            continue
         elem = decode_bytes(mapped)
         try:
             raw = await r.execute_command("VGETATTR", PROC_KEY, elem)
@@ -1443,12 +1465,18 @@ async def find_procedure_by_task(
         except Exception:
             attrs = {}
         if attrs.get("task") and scope.matches(attrs):
+            if k_key != key:
+                try:
+                    await r.hset(PROC_TASK_KEY, key, elem)
+                except Exception:
+                    pass
             return {"score": 1.0, "attrs": attrs, "_element": elem}
     for item in await nearest_procedures(r, embedding, k=k,
                                          filter_expr=scope.filter() or None):
-        if item["attrs"].get("task") == task and item["score"] >= min_score:
+        if (item["attrs"].get("task") == task or
+                proc_task_key(item["attrs"].get("task")) == key) and item["score"] >= min_score:
             try:
-                await r.hset(PROC_TASK_KEY, task[:300], item["_element"])
+                await r.hset(PROC_TASK_KEY, key, item["_element"])
             except Exception:
                 pass
             return item
@@ -1475,6 +1503,7 @@ async def save_procedure(
     task_key = task[:300]
     attrs = {
         "task":          task_key,
+        "task_key":      proc_task_key(task),
         "content":       task_key,
         "procedure":     procedure[:1000],
         "tools_used":    tools,
@@ -1495,7 +1524,7 @@ async def save_procedure(
     except Exception as e:  # pragma: no cover - cache is best-effort
         log.warning("procedure vector cache failed for %s: %s", uid, e)
     try:
-        await r.hset(PROC_TASK_KEY, task_key, uid)
+        await r.hset(PROC_TASK_KEY, attrs["task_key"], uid)
     except Exception:
         pass
     # Populate reverse index for each tool

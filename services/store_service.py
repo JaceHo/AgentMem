@@ -152,7 +152,7 @@ def format_prepend(
         for p in proc_ctx:
             task = p.get("task", "")
             procedure = p.get("procedure", "")
-            display = task.split("] ", 1)[-1] if task.startswith("[skill:") else task
+            display = task.split("] ", 1)[-1] if task.startswith("[skill") else task
             body_hint = procedure[:200].replace("\n", " ").strip()
             line = f"- **{display}**" + (f": {body_hint}" if body_hint else "")
             if not _add(line):
