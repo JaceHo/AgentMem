@@ -134,6 +134,7 @@ import os
 import httpx
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 BASE_URL = os.getenv("AGENTMEMORY_URL", "http://127.0.0.1:18800").rstrip("/")
 TIMEOUT  = 12.0
@@ -156,9 +157,57 @@ def _auth_headers() -> dict[str, str]:
             key = ""
     return {"X-API-Key": key} if key else {}
 
+
+def _mcp_transport_security() -> TransportSecuritySettings:
+    """LAN-friendly Host allowlist for Streamable HTTP /mcp.
+
+    FastMCP defaults to localhost-only DNS-rebinding protection, which rejects
+    ``Host: 192.168.31.105:18800`` with 421 and makes Cursor invent OAuth.
+    Trust loopback + this mesh LAN; extend via AGENTMEM_MCP_ALLOWED_HOSTS.
+    """
+    hosts = [
+        "127.0.0.1:*",
+        "localhost:*",
+        "[::1]:*",
+        "192.168.31.105:*",
+        "192.168.31.105",
+    ]
+    origins = [
+        "http://127.0.0.1:*",
+        "http://localhost:*",
+        "http://[::1]:*",
+        "http://192.168.31.105:*",
+        "http://192.168.31.105",
+    ]
+    for h in os.getenv("AGENTMEM_MCP_ALLOWED_HOSTS", "").split(","):
+        h = h.strip()
+        if not h:
+            continue
+        hosts.append(h if (":" in h or h.endswith(":*")) else f"{h}:*")
+        if h.startswith("http"):
+            origins.append(h if ":*" in h else f"{h}:*")
+        else:
+            origins.append(f"http://{h}:*" if ":*" not in h else f"http://{h}")
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=hosts,
+        allowed_origins=origins,
+    )
+
+
 mcp = FastMCP(
     "agentmem",
     json_response=True,
+    # F15 (2026-11-05) — memory-leak fix. In stateful mode the StreamableHTTP
+    # session manager keeps every transport in `_server_instances` until the
+    # client sends an explicit DELETE; the MCP client here polls ListTools /
+    # ListPrompts every 1-3s and never terminates, so the registry grew without
+    # bound (~0.5-1MB/session, measured +13MB/45s => ~25GB/day; the process hit
+    # 42.6GB and drove the host into 40GB of swap). All agentmem tools are
+    # stateless request/response over HTTP, so a fresh transport per request is
+    # correct and nothing accumulates.
+    stateless_http=True,
+    transport_security=_mcp_transport_security(),
     instructions=(
         "AgentMem gives you persistent, cross-session memory. "
         "Call recall_memory at the start of each conversation with the user's question as the query. "
@@ -245,7 +294,7 @@ async def recall_memory(
     memory_limit_number: int = 6,
     include_tools: bool = True,
     include_graph: bool = False,
-    enable_hyde: bool = True,
+    enable_hyde: bool = False,
     user_id: str = "",
     agent_id: str = "",
 ) -> str:
@@ -449,7 +498,7 @@ async def batch_recall_memory(
             _post("/recall", {
                 "query": q, "session_id": session_id,
                 "memory_limit_number": memory_limit_number,
-                "enable_hyde": True,
+                "enable_hyde": False,
                 "user_id": user_id, "agent_id": agent_id,
             })
             for q in qs

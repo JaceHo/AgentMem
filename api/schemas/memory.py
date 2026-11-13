@@ -23,7 +23,9 @@ class RecallRequest(BaseModel):
     include_graph: bool = False
     auto_graph: bool = True
     enable_planning: bool = False
-    enable_hyde: bool = True
+    # LAN/SOTA default: hybrid retrieval without LLM on the hot path.
+    # Opt in with enable_hyde=true when the query is vague and latency budget allows.
+    enable_hyde: bool = False
     enable_reflection: bool = False
     token_budget: int | None = None
     time_from: int | None = None

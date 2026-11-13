@@ -137,6 +137,8 @@ class TestQuerySpecificity:
     def test_gate_constant_is_sane(self):
         import main
         assert main._AUG_SPECIFICITY_FLOOR >= 1
+        # Default floor is 2 so one strong identifier skips LLM augmentation.
+        assert main._AUG_SPECIFICITY_FLOOR <= 3
 
 
 class TestAugmentationSkip:

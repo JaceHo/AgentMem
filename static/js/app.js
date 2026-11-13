@@ -11,7 +11,7 @@ const S = {
   WS_MAX: 5,
 };
 
-const TABS = ['dashboard','graph','memories','timeline','sessions','procedures','search','audit','activity','profile','replay','logs','api'];
+const TABS = ['dashboard','graph','memories','timeline','sessions','procedures','knowledge','search','audit','activity','profile','replay','logs','api'];
 
 /* ── Utilities ─────────────────────────────────────────────────────────── */
 const $ = id => document.getElementById(id);
@@ -58,6 +58,7 @@ function loadTab(t) {
     timeline: () => window.loadTL?.(),
     sessions: () => window.loadSess?.(),
     procedures: () => window.loadProcs?.(),
+    knowledge: () => window.loadKB?.(),
     search: () => {},
     audit: () => window.loadAudit?.(),
     activity: () => window.loadAct?.(),

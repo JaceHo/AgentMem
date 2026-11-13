@@ -1907,12 +1907,13 @@ async def system_prompt(agent: str = ""):
 
 
 
-_RECALL_AUGMENT_BUDGET_S = float(_os.getenv("AGENTMEM_RECALL_AUGMENT_BUDGET", "2.5"))
+# Default 0.35s: enough for a hot aiserv flash reply, not enough to dominate P50.
+# Set AGENTMEM_RECALL_AUGMENT_BUDGET=0 to force pure hybrid (no HyDE/MIRIX wait).
+_RECALL_AUGMENT_BUDGET_S = float(_os.getenv("AGENTMEM_RECALL_AUGMENT_BUDGET", "0.35"))
 
 # A query scoring at least this many specificity points skips HyDE/MIRIX.
-# 3 points is roughly "three long/identifier/path tokens" — enough for the
-# symbolic and BM25 passes to act on without an LLM rewrite.
-_AUG_SPECIFICITY_FLOOR = 3
+# 2 ≈ one strong identifier/path or two long tokens — enough for BM25/symbolic.
+_AUG_SPECIFICITY_FLOOR = int(_os.getenv("AGENTMEM_AUG_SPECIFICITY_FLOOR", "2"))
 
 # Tokens below this length carry little lexical signal on their own.
 _SPECIFIC_TOKEN_MIN_LEN = 5

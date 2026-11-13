@@ -23,6 +23,7 @@
     <button class="tab" data-t="timeline">Timeline</button>
     <button class="tab" data-t="sessions">Sessions</button>
     <button class="tab" data-t="procedures">Procedures</button>
+    <button class="tab" data-t="knowledge">Knowledge</button>
     <button class="tab" data-t="search">Search</button>
     <button class="tab" data-t="audit">Audit</button>
     <button class="tab" data-t="activity">Activity</button>
@@ -154,6 +155,23 @@
     </div>
   </section>
 
+  <!-- KNOWLEDGE BASE -->
+  <section id="p-knowledge" class="pane">
+    <div class="g2">
+      <div class="card"><div class="ch">KB Status</div><div id="kb-status" class="cb"></div></div>
+      <div class="card"><div class="ch">Index (Tier 0)</div><div id="kb-index" class="cb" style="max-height:280px;overflow:auto"></div></div>
+    </div>
+    <div class="card" style="margin-top:10px">
+      <div class="ch">KB Search (Tier 2)
+        <div style="float:right;display:flex;gap:4px">
+          <input id="kbq" placeholder="Search knowledge base..." style="font-size:11px;padding:2px 6px;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);color:var(--text);width:260px" onkeydown="if(event.key==='Enter')kbSearch()">
+          <button class="btn sm pri" onclick="kbSearch()">Search</button>
+        </div>
+      </div>
+      <div id="kb-hits" class="cb"></div>
+    </div>
+  </section>
+
   <!-- SEARCH -->
   <section id="p-search" class="pane">
     <div class="card">
@@ -252,7 +270,7 @@
 </div>
 
 <!-- ═══ JS MODULES ═══ -->
-<script src="/js/app.js?v=3"></script>
+<script src="/js/app.js?v=4"></script>
 <script src="/js/ws.js?v=3"></script>
 <script src="/js/dashboard.js?v=3"></script>
 <script src="/js/graph.js?v=7"></script>
@@ -260,6 +278,7 @@
 <script src="/js/timeline.js?v=3"></script>
 <script src="/js/sessions.js?v=3"></script>
 <script src="/js/procedures.js?v=3"></script>
+<script src="/js/knowledge.js?v=1"></script>
 <script src="/js/search.js?v=3"></script>
 <script src="/js/audit.js?v=3"></script>
 <script src="/js/activity.js?v=3"></script>

@@ -20,7 +20,7 @@ from core import persona as persona_mod
 from core import scene as scene_mod
 from core import store as mem_store
 from core.scope import BadScope, strict_scope
-from core.search import async_encode, encode
+from core.search import async_encode
 from core.utils import decode_attrs, decode_bytes
 
 log = logging.getLogger("mem")
@@ -105,7 +105,7 @@ async def register_env(req: EnvState):
 async def recall_tools_endpoint(req: RecallToolsRequest):
     """Semantic search over registered tools."""
     t0 = time.time()
-    emb = encode(req.query)
+    emb = await async_encode(req.query)
     tools = await cap_mod.recall_tools(
         state.redis, emb,
         k=req.k,
@@ -131,7 +131,7 @@ async def recall_procedures(req: RecallProceduresRequest):
         scope = strict_scope(req.user_id, req.agent_id)
     except BadScope as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    emb = encode(req.query)
+    emb = await async_encode(req.query)
     blob = emb.astype("float32").tobytes()
     cmd = ["VSIM", mem_store.PROC_KEY, "FP32", blob,
            "COUNT", req.k + 1, "WITHSCORES", "WITHATTRIBS"]
@@ -204,7 +204,7 @@ async def _store_proc_now(r, req, scope=None) -> str:
     """Embed + persist one procedure. Raises if the embedder is down — callers must handle it."""
     if scope is None:
         scope = strict_scope(req.user_id, req.agent_id)
-    emb = encode(req.task)
+    emb = await async_encode(req.task)
     sc = scene_mod.detect(req.task)
     hit = await mem_store.find_procedure_by_task(r, emb, req.task, scope=scope)
     dedup_score = 1.0
@@ -371,6 +371,13 @@ async def store_procedure(req: StoreProcedureRequest, background_tasks: Backgrou
 @router.post("/tool-feedback")
 async def tool_feedback(req: ToolFeedbackRequest):
     """Record success/failure for a tool invocation (ToolMem)."""
+    if not req.tool_name:
+        # Empty names used to become tool="" and pollute ToolMem; reject loudly
+        # so hooks fix their payload (aliases: tool_name | name | tool).
+        raise HTTPException(
+            status_code=400,
+            detail="tool_name is required (aliases: name, tool)",
+        )
     r = state.redis
     elem_key = req.tool_name.lower().replace(" ", "_").replace("/", "_")[:64]
 
@@ -520,7 +527,7 @@ async def detect_meta_tools(threshold: int = 5, background_tasks: BackgroundTask
             if mapped:
                 continue
             try:
-                emb = encode(task)
+                emb = await async_encode(task)
             except Exception as e:
                 embed_failures += 1
                 log.warning("[awo] embed failed for %s: %s", a, e)
@@ -570,7 +577,7 @@ async def detect_meta_tools(threshold: int = 5, background_tasks: BackgroundTask
 async def procedure_feedback(req: ProcedureFeedbackRequest):
     """Record success/failure for a procedure retrieval (MACLA)."""
     r = state.redis
-    emb = encode(req.task_prefix[:80])
+    emb = await async_encode(req.task_prefix[:80])
     blob = emb.astype("float32").tobytes()
     try:
         results = await r.execute_command(

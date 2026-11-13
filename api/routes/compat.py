@@ -22,7 +22,7 @@ from core import embedder
 from core import persona as persona_mod
 from core import store as mem_store
 from core.scope import BadScope, scope_of, strict_scope
-from core.search import encode
+from core.search import async_encode
 from core.utils import decode_bytes, decode_attrs
 from services.store_service import (
     format_prepend, do_compress_session, observe_internal, rrf_merge,
@@ -142,7 +142,7 @@ async def enrich(req: EnrichRequest, request: Request):
     file_contexts = []
     for f in files[:5]:
         fname = os.path.basename(f)
-        emb = encode(fname)
+        emb = await async_encode(fname)
         results = await mem_store.knn_search(r, mem_store.FACT_KEY, emb, k=3)
         for res in results:
             attrs = res.get("attrs", {})
@@ -150,7 +150,7 @@ async def enrich(req: EnrichRequest, request: Request):
                 file_contexts.append(attrs["content"][:200])
 
     if query:
-        emb = encode(query)
+        emb = await async_encode(query)
         results = await mem_store.knn_search(r, mem_store.FACT_KEY, emb, k=5)
         for res in results:
             attrs = res.get("attrs", {})
@@ -186,7 +186,7 @@ async def compat_context(req: ContextRequest, request: Request):
     facts = []
     episodes = []
     if query:
-        emb = encode(query)
+        emb = await async_encode(query)
         scope_filter = scope.filter() or None
         facts = await mem_store.knn_search(r, mem_store.FACT_KEY, emb, k=8,
                                            filter_expr=scope_filter)
@@ -281,7 +281,7 @@ async def claude_bridge_sync(req: ClaudeBridgeSyncRequest, request: Request):
     pinned_raw = await r.get("mem:pinned:session_summary")
     last_summary = decode_bytes(pinned_raw)
 
-    emb = encode(project or "project context")
+    emb = await async_encode(project or "project context")
     facts = await mem_store.knn_search(r, mem_store.FACT_KEY, emb, k=10)
     episodes = await mem_store.knn_search(r, mem_store.EPISODE_KEY, emb, k=6)
 
@@ -330,7 +330,7 @@ async def compat_search(req: SearchRequest, request: Request):
 
     r = state.redis
     sid = _compat_sid(req)
-    emb = encode(req.query)
+    emb = await async_encode(req.query)
     try:
         scope = strict_scope(req.user_id, req.agent_id)
     except BadScope as exc:
@@ -388,7 +388,7 @@ async def compat_remember(req: RememberRequest, request: Request):
 
     r = state.redis
     content = req.content
-    emb = encode(content)
+    emb = await async_encode(content)
     try:
         scope = strict_scope(req.user_id, req.agent_id)
     except BadScope as exc:
@@ -413,7 +413,7 @@ async def compat_forget(req: ForgetRequest, request: Request):
     _compat_check_auth(request)
 
     r = state.redis
-    emb = encode(req.query)
+    emb = await async_encode(req.query)
     try:
         scope = strict_scope(req.user_id, req.agent_id)
     except BadScope as exc:
@@ -556,7 +556,7 @@ async def file_context(req: FileContextRequest, request: Request):
     all_results = []
     for f in files[:10]:
         fname = os.path.basename(f)
-        emb = encode(fname)
+        emb = await async_encode(fname)
         results = await mem_store.knn_search(r, mem_store.EPISODE_KEY, emb, k=5,
                                               filter_expr=f'.session_id != "{sid}"')
         for res in results:
@@ -576,7 +576,7 @@ async def compat_patterns(req: PatternsRequest, request: Request):
 
     r = state.redis
     query = req.query or "recurring patterns"
-    emb = encode(query)
+    emb = await async_encode(query)
     facts = await mem_store.knn_search(r, mem_store.FACT_KEY, emb, k=req.limit)
 
     categories = {}
@@ -598,18 +598,44 @@ async def smart_search(req: SmartSearchRequest, request: Request):
     _compat_check_auth(request)
 
     r = state.redis
-    emb = encode(req.query)
+    emb = await async_encode(req.query)
     facts = await mem_store.knn_search(r, mem_store.FACT_KEY, emb, k=req.limit)
     episodes = await mem_store.knn_search(r, mem_store.EPISODE_KEY, emb, k=req.limit)
+    # Lexical leg — without BM25, pure vector RRF returns near-random low scores
+    # on short/noisy queries (live audit: never* rules at ~0.016).
+    bm25: list[dict] = []
+    try:
+        bm25 = await state.bm25_index.search(req.query, k=req.limit) or []
+    except Exception as e:
+        log.debug("[smart-search] bm25 unavailable: %s", e)
 
-    merged = rrf_merge([facts, episodes], weights=[1.0, 0.8], limit=req.limit)
+    sources = [facts, episodes]
+    weights = [1.0, 0.8]
+    if bm25:
+        sources.append(bm25)
+        weights.append(1.2)
+    merged = rrf_merge(sources, weights=weights, limit=max(req.limit * 2, 20))
+
+    # Relative floor: drop junk tails (score << top). Absolute floor catches
+    # all-noise result sets where even the top hit is meaningless.
+    min_abs = float(os.getenv("AGENTMEM_SMART_SEARCH_MIN_SCORE", "0.02"))
+    rel = float(os.getenv("AGENTMEM_SMART_SEARCH_REL_FLOOR", "0.35"))
+    top = merged[0].get("score", 0.0) if merged else 0.0
+    floor = max(min_abs, top * rel) if top > 0 else min_abs
+    filtered = [m for m in merged if float(m.get("score") or 0) >= floor][: req.limit]
+    if not filtered and merged:
+        filtered = merged[: min(3, req.limit)]  # never return a silent empty on weak hits
 
     return {
         "results": [{
             "content": m.get("content", "")[:300],
-            "category": m.get("attrs", {}).get("category", ""),
-            "score": round(m.get("score", 0), 4),
-        } for m in merged],
+            "category": m.get("attrs", {}).get("category", "")
+                        or (m.get("attrs") or {}).get("category", "")
+                        or m.get("category", ""),
+            "score": round(float(m.get("score") or 0), 4),
+        } for m in filtered],
+        "floor": round(floor, 4),
+        "candidates": len(merged),
     }
 
 
@@ -721,7 +747,7 @@ async def compat_import(req: ImportRequest, request: Request):
         content = item.get("content", "")
         if not content:
             continue
-        emb = encode(content)
+        emb = await async_encode(content)
         row = scope_of(item.get("user_id") or default.user_id,
                        item.get("agent_id") or default.agent_id)
         await mem_store.save_episode(
@@ -739,7 +765,7 @@ async def compat_import(req: ImportRequest, request: Request):
         content = item.get("content", "")
         if not content:
             continue
-        emb = encode(content)
+        emb = await async_encode(content)
         row = scope_of(item.get("user_id") or default.user_id,
                        item.get("agent_id") or default.agent_id)
         await mem_store.save_fact(

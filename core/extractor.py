@@ -159,21 +159,18 @@ def _regex_extract(user_text: str) -> list[ExtractedFact]:
 
 AISERV_BASE  = os.getenv("AISERV_URL", "http://127.0.0.1:4000")
 AISERV_URL   = f"{AISERV_BASE}/v1/chat/completions"
-AISERV_KEY   = "sk-aiserv-local"
+AISERV_KEY   = os.getenv("AISERV_KEY", "sk-aiserv-local-dev")
 AISERV_ROLE  = "nlp"                    # maps to /v1/role/nlp
-AISERV_FALLBACK_MODEL = "ZhipuAI/GLM-4.7-Flash"  # direct fallback if /v1/role/nlp returns broken models
+# Prefer aiserv/fast role alias when role API is down — aiserv routes it.
+AISERV_FALLBACK_MODEL = os.getenv("AGENTMEM_EXTRACT_FALLBACK", "aiserv/fast")
 AISERV_MODEL_CASCADE = []               # populated dynamically; kept for import compat
-# Extraction runs inside the background _do_store task — the HTTP caller is
-# already "queued", so these timeouts never block anyone. 6s dropped facts
-# wholesale under load ("all models circuit-broken" → regex=0 → facts+0);
-# 12s still timed out with aiserv under concurrent mesh load. Structured
-# 1500-token extraction simply needs this much headroom.
-FAST_LLM_TIMEOUT_S = 20.0              # fast models: generous — background task
-ROLE_LLM_TIMEOUT_S = 60.0              # premium/reasoning models: role:nlp sometimes
-                                       # routes slow reasoners (Intern-S1) that finish
-                                       # in 30-60s — extraction is background, wait
+# Extraction is background, but long cascades (20–60s × N models) still pile
+# writer avg_ms into the 20–30s range and flood stderr with timeouts. Fail
+# fast to regex when aiserv is slow; quality-feedback still trains the router.
+FAST_LLM_TIMEOUT_S = float(os.getenv("AGENTMEM_EXTRACT_FAST_TIMEOUT", "8.0"))
+ROLE_LLM_TIMEOUT_S = float(os.getenv("AGENTMEM_EXTRACT_ROLE_TIMEOUT", "12.0"))
 LLM_TIMEOUT_S = ROLE_LLM_TIMEOUT_S
-LLM_MAX_RETRIES = 3
+LLM_MAX_RETRIES = int(os.getenv("AGENTMEM_EXTRACT_MAX_RETRIES", "2"))
 
 # Circuit breaker: models that failed recently are skipped for 5 minutes.
 # A single timeout must not lock the model out — aiserv blips were turning

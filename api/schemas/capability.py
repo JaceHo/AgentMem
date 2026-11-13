@@ -1,6 +1,6 @@
 """API schemas for capability (tool/env/procedure) endpoints."""
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field, field_validator
 
 
 class ToolDefinition(BaseModel):
@@ -57,9 +57,26 @@ class RecallProceduresRequest(RecallToolsRequest):
 
 
 class ToolFeedbackRequest(BaseModel):
-    tool_name: str                      # slugified tool name (e.g. "web_search_prime")
-    success: bool                       # did the tool invocation succeed?
-    session_id: str = ""
+    # Hooks / plugins historically used tool_name, name, or tool.
+    tool_name: str = Field(
+        default="",
+        description="Slugified tool name (e.g. web_search_prime)",
+        validation_alias=AliasChoices("tool_name", "name", "tool"),
+    )
+    success: bool = Field(
+        default=False,
+        description="Did the tool invocation succeed?",
+        validation_alias=AliasChoices("success", "ok", "succeeded"),
+    )
+    session_id: str = Field(
+        default="",
+        validation_alias=AliasChoices("session_id", "sessionId", "session"),
+    )
+
+    @field_validator("tool_name")
+    @classmethod
+    def _strip_tool_name(cls, v: str) -> str:
+        return (v or "").strip()
 
 
 class ToolSequenceRequest(BaseModel):
