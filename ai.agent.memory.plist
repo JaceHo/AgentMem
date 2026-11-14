@@ -61,7 +61,9 @@
          Keep this file equal to ~/Library/LaunchAgents/ai.agent.memory.plist — a
          restore from git must not resurrect a width the index cannot hold. -->
     <key>EMBEDDING_PROVIDER</key>
-    <string>local</string>
+    <string>ollama</string>
+    <key>OLLAMA_EMBED_MODEL</key>
+    <string>qwen3-embedding:0.6b</string>
     <key>EMBEDDING_MODEL</key>
     <string>/Users/jace/.cache/models/qwen3-embedding-0.6b</string>
     <key>EMBEDDING_DIMS</key>

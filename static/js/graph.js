@@ -67,14 +67,52 @@ function edgeFlowColor(type, hot) {
 
 // ── Data loading ─────────────────────────────────────────────────────────────
 
-async function loadGraph() {
+function resizeGCanvas() {
+  const gc = $('gcanvas');
+  if (!gc?.parentElement) return false;
+  const wrap = gc.parentElement;
+  const W = wrap.clientWidth;
+  if (W < 40) return false;
+  const H = Math.max(550, window.innerHeight - 140);
+  G.dpr = window.devicePixelRatio || 1;
+  gc.style.width = W + 'px';
+  gc.style.height = H + 'px';
+  gc.width = W * G.dpr;
+  gc.height = H * G.dpr;
+  return true;
+}
+
+async function loadGraph(opts) {
+  const auto = !!(opts && opts.auto);
+  const sized = !!(opts && opts._sized);
+  // Tab enter: wait 2 frames so the pane is laid out (clientWidth > 0).
+  if (auto && !sized) {
+    if ($('ginfo')) $('ginfo').textContent = 'Loading…';
+    requestAnimationFrame(() =>
+      requestAnimationFrame(() => loadGraph({ auto: true, _sized: true }))
+    );
+    return;
+  }
   const q = $('gq')?.value?.trim() || '';
+  if (auto && G.loaded && !q && G.nodes.length) {
+    resizeGCanvas();
+    if (!G.running) startSimulation();
+    else renderG();
+    return;
+  }
+  resizeGCanvas();
+  if ($('ginfo')) $('ginfo').textContent = 'Loading…';
+
+  try {
   const [stats, graphData] = await Promise.all([
     api('/graph/stats'),
     q ? api(`/graph/${encodeURIComponent(q)}`) : api('/graph/nodes?limit=80'),
   ]);
 
-  if (!stats) return;
+  if (!stats) {
+    if ($('ginfo')) $('ginfo').textContent = 'Graph stats unavailable';
+    return;
+  }
   const nc = stats.total_nodes || stats.nodes || 0;
   const ec = stats.total_edges || stats.edges || 0;
   $('ginfo').textContent = `${nc} entities · ${ec} relations`;
@@ -93,12 +131,16 @@ async function loadGraph() {
 
   if (!rawNodes.length) {
     $('ginfo').textContent = 'No graph data yet — store some memories first.';
+    G.loaded = false;
     return;
   }
 
   const maxConn = Math.max(1, ...rawNodes.map(n => n.connections || 1));
   const canvas = $('gcanvas');
-  const W = canvas.width / G.dpr, H = canvas.height / G.dpr;
+  if (!canvas) return;
+  resizeGCanvas();
+  const W = Math.max(canvas.width / G.dpr, 320);
+  const H = Math.max(canvas.height / G.dpr, 400);
   const maxR = Math.min(W, H) * 0.38;
 
   // Sort nodes by connections (hubs first) for staggered entrance
@@ -148,6 +190,11 @@ async function loadGraph() {
 
   renderGSidebar();
   startSimulation();
+  } catch (err) {
+    console.error('[graph] loadGraph failed', err);
+    if ($('ginfo')) $('ginfo').textContent = 'Graph load failed — click Go';
+    G.loaded = false;
+  }
 }
 
 // ── Physics simulation ───────────────────────────────────────────────────────
@@ -938,19 +985,8 @@ function searchNode(entityId) {
 function setupGCanvas() {
   const gc = $('gcanvas'); if (!gc) return;
   G.dpr = window.devicePixelRatio || 1;
-
-  function resizeCanvas() {
-    const wrap = gc.parentElement;
-    if (!wrap) return;
-    const W = wrap.clientWidth;
-    const H = Math.max(550, window.innerHeight - 140);
-    gc.style.width = W + 'px';
-    gc.style.height = H + 'px';
-    gc.width = W * G.dpr;
-    gc.height = H * G.dpr;
-  }
-  resizeCanvas();
-  window.addEventListener('resize', () => { resizeCanvas(); if (G.loaded) renderG(); });
+  resizeGCanvas();
+  window.addEventListener('resize', () => { resizeGCanvas(); if (G.loaded) renderG(); });
 
   // Wheel zoom — zoom toward cursor position
   gc.addEventListener('wheel', e => {
@@ -1168,6 +1204,7 @@ function toggleGSidebar() {
 
 document.addEventListener('DOMContentLoaded', setupGCanvas);
 
+window.G = G;
 window.loadGraph = loadGraph;
 window.expandNode = expandNode;
 window.searchNode = searchNode;

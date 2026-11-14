@@ -29,7 +29,7 @@ from core import persona as persona_mod
 from core import scene as scene_mod
 from core import store as mem_store
 from core import summarizer
-from core.search import encode, vscan
+from core.search import async_encode, vscan
 from utils.text_processing import (
     flatten_message_content,
     estimate_tokens,
@@ -273,7 +273,7 @@ async def admission_gate(user_text: str) -> bool:
     text = user_text[:400]
 
     # F1 — Semantic novelty (w=0.25)
-    emb = encode(text)
+    emb = await async_encode(text)
     recent = await mem_store.knn_search(r, mem_store.EPISODE_KEY, emb, k=3)
     if recent:
         max_sim = max(res.get("score", 0.0) for res in recent)
@@ -543,7 +543,7 @@ async def do_store(messages: list[Message], session_id: str) -> None:
         turn_text = messages_to_text(clean)
         summary = await summarizer.summarize(turn_text)
 
-        ep_emb = encode(summary[:500])
+        ep_emb = await async_encode(summary[:500])
         similar = await mem_store.knn_search(state.redis, mem_store.EPISODE_KEY, ep_emb, k=1)
         is_dup = bool(similar and similar[0].get("score", 0.0) > 0.95)
         ep_saved = 0
@@ -566,7 +566,7 @@ async def do_store(messages: list[Message], session_id: str) -> None:
         for fact in facts:
             if contains_secret(fact.content):
                 continue
-            f_emb = encode(fact.content)
+            f_emb = await async_encode(fact.content)
             existing = await mem_store.knn_search(state.redis, mem_store.FACT_KEY, f_emb, k=1)
             if existing and existing[0].get("score", 0.0) > 0.95:
                 if fact.keywords and existing[0].get("score", 0.0) > 0.80:
@@ -620,7 +620,7 @@ async def do_store(messages: list[Message], session_id: str) -> None:
             "agent", "task", "notebook", "notebookedit", "mcp", "skill",
         }
         for pf in proc_facts:
-            p_emb = encode(pf.content)
+            p_emb = await async_encode(pf.content)
             existing = await mem_store.knn_search(state.redis, mem_store.PROC_KEY, p_emb, k=1)
             if not existing or existing[0].get("score", 0.0) < 0.90:
                 content_lower = pf.content.lower()
@@ -706,7 +706,7 @@ async def do_compress_session(session_id: str) -> dict:
 
     session_summary = await summarizer.summarize(ctx)
 
-    ep_emb = encode(session_summary[:500])
+    ep_emb = await async_encode(session_summary[:500])
     similar = await mem_store.knn_search(r, mem_store.EPISODE_KEY, ep_emb, k=1)
     ep_saved = 0
     if not similar or similar[0].get("score", 0.0) < 0.95:
@@ -727,7 +727,7 @@ async def do_compress_session(session_id: str) -> dict:
     for fact in facts:
         if contains_secret(fact.content):
             continue
-        f_emb = encode(fact.content)
+        f_emb = await async_encode(fact.content)
         existing = await mem_store.knn_search(r, mem_store.FACT_KEY, f_emb, k=1)
         if existing and existing[0].get("score", 0.0) > 0.95:
             if fact.keywords and existing[0].get("score", 0.0) > 0.80:
@@ -801,7 +801,7 @@ async def observe_internal(session_id: str, _project: str, _cwd: str,
     if not await admission_gate(content):
         return {"status": "ok", "action": "skipped_gate"}
 
-    emb = encode(content)
+    emb = await async_encode(content)
     uid = await mem_store.save_episode(
         r, session_id, content, emb,
         ep_type=hook_type,
@@ -811,7 +811,7 @@ async def observe_internal(session_id: str, _project: str, _cwd: str,
     try:
         facts = await extractor.extract_facts(content, session_id)
         for fact_text, fact_attrs in facts:
-            fact_emb = encode(fact_text)
+            fact_emb = await async_encode(fact_text)
             await mem_store.save_fact(
                 r,
                 content=fact_text,

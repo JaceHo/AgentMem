@@ -11,7 +11,8 @@ const S = {
   WS_MAX: 5,
 };
 
-const TABS = ['dashboard','graph','memories','timeline','sessions','procedures','knowledge','search','audit','activity','profile','replay','logs','api'];
+const TABS = ['dashboard','memories','graph','knowledge','search','intentions','sessions','timeline','procedures','audit','activity','profile','replay','logs','api'];
+const PRIMARY_TABS = new Set(['dashboard','memories','graph','knowledge','search','intentions']);
 
 /* ── Utilities ─────────────────────────────────────────────────────────── */
 const $ = id => document.getElementById(id);
@@ -46,6 +47,11 @@ function switchTab(name, skipRoute) {
   S.tab = name;
   document.querySelectorAll('.tab').forEach(t => t.classList.toggle('on', t.dataset.t === name));
   document.querySelectorAll('.pane').forEach(p => p.classList.toggle('on', p.id === 'p-' + name));
+  const more = document.querySelector('.tabs-more');
+  if (more) {
+    if (!PRIMARY_TABS.has(name)) more.open = true;
+    else more.open = false;
+  }
   if (!skipRoute) location.hash = name;
   loadTab(name);
 }
@@ -53,12 +59,13 @@ function switchTab(name, skipRoute) {
 function loadTab(t) {
   const loaders = {
     dashboard: () => window.loadDash?.(),
-    graph: () => window.loadGraph?.(),
+    graph: () => window.loadGraph?.({ auto: true }),
     memories: () => window.loadMem?.(),
     timeline: () => window.loadTL?.(),
     sessions: () => window.loadSess?.(),
     procedures: () => window.loadProcs?.(),
     knowledge: () => window.loadKB?.(),
+    intentions: () => window.loadIntentions?.(),
     search: () => {},
     audit: () => window.loadAudit?.(),
     activity: () => window.loadAct?.(),
@@ -112,13 +119,14 @@ document.addEventListener('keydown', e => {
 
 /* ── Init ──────────────────────────────────────────────────────────────── */
 document.addEventListener('DOMContentLoaded', () => {
-  // Tab click handlers
-  document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () => switchTab(t.dataset.t)));
-  // Hash routing
+  document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', (e) => {
+    e.preventDefault();
+    switchTab(t.dataset.t);
+    const more = document.querySelector('.tabs-more');
+    if (more && PRIMARY_TABS.has(t.dataset.t)) more.open = false;
+  }));
   window.addEventListener('hashchange', () => switchTab(tabFromHash(), true));
   switchTab(tabFromHash(), true);
-  // Connect WebSocket
   window.connectWs?.();
-  // Auto-refresh dashboard every 30s
   setInterval(() => { if (S.tab === 'dashboard') window.loadDash?.() }, 30000);
 });

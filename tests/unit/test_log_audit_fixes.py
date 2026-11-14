@@ -69,8 +69,9 @@ def test_embedding_circuit_fails_fast_after_an_outage():
     embedder._embed_down_until = 0.0
     try:
         original = embedder._get_provider
-        embedder._get_provider = lambda: _Down()
-        with pytest.raises(httpx.ConnectError):
+        embedder._get_provider = lambda measure=True: _Down()
+        # Soft-fail: first outage becomes EmbeddingUnavailable (not raw ConnectError)
+        with pytest.raises(embedder.EmbeddingUnavailable):
             embedder.encode("audit")
         assert embedder.embedding_unavailable()
         with pytest.raises(embedder.EmbeddingUnavailable):

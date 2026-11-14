@@ -3,35 +3,41 @@
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>AgentMem</title>
-<link rel="stylesheet" href="/css/base.css?v=3">
-<link rel="stylesheet" href="/css/components.css?v=3">
+<link rel="stylesheet" href="/css/base.css?v=4">
+<link rel="stylesheet" href="/css/components.css?v=4">
 </head>
 <body>
 
-<!-- ═══ HEADER ═══ -->
-<header id="hdr">
+<!-- ═══ HEADER — primary ops nav + More for secondary panes ═══ -->
+<header id="hdr" class="hdr">
   <div class="hl">
     <span class="logo">AgentMem</span>
     <span id="dot" class="dot ok"></span>
     <span id="ver" style="font-size:10px;color:var(--text3)">v?</span>
     <span id="emb-info" style="font-size:9px;color:var(--text3);margin-left:4px"></span>
   </div>
-  <nav id="tabs">
+  <nav id="tabs" class="tabs-primary" aria-label="Primary">
     <button class="tab" data-t="dashboard">Dashboard</button>
-    <button class="tab" data-t="graph">Graph</button>
     <button class="tab" data-t="memories">Memories</button>
-    <button class="tab" data-t="timeline">Timeline</button>
-    <button class="tab" data-t="sessions">Sessions</button>
-    <button class="tab" data-t="procedures">Procedures</button>
+    <button class="tab" data-t="graph">Graph</button>
     <button class="tab" data-t="knowledge">Knowledge</button>
     <button class="tab" data-t="search">Search</button>
-    <button class="tab" data-t="audit">Audit</button>
-    <button class="tab" data-t="activity">Activity</button>
-    <button class="tab" data-t="profile">Profile</button>
-    <button class="tab" data-t="replay">Replay</button>
-    <button class="tab" data-t="logs">Logs</button>
-    <button class="tab" data-t="api">API</button>
+    <button class="tab" data-t="intentions">Intentions</button>
   </nav>
+  <details class="tabs-more">
+    <summary>More</summary>
+    <div class="tabs-more-panel" id="tabs-more">
+      <button class="tab" data-t="sessions">Sessions</button>
+      <button class="tab" data-t="timeline">Timeline</button>
+      <button class="tab" data-t="procedures">Procedures</button>
+      <button class="tab" data-t="audit">Audit</button>
+      <button class="tab" data-t="activity">Activity</button>
+      <button class="tab" data-t="profile">Profile</button>
+      <button class="tab" data-t="replay">Replay</button>
+      <button class="tab" data-t="logs">Logs</button>
+      <button class="tab" data-t="api">API</button>
+    </div>
+  </details>
   <div class="hr">
     <span id="live-cnt" class="live-cnt" style="display:none"><span class="live-dot"></span>LIVE</span>
     <span id="ws-badge" class="badge badge-ws off">OFF</span>
@@ -45,6 +51,7 @@
 
   <!-- DASHBOARD -->
   <section id="p-dashboard" class="pane on">
+    <div id="ops-strip" class="ops-strip"></div>
     <div class="g2">
       <div class="card"><div class="ch">Health<span id="uptime" style="float:right;font-size:10px;color:var(--text3)"></span></div><div id="health-info" class="cb"></div></div>
       <div class="card"><div class="ch">Memory Tiers</div><div id="tier-grid" class="g3 cb"></div></div>
@@ -57,6 +64,10 @@
     <div id="writer-info"></div>
     <div class="g2">
       <div class="card"><div class="ch">Gauges</div><div id="gauge-area" class="cb"></div></div>
+      <div class="card"><div class="ch">Focus &amp; Intentions</div><div id="dash-focus" class="cb"></div></div>
+    </div>
+    <div class="g2" style="margin-top:10px">
+      <div class="card"><div class="ch">Knowledge Base</div><div id="dash-kb" class="cb"></div></div>
       <div class="card"><div class="ch">Recent Observations</div><div id="dash-obs" class="cb"></div></div>
     </div>
     <div class="card" id="setup-card" style="margin-top:10px">
@@ -152,6 +163,41 @@
         </div>
       </div>
       <div id="plist" class="cb"></div>
+    </div>
+  </section>
+
+  <!-- INTENTIONS (prospective memory) -->
+  <section id="p-intentions" class="pane">
+    <div class="g2">
+      <div class="card">
+        <div class="ch">Active Focus
+          <button class="btn sm pri" style="float:right" onclick="saveFocus()">Save</button>
+        </div>
+        <div class="cb" style="display:flex;flex-direction:column;gap:8px">
+          <label style="font-size:10px;color:var(--text3)">Session
+            <input id="focus-sid" value="default" style="display:block;width:100%;margin-top:2px;font-size:11px;padding:4px 6px;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);color:var(--text)">
+          </label>
+          <label style="font-size:10px;color:var(--text3)">Goal
+            <input id="focus-goal" placeholder="Current working goal..." style="display:block;width:100%;margin-top:2px;font-size:11px;padding:4px 6px;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);color:var(--text)">
+          </label>
+          <label style="font-size:10px;color:var(--text3)">Notes
+            <textarea id="focus-notes" rows="4" placeholder="Hot buffer notes..." style="display:block;width:100%;margin-top:2px;font-size:11px;padding:4px 6px;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);color:var(--text);resize:vertical"></textarea>
+          </label>
+        </div>
+      </div>
+      <div class="card">
+        <div class="ch">Add Intention
+          <button class="btn sm pri" style="float:right" onclick="addIntention()">Add</button>
+        </div>
+        <div class="cb" style="display:flex;flex-direction:column;gap:8px">
+          <input id="int-text" placeholder="Remember to…" style="font-size:11px;padding:4px 6px;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);color:var(--text)">
+          <input id="int-cue" placeholder="Cue / when (optional)" style="font-size:11px;padding:4px 6px;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);color:var(--text)">
+        </div>
+      </div>
+    </div>
+    <div class="card" style="margin-top:10px">
+      <div class="ch">Pending Intentions</div>
+      <div id="int-list" class="cb"></div>
     </div>
   </section>
 
@@ -270,15 +316,16 @@
 </div>
 
 <!-- ═══ JS MODULES ═══ -->
-<script src="/js/app.js?v=4"></script>
+<script src="/js/app.js?v=5"></script>
 <script src="/js/ws.js?v=3"></script>
-<script src="/js/dashboard.js?v=3"></script>
-<script src="/js/graph.js?v=7"></script>
+<script src="/js/dashboard.js?v=5"></script>
+<script src="/js/graph.js?v=11"></script>
 <script src="/js/memories.js?v=3"></script>
 <script src="/js/timeline.js?v=3"></script>
 <script src="/js/sessions.js?v=3"></script>
 <script src="/js/procedures.js?v=3"></script>
 <script src="/js/knowledge.js?v=1"></script>
+<script src="/js/intentions.js?v=1"></script>
 <script src="/js/search.js?v=3"></script>
 <script src="/js/audit.js?v=3"></script>
 <script src="/js/activity.js?v=3"></script>

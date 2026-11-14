@@ -368,6 +368,14 @@ async def store_procedure(req: StoreProcedureRequest, background_tasks: Backgrou
     return {"status": "queued", "pending": pending}
 
 
+# Success-path debounce: hooks fire on every tool call (~189k lifetime). Failures
+# always write; successes coalesce per-tool within TOOL_FB_SUCCESS_INTERVAL_S so
+# Redis/VSET stay healthy without losing ToolMem signal.
+_TOOL_FB_LAST_OK: dict[str, float] = {}
+_TOOL_FB_PENDING_OK: dict[str, int] = {}
+_TOOL_FB_SUCCESS_INTERVAL_S = float(__import__("os").environ.get("AGENTMEM_TOOL_FB_INTERVAL", "1.5"))
+
+
 @router.post("/tool-feedback")
 async def tool_feedback(req: ToolFeedbackRequest):
     """Record success/failure for a tool invocation (ToolMem)."""
@@ -381,7 +389,28 @@ async def tool_feedback(req: ToolFeedbackRequest):
     r = state.redis
     elem_key = req.tool_name.lower().replace(" ", "_").replace("/", "_")[:64]
 
+    import time as _time
+    now = _time.monotonic()
+    if req.success:
+        last = _TOOL_FB_LAST_OK.get(elem_key, 0.0)
+        if (now - last) < _TOOL_FB_SUCCESS_INTERVAL_S:
+            _TOOL_FB_PENDING_OK[elem_key] = _TOOL_FB_PENDING_OK.get(elem_key, 0) + 1
+            return {
+                "ok": True,
+                "tool": elem_key,
+                "deferred": True,
+                "pending_ok": _TOOL_FB_PENDING_OK[elem_key],
+                "observed": False,
+            }
+        pending = _TOOL_FB_PENDING_OK.pop(elem_key, 0)
+        _TOOL_FB_LAST_OK[elem_key] = now
+    else:
+        pending = 0
+
     attrs = await cap_mod.atomic_tool_feedback(r, elem_key, req.success)
+    # Flush coalesced successes as extra increments (cheap Lua path).
+    for _ in range(min(pending, 50)):
+        attrs = await cap_mod.atomic_tool_feedback(r, elem_key, True) or attrs
     observed = False
     if not attrs:
         # Hooks report every tool Claude actually ran. Most 404s were tools

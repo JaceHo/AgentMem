@@ -3,11 +3,30 @@
    ═══════════════════════════════════════════════════════════════════════════ */
 
 async function loadDash() {
-  const [health, stats, sess, obs, gs] = await Promise.all([
+  const [health, stats, sess, obs, gs, kb, focus, intents] = await Promise.all([
     api('/health'), api('/stats'), api('/sessions?limit=5'),
-    api('/observations?limit=5'), api('/graph/stats')
+    api('/observations?limit=5'), api('/graph/stats'),
+    api('/kb/status'), api('/active-memory?session_id=default'),
+    api('/intentions?status=pending&limit=5'),
   ]);
   S.health = health; S.stats = stats;
+
+  // Ops strip: KB + writer errors + embedding — progressive disclosure for SOTA ops-first
+  const strip = $('ops-strip');
+  if (strip) {
+    const chips = [];
+    chips.push(`<span class="ops-chip"><b>Embed</b> ${esc(health?.embedding?.provider || '?')} ${health?.embedding?.dims || ''}d</span>`);
+    if (kb) chips.push(`<span class="ops-chip"><b>KB</b> ${kb.docs || 0} docs · ${kb.chunks || 0} chunks</span>`);
+    if (gs) chips.push(`<span class="ops-chip"><b>Graph</b> ${gs.total_nodes || gs.nodes || 0}n / ${gs.total_edges || gs.edges || 0}e</span>`);
+    const w = stats?.writer;
+    if (w) {
+      const cls = (w.errors || 0) > 0 ? 'ops-chip warn' : 'ops-chip';
+      chips.push(`<span class="${cls}"><b>Writer</b> ${Math.round((w.success_rate || 0) * 100)}% · ${w.avg_ms || 0}ms · err ${w.errors || 0}</span>`);
+    }
+    const pending = (intents?.intentions || []).length;
+    chips.push(`<span class="ops-chip"><b>Intentions</b> ${pending} pending</span>`);
+    strip.innerHTML = chips.join('');
+  }
 
   // Health dot
   const ok = health && health.status === 'ok';
@@ -96,6 +115,44 @@ async function loadDash() {
   }
   if (gs) { const n = gs.total_nodes || gs.nodes || 0, e = gs.total_edges || gs.edges || 0; gaugeH += gauge('Graph', Math.min(100, n / 10), 'var(--accent)', n + ' nodes, ' + e + ' edges') }
   $('gauge-area').innerHTML = gaugeH || '<div class="empty">No data</div>';
+
+  // Focus & intentions (deduped summary for elegant ops view)
+  const df = $('dash-focus');
+  if (df) {
+    const goal = focus?.goal || '';
+    const notes = focus?.notes || '';
+    const pending = intents?.intentions || [];
+    let html = '';
+    if (goal || notes) {
+      html += `<div style="font-size:11px;margin-bottom:6px"><b>Goal</b> ${esc(goal || '—')}</div>`;
+      if (notes) html += `<div style="font-size:10px;color:var(--text2);margin-bottom:8px">${esc(notes.slice(0, 160))}</div>`;
+    } else {
+      html += `<div class="empty" style="margin-bottom:8px">No active focus — set on Intentions tab</div>`;
+    }
+    if (pending.length) {
+      html += pending.slice(0, 4).map(it =>
+        `<div class="mc lo"><div class="mt">${esc((it.text || '').slice(0, 100))}${it.cue ? ` <span class="mi">cue:${esc(it.cue)}</span>` : ''}</div></div>`
+      ).join('');
+    } else {
+      html += `<div class="empty">No pending intentions</div>`;
+    }
+    df.innerHTML = html;
+  }
+
+  // KB card
+  const dkb = $('dash-kb');
+  if (dkb) {
+    if (kb) {
+      dkb.innerHTML = `<div style="font-size:12px;line-height:1.8">
+        <div><span style="color:var(--cyan)">●</span> Docs: <b>${kb.docs || 0}</b> · Chunks: <b>${kb.chunks || 0}</b></div>
+        <div><span style="color:var(--green)">●</span> BM25: ${kb.bm25_ready || 0} indexed</div>
+        <div style="color:var(--text3);font-size:10px">${esc(kb.embed_sig || '')}</div>
+        <button class="btn sm" style="margin-top:6px" onclick="switchTab('knowledge')">Open Knowledge</button>
+      </div>`;
+    } else {
+      dkb.innerHTML = '<div class="empty">KB status unavailable</div>';
+    }
+  }
 
   // Recent observations
   if (obs?.observations?.length) {

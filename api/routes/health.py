@@ -10,17 +10,55 @@ router = APIRouter(tags=["health"])
 
 @router.get("/health")
 async def health():
+    """Liveness + honest warmup state.
+
+    Deliberately 200 even while warming: this process IS alive, it is just not
+    finished loading the embedding model / BM25 index yet. Returning "degraded"
+    (or refusing the connection, as it used to) made supervisors kill a service
+    that was merely booting -- see core/warmup.py. Callers that need to know
+    whether real work will succeed must use /ready.
+    """
+    from core import warmup as warmup_mod
+
+    snap = warmup_mod.snapshot()
     r = state.redis
-    if r is None:
-        return {"status": "degraded", "redis": "not_connected",
-                "version": settings.app_version}
+    if not snap["ready"]:
+        return {"status": "starting", "redis": "pending" if r is None else "ok",
+                "version": settings.app_version, "warmup": snap}
     try:
         await r.ping()
         return {"status": "ok", "redis": "ok", "version": settings.app_version,
-                "embedding": state.embedder.get_provider_info()}
+                "embedding": state.embedder.get_provider_info(), "warmup": snap}
     except Exception as e:
         return {"status": "degraded", "redis": "error", "error": str(e),
-                "version": settings.app_version}
+                "version": settings.app_version, "warmup": snap}
+
+
+@router.get("/ready")
+async def ready():
+    """Readiness: 200 once core work (redis/indexes/kb) can be served.
+
+    ``embedding_ready`` is reported separately: the model loads in a background
+    stage and the embedder's lazy loader covers requests that arrive before it
+    finishes. Callers that require a warm model can poll this field instead of
+    blocking readiness — a stats/graph/metadata request must not wait behind a
+    20 s torch import.
+    """
+    from fastapi.responses import JSONResponse
+
+    from core import warmup as warmup_mod
+
+    snap = warmup_mod.snapshot()
+    if warmup_mod.is_ready():
+        return {"status": "ready", "embedding_ready": snap["embedding_ready"],
+                "warmup": snap}
+    resp = JSONResponse(
+        status_code=503,
+        content={"status": snap["phase"], "ready": False, "retry_after_s": 5,
+                 "warmup": snap},
+    )
+    resp.headers["Retry-After"] = "5"
+    return resp
 
 
 @router.get("/livez")

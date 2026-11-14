@@ -13,6 +13,7 @@ keyed by content hash for incremental re-ingest.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -25,7 +26,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from .embedder import embed_signature
-from .search import BM25Index, async_encode, async_encode_batch_chunked, encode
+from .search import BM25Index, async_encode, async_encode_batch_chunked
 from . import store as store_mod
 from .store import knn_search
 from .utils import decode_bytes
@@ -263,6 +264,28 @@ async def make_digest(title: str, sections: List[Dict[str, str]]) -> Tuple[str, 
 
 _CJK = re.compile(r"[\u3400-\u9fff]")
 _EXPANSIONS: Dict[str, str] = {}
+# Chinese headwords operators actually type, mapped to the English identifiers in the spec.
+# A timed-out translation used to be cached as "" and then skipped forever, so these
+# questions never got the English BM25 pass. The map is the pass that does not wait on aiserv.
+_HOUSE_TERMS = (
+    ("看门狗", "watchdog DOWN_AT ESCALATE_AT"),
+    ("未提交", "stash-guard restore"),
+    ("共享文件", "lockedwrite"),
+    ("兼容桥", "bridge plist"),
+    ("浏览器", "ego lite"),
+    ("人机回环", "ego_hitl"),
+    ("留下痕迹", "mem:proc_tasks"),
+    ("生命周期计数", "proc_guard"),
+    ("缺 Goal", "Goal warning"),
+    ("管理控制台", "127.0.0.1:4010"),
+    ("批了没人接", "open-lint G3"),
+    ("会话登记", "sessions.py register"),
+)
+
+
+def glossary_expansion(query: str) -> str:
+    """English identifiers for house words in a Chinese question. Empty if none match."""
+    return " ".join(en for zh, en in _HOUSE_TERMS if zh in query)
 
 
 async def expand_query(query: str) -> str:
@@ -279,6 +302,11 @@ async def expand_query(query: str) -> str:
         return ""
     if not _CJK.search(query):
         return ""
+    gloss = glossary_expansion(query)
+    if gloss:
+        # Known house words do not wait on an 8s translation. Measured 2026-11-02:
+        # a novel Chinese query burned the whole timeout and cached "" .
+        return gloss
     if query in _EXPANSIONS:
         return _EXPANSIONS[query]
     # A translation, not a keyword bag: a keyword version ("source notes version
@@ -290,6 +318,8 @@ async def expand_query(query: str) -> str:
         query, timeout=8,
     )
     out = " ".join(out.strip().strip('"').split())[:300]
+    if not out:
+        return ""
     if len(_EXPANSIONS) > 500:
         _EXPANSIONS.clear()
     _EXPANSIONS[query] = out
@@ -324,7 +354,7 @@ class KBStore:
     async def _seed(self, r) -> None:
         try:
             await r.execute_command("VADD", KB_CHUNK_KEY, "FP32",
-                                    _blob(encode("__seed__")), "__seed__",
+                                    _blob(await async_encode("__seed__")), "__seed__",
                                     "SETATTR", json.dumps({"_seed": True}))
         except Exception:
             pass  # already seeded (or dims differ) — non-fatal
@@ -565,9 +595,35 @@ class KBStore:
         return out
 
     async def warm(self, r) -> int:
-        """Rebuild the in-RAM BM25 index from Redis after a service restart."""
+        """Rebuild the in-RAM BM25 index from Redis after a service restart.
+
+        The two HGETALLs run on the loop (fast, async Redis), then the whole
+        tokenize+index build is handed to a worker thread via ``build_bulk`` so
+        the event loop is never blocked during warm-up — /livez /health /ready
+        keep answering. (The previous form awaited 2,083 ``bm25.add`` coroutines,
+        which starved the loop enough that /ready timed out mid-warmup.)
+        """
         elems = await r.hgetall(KB_TEXT_KEY)
-        n = 0
+        # One HGETALL for all doc metadata instead of one HGET inside the loop.
+        # The old form issued 2,083 sequential round-trips (one per chunk) on a
+        # corpus of 2,083 chunks, and on a memory-pressured host each round-trip
+        # cost ~100 ms -- measured 2026-11-05: restart sat in phase `kb_bm25` for
+        # 250 s+, which is most of a ~10 min cold start. Doc metadata is the same
+        # hash every time, so a single fetch removes the entire N+1.
+        try:
+            doc_meta_raw = await r.hgetall(KB_DOC_KEY) or {}
+        except Exception:
+            doc_meta_raw = {}
+        meta_by_doc: dict[str, dict] = {}
+        for _k, _v in doc_meta_raw.items():
+            try:
+                meta_by_doc[decode_bytes(_k)] = json.loads(_v) if _v else {}
+            except Exception:
+                meta_by_doc[decode_bytes(_k)] = {}
+
+        # Build the (uid, content, attrs, tier) tuples on the loop — cheap
+        # decode/split; the expensive tokenize+rank_bm25 build happens in-thread.
+        items: list[tuple[str, str, dict, str]] = []
         for elem_raw, content_raw in elems.items():
             # The pool runs with decode_responses=False, so BOTH the hash field
             # and the value come back as bytes. ``bytes.split(":")`` raises
@@ -577,16 +633,12 @@ class KBStore:
             elem = decode_bytes(elem_raw)
             content = decode_bytes(content_raw)
             doc_id = elem.split(":")[0]
-            attrs_raw = await r.hget(KB_DOC_KEY, doc_id)
-            meta = json.loads(attrs_raw) if attrs_raw else {}
-            await self.bm25.add(elem, content, {"content": content, "doc": doc_id,
-                                                "title": meta.get("title", ""), "path": meta.get("path", "")})
-            n += 1
-        # add() rebuilds every 10 docs in the background, so the last 0-9 chunks
-        # never reach the index and search() will not rebuild for a gap that
-        # small. /kb/status showed 1771 indexed of 1775 right after a restart.
-        await self.bm25.force_rebuild()
-        return n
+            meta = meta_by_doc.get(doc_id) or {}
+            items.append((elem, content,
+                          {"content": content, "doc": doc_id,
+                           "title": meta.get("title", ""), "path": meta.get("path", "")},
+                          "facts"))
+        return await asyncio.to_thread(self.bm25.build_bulk, items)
 
 
 _kb: Optional[KBStore] = None

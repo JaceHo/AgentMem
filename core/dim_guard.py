@@ -40,15 +40,29 @@ def _s(value: Any) -> str:
 
 
 async def scan_sets(redis) -> list[str]:
-    """Every Redis key of type `vectorset`, whatever its name."""
+    """Every Redis key of type `vectorset`, whatever its name.
+
+    One SCAN with the server-side TYPE filter (Redis >= 6.0) instead of a TYPE
+    round-trip per key. The old form issued one awaited ``TYPE`` per key in the
+    keyspace — 5,375 keys × ~30 ms measured ~160 s on a memory-pressured host
+    (2026-11-05), and it was on the hot path of BOTH the boot dim-guard phase
+    and every /kb/status poll. The filtered scan is ~11 round-trips for the
+    same answer. The per-key fallback only exists for ancient redis-py builds
+    without the ``_type`` kwarg.
+    """
     keys: list[str] = []
     cursor = 0
     while True:
-        cursor, batch = await redis.scan(cursor, match="*", count=500)
-        for raw in batch:
-            key = _s(raw)
-            if _s(await redis.type(key)) == VECTORSET_TYPE:
-                keys.append(key)
+        try:
+            cursor, batch = await redis.scan(cursor, match="*", count=500,
+                                             _type=VECTORSET_TYPE)
+        except TypeError:
+            cursor, batch = await redis.scan(cursor, match="*", count=500)
+            for raw in batch:
+                if _s(await redis.type(raw)) == VECTORSET_TYPE:
+                    keys.append(_s(raw))
+        else:
+            keys.extend(_s(raw) for raw in batch)   # already filtered server-side
         if cursor == 0:
             return sorted(keys)
 

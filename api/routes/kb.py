@@ -11,7 +11,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import json as _json
 import logging
+import time
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
@@ -119,23 +122,43 @@ async def kb_remove(req: KbRemoveRequest):
     return {"status": "removed" if removed else "absent", "doc": doc_id}
 
 
+def _count_stale(raw_vals: list, current: str) -> int:
+    """CPU side of the stale-embed scan. MUST run off the event loop."""
+    stale = 0
+    for raw in raw_vals:
+        try:
+            if _json.loads(raw).get("embed_sig", "") != current:
+                stale += 1
+        except Exception:  # noqa: BLE001 — a corrupt meta row is stale by definition
+            stale += 1
+    return stale
+
+
+# Dashboards poll /kb/status every few seconds; each poll used to re-pull and
+# re-parse every doc's metadata. A short TTL turns N polls into one scan.
+_STATUS_TTL_S = 5.0
+_status_cache: dict = {"at": 0.0, "payload": None}
+
+
 @router.get("/status")
 async def kb_status():
+    now = time.monotonic()
+    if _status_cache["payload"] is not None and now - _status_cache["at"] < _STATUS_TTL_S:
+        return _status_cache["payload"]
+
     r = _redis()
     docs = await r.hlen(kb_mod.KB_DOC_KEY)
     chunks = await r.hlen(kb_mod.KB_TEXT_KEY)
     # Docs written by another embedding provider are not comparable with today's
     # queries; they still occupy the vectorset and, left unreported, make search
     # look merely bad instead of broken. Re-ingest with force to clear this.
-    import json as _json
-    current = kb_mod.embed_signature()
-    stale = 0
-    for raw in await r.hvals(kb_mod.KB_DOC_KEY):
-        try:
-            if _json.loads(raw).get("embed_sig", "") != current:
-                stale += 1
-        except Exception:  # noqa: BLE001 — a corrupt meta row is stale by definition
-            stale += 1
+    current = kb_mod.embed_signature()   # cheap: constructs the provider, never loads it
+    # hvals pulls EVERY doc's full metadata JSON and each row gets parsed. On the
+    # event loop this measured 110 s for ~2k docs (2026-11-05) and froze every
+    # concurrent request — including readiness probes — behind it. Off-loop it is
+    # the same work with zero loop impact.
+    raw_vals = await r.hvals(kb_mod.KB_DOC_KEY)
+    stale = await asyncio.to_thread(_count_stale, raw_vals, current)
     # The width the model actually produces, next to the width the sets were built
     # with — a mismatch here is the one failure mode that blocks every write, so it
     # belongs in the status payload instead of only in the boot log.
@@ -146,7 +169,7 @@ async def kb_status():
     except Exception as exc:                                  # noqa: BLE001
         dims_block = {"dims": None, "dims_verified": False, "dims_mismatched": [],
                       "dims_error": str(exc)[:120]}
-    return {"docs": docs, "chunks": chunks,
+    return _cache_status({"docs": docs, "chunks": chunks,
             "embed_sig": current, "stale_embed": stale,
             "bm25_ready": len(kb_mod.get_kb().bm25._docs) if hasattr(kb_mod.get_kb().bm25, "_docs") else None,
             # What the BM25 index was actually BUILT from. warm() appends to the
@@ -154,4 +177,10 @@ async def kb_status():
             # of the warm-up can stay out of the index — and bm25_ready above
             # keeps reporting the full list length while it does.
             "bm25_indexed": getattr(kb_mod.get_kb().bm25, "_built_at_len", None),
-            **dims_block}
+            **dims_block})
+
+
+def _cache_status(payload: dict) -> dict:
+    _status_cache["payload"] = payload
+    _status_cache["at"] = time.monotonic()
+    return payload

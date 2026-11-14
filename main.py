@@ -169,6 +169,12 @@ logging.basicConfig(level=getattr(logging, settings.log_level), format=settings.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
+# Startup forensics: how long did the module imports above take? Under memory
+# pressure the torch/fastapi import chain was suspected of eating the first
+# minutes of boot (probe-timeout mystery: TCP accepted but no HTTP response).
+# _BOOT_T0 is captured as early as possible; lifespan logs the split.
+_BOOT_T0 = time.monotonic()
+
 
 class _ConciseNotificationFilter(logging.Filter):
     """The MCP SDK logs a multi-KB pydantic validation dump (WARNING) for every
@@ -365,61 +371,16 @@ async def _startup_bm25_populate(r, bm25_index) -> None:
 async def lifespan(app: FastAPI):
     global _redis
     from api import state as _state
-    log.info("Loading embedding model…")
-    embedder._get_provider()  # warm up embedding model
-    log.info("Connecting to Redis…")
-    _redis = await mem_store.get_client()
-    _state.redis = _redis  # share with compat/health/graph routes
+    from core import warmup as warmup_mod
 
-    # KB plane: rebuild the in-RAM BM25 index for knowledge-base chunks
-    try:
-        from core import kb as kb_mod
-        _warmed = await kb_mod.get_kb().warm(_redis)
-        if _warmed:
-            log.info("[kb] BM25 warm: %d chunks", _warmed)
-    except Exception as exc:
-        log.warning("[kb] warm skipped: %s", exc)
-
-    # Width integrity: the index is the source of truth, the model is measured.
-    # This used to check three hard-coded keys and, on mismatch, force-switch the
-    # provider — a config error became a silent model downgrade, and sets added
-    # later (mem:tools, kb chunks) were never checked at all.
-    await dim_guard.enforce(_get_redis())
-
-    log.info("Ensuring vectorset indexes…")
-    await mem_store.ensure_indexes(_get_redis())
-    # Persona hygiene: reject rules only guard *future* writes. Anything already
-    # in mem:persona (e.g. the national-ID-card path that was being injected into
-    # every agent's context on every recall) is re-filtered here once per boot,
-    # so a stale profile can never outlive the rule that should have blocked it.
-    try:
-        _dropped = await persona_mod.sanitize_stored(_get_redis())
-        if _dropped:
-            log.info("[persona] startup hygiene removed stale entries from %d field(s): %s",
-                     len(_dropped), _dropped)
-    except Exception as exc:
-        log.warning("[persona] startup hygiene skipped: %s", exc)
-    # Pre-load the heat-bump Lua so the first recall does not pay a NOSCRIPT
-    # round trip (and so a flushed script cache is visible at startup, loudly).
-    try:
-        await _get_redis().execute_command(
-            "SCRIPT LOAD", heat_mod.BUMP_HEAT_LUA_SRC)
-        log.info("[heat] bump script cached: sha=%s", heat_mod.bump_script_sha())
-    except Exception as exc:
-        log.warning("[heat] SCRIPT LOAD failed (%s) — bumps will use per-element "
-                    "EVAL fallback", exc)
-    _spawn(_periodic_consolidate(), "consolidate")
-    _spawn(_auto_crystallize(), "crystallize")  # Auto-crystallize sessions every 6h
-    # Populate BM25 corpus from existing Redis facts (non-blocking, best-effort)
-    _spawn(_startup_bm25_populate(_get_redis(), state.bm25_index), "bm25-populate")
-    # Backfill crystallized sorted-set index from existing keys (idempotent, skips if populated)
-    _spawn(_backfill_crystallized_index(_get_redis()), "crystallize-index-backfill")
-    log.info("AgentMem v%s ready (session-handoff+hard-prune+auto-graph+batch-MCP+compat+auto-crystallize)", APP_VERSION)
-
-    # The MCP Streamable-HTTP transport is mounted as an ASGI sub-app, whose
-    # own lifespan is NOT propagated by Starlette/FastAPI mounts. Run its
-    # session manager here so the StreamableHTTPSessionManager task group is
-    # initialized — otherwise every /mcp request 500s ("Task group is not initialized").
+    # ── BIND FIRST, WARM AFTER ────────────────────────────────────────────────
+    # The heavy init used to run right here -- embedding model, Redis, KB BM25 warm,
+    # ~10 min of cold start -- and FastAPI runs lifespan BEFORE uvicorn binds the
+    # socket. So the port refused connections for the entire warmup, which the
+    # supervisor can only read as "crashing" (watchdog.log 07:57:06 DOWN → 07:59:32
+    # P0, while the model had not even started loading). See core/warmup.py for the
+    # full receipts. We now yield immediately and warm in the background; /livez,
+    # /health and /ready carry the truth in the meantime.
     _mcp_session_mgr = None
     try:
         from mcp_server import mcp as _mcp_srv
@@ -427,12 +388,136 @@ async def lifespan(app: FastAPI):
     except Exception as _e:
         log.info("MCP session manager unavailable: %s", _e)
 
+    async def _run_warmup() -> None:
+        """Two stages.
+
+        Stage A (gates /ready): everything core work needs — Redis, indexes, KB BM25.
+        Stage B (does NOT gate): the embedding model + dim-guard. Measured on a
+        healthy run, stage B costs ~25 s (SentenceTransformer import 20 s + weights
+        2 s + MPS first encode 1 s); under memory pressure it stretched to 180 s+.
+        Blocking /ready on it delayed a service that could already serve recall
+        metadata, stats and graph queries. Stage B now preloads in the background so
+        the first real embed is warm; if it lands before that, the embedder's own
+        thread-safe lazy loader covers the gap.
+        """
+        try:
+            def _elapsed() -> float:
+                return time.monotonic() - _BOOT_T0
+
+            log.info("[warmup] entered lifespan warmup task (t+%.1fs since import-start)",
+                     _elapsed())
+            warmup_mod.set_phase("redis", "connecting")
+            log.info("Connecting to Redis…")
+            _t = time.monotonic()
+            _redis = await mem_store.get_client()
+            _state.redis = _redis  # share with compat/health/graph routes
+            log.info("[warmup] redis connect %.1fs (t+%.1fs)", time.monotonic() - _t, _elapsed())
+
+            # KB plane: rebuild the in-RAM BM25 index for knowledge-base chunks.
+            # The old form issued one HGET per chunk (N+1) — 250 s+ on 2,083 chunks;
+            # one HGETALL brought this phase to ~10 s.
+            try:
+                from core import kb as kb_mod
+                warmup_mod.set_phase("kb_bm25", "rebuilding BM25 index")
+                _t = time.monotonic()
+                _warmed = await kb_mod.get_kb().warm(_redis)
+                log.info("[warmup] kb BM25 warm %.1fs -> %d chunks (t+%.1fs)",
+                         time.monotonic() - _t, _warmed, _elapsed())
+            except Exception as exc:
+                log.warning("[kb] warm skipped: %s", exc)
+
+            warmup_mod.set_phase("indexes", "ensuring vectorset indexes")
+            log.info("Ensuring vectorset indexes…")
+            _t = time.monotonic()
+            await mem_store.ensure_indexes(_get_redis())
+            log.info("[warmup] ensure_indexes %.1fs (t+%.1fs)", time.monotonic() - _t, _elapsed())
+            # Persona hygiene: reject rules only guard *future* writes. Anything already
+            # in mem:persona (e.g. the national-ID-card path that was being injected into
+            # every agent's context on every recall) is re-filtered here once per boot,
+            # so a stale profile can never outlive the rule that should have blocked it.
+            try:
+                warmup_mod.set_phase("persona", "sanitizing stored persona")
+                _t = time.monotonic()
+                _dropped = await persona_mod.sanitize_stored(_get_redis())
+                log.info("[warmup] persona sanitize %.1fs (t+%.1fs)", time.monotonic() - _t,
+                         _elapsed())
+                if _dropped:
+                    log.info("[persona] startup hygiene removed stale entries from %d field(s): %s",
+                             len(_dropped), _dropped)
+            except Exception as exc:
+                log.warning("[persona] startup hygiene skipped: %s", exc)
+            # Pre-load the heat-bump Lua so the first recall does not pay a NOSCRIPT
+            # round trip (and so a flushed script cache is visible at startup, loudly).
+            try:
+                _t = time.monotonic()
+                await _get_redis().execute_command(
+                    "SCRIPT LOAD", heat_mod.BUMP_HEAT_LUA_SRC)
+                log.info("[warmup] heat SCRIPT LOAD %.3fs (t+%.1fs)", time.monotonic() - _t,
+                         _elapsed())
+                log.info("[heat] bump script cached: sha=%s", heat_mod.bump_script_sha())
+            except Exception as exc:
+                log.warning("[heat] SCRIPT LOAD failed (%s) — bumps will use per-element "
+                            "EVAL fallback", exc)
+            _spawn(_periodic_consolidate(), "consolidate")
+            _spawn(_auto_crystallize(), "crystallize")  # Auto-crystallize sessions every 6h
+            # Populate BM25 corpus from existing Redis facts (non-blocking, best-effort)
+            _spawn(_startup_bm25_populate(_get_redis(), state.bm25_index), "bm25-populate")
+            # Backfill crystallized sorted-set index from existing keys (idempotent)
+            _spawn(_backfill_crystallized_index(_get_redis()), "crystallize-index-backfill")
+
+            warmup_mod.mark_ready()
+            log.info("AgentMem v%s core ready (redis+indexes+kb); embedding warmup continues "
+                     "in background (t+%.1fs)", APP_VERSION, _elapsed())
+
+            # ── Stage B: embedding model + width guard (non-gating) ──────────────
+            try:
+                warmup_mod.set_phase("embedding", "loading qwen3-embedding-0.6b")
+                log.info("Loading embedding model…")
+                # MUST go off the loop: `_get_provider()` is a synchronous model load
+                # (torch + SentenceTransformer). Called directly it blocks the event
+                # loop for the whole load, and uvicorn only creates its listening
+                # socket after lifespan startup — so the block would delay binding and
+                # we would be right back at ECONNREFUSED during warmup.
+                await asyncio.to_thread(embedder._get_provider)
+
+                # Width integrity: the index is the source of truth, the model is
+                # measured. This used to check three hard-coded keys and, on mismatch,
+                # force-switch the provider — a config error became a silent model
+                # downgrade. It needs the loaded model to measure, so it lives in
+                # stage B next to the load it validates.
+                warmup_mod.set_phase("dim_guard", "verifying embedding width")
+                await dim_guard.enforce(_get_redis())
+
+                warmup_mod.mark_embedding_ready()
+                log.info("[warmup] embedding model warm + dim-guard verified")
+            except Exception as exc:
+                # Core stays ready; only the embedding plane is flagged. /ready keeps
+                # reporting 200 with embedding_ready=false + the error, instead of
+                # pretending a broken model is healthy or hiding the failure.
+                warmup_mod.mark_embedding_failed(f"{type(exc).__name__}: {exc}")
+                log.error("[warmup] embedding stage FAILED (core unaffected): %s", exc,
+                          exc_info=True)
+        except Exception as exc:
+            # Stay un-ready: /ready keeps returning 503 with this error rather than
+            # letting a half-initialised service look healthy and corrupt reads.
+            warmup_mod.mark_failed(f"{type(exc).__name__}: {exc}")
+            log.error("[warmup] FAILED — service stays un-ready: %s", exc, exc_info=True)
+
+    warm_task = asyncio.create_task(_run_warmup(), name="warmup")
+
     if _mcp_session_mgr is not None:
         async with _mcp_session_mgr.run():
             log.info("MCP Streamable-HTTP session manager started")
             yield
     else:
         yield
+
+    if not warm_task.done():
+        warm_task.cancel()
+        try:
+            await warm_task
+        except (asyncio.CancelledError, Exception):
+            pass
     # Cancel tracked background tasks before closing Redis
     global _shutting_down
     _shutting_down = True
@@ -473,9 +558,39 @@ async def mcp_path_rewrite(request: Request, call_next):
 
 @app.middleware("http")
 async def redis_guard(request: Request, call_next):
-    """Return 503 if Redis is not connected (prevents NoneType crashes)."""
-    if _get_redis() is None and request.url.path not in ("/health", "/docs", "/openapi.json", "/redoc"):
-        from fastapi.responses import JSONResponse
+    """Warmup gate: hold real work through cold start, or fail fast WITH a retry hint.
+
+    Was: `if redis is None: return 503 "Redis not connected"`, immediately. During the
+    ~10 min cold start every real request therefore got a flat 503 that reads like a
+    broken service, and a caller had no way to tell "still booting" from "misconfigured".
+    Now we wait up to AGENTMEM_WARMUP_WAIT_S for readiness and, if the budget runs out,
+    answer 503 + Retry-After with the live warmup phase in the body. Liveness/readiness
+    endpoints and static assets are never gated.
+    """
+    from fastapi.responses import JSONResponse
+    from core import warmup as warmup_mod
+
+    path = request.url.path
+    if warmup_mod.is_exempt(path):
+        return await call_next(request)
+
+    if not warmup_mod.is_ready():
+        # One bounded wait shared by every in-flight request during cold start.
+        if await warmup_mod.wait_ready():
+            return await call_next(request)
+        snap = warmup_mod.snapshot()
+        return JSONResponse(
+            status_code=503,
+            headers={"Retry-After": "5"},
+            content={
+                "detail": "agentmem is still warming up",
+                "ready": False,
+                "retry_after_s": 5,
+                "warmup": snap,
+            },
+        )
+
+    if _get_redis() is None:
         return JSONResponse(status_code=503, content={"detail": "Redis not connected"})
     return await call_next(request)
 
@@ -607,6 +722,8 @@ app.include_router(compat_router)
 app.include_router(admin_router)
 from api.routes.kb import router as kb_router
 app.include_router(kb_router)
+from api.routes.focus import router as focus_router
+app.include_router(focus_router)
 
 # ── MCP transports: Streamable HTTP (preferred) + SSE (legacy) ───────────────
 try:
@@ -726,12 +843,15 @@ def _format_prepend(
     token_budget: int | None = 1500,
     last_session_summary: str | None = None,
     crystal_digests: list[dict] | None = None,
+    active_focus: dict | None = None,
+    intentions: list[dict] | None = None,
 ) -> str:
     """
     Build the context string injected into the agent's system prompt.
 
     SimpleMem Section 3.3 token-budget packing:
-    Priority order: persona → last_session_summary → crystallized digests → env → tools → skills → session_ctx → facts → episodes
+    Priority order: active focus → intentions → persona → last_session_summary →
+    crystallized digests → env → tools → skills → session_ctx → facts → episodes
     Greedy packing: stop adding items when token_budget is exhausted.
     Output wrapped in <cross_session_memory> XML tags (SimpleMem convention).
     """
@@ -749,6 +869,22 @@ def _format_prepend(
         sections.append(text)
         tokens_used += cost
         return True
+
+    if active_focus and (active_focus.get("goal") or active_focus.get("notes")):
+        focus_lines = ["## Active Focus"]
+        if active_focus.get("goal"):
+            focus_lines.append(f"- goal: {active_focus['goal']}")
+        if active_focus.get("notes"):
+            focus_lines.append(f"- notes: {active_focus['notes']}")
+        _add("\n".join(focus_lines))
+
+    if intentions:
+        intent_lines = ["## Pending Intentions"]
+        for it in intentions[:5]:
+            cue = f" (cue: {it['cue']})" if it.get("cue") else ""
+            intent_lines.append(f"- {it.get('text', '')}{cue}")
+        if len(intent_lines) > 1:
+            _add("\n".join(intent_lines))
 
     def _add_fitted(text: str) -> bool:
         """Add a block, truncated to whatever budget is left rather than dropped.
@@ -2492,6 +2628,18 @@ async def recall(req: RecallRequest):
     # proc_ctx: already decoded by _fetch_procs (list of {task, procedure} dicts)
     proc_ctx: list[dict] = procs_raw if isinstance(procs_raw, list) else []
 
+    # Active working-memory + pending intentions (prospective memory layer).
+    _active: dict | None = None
+    _intents: list[dict] = []
+    try:
+        from core import focus as focus_mod
+        _active = await focus_mod.get_active(_get_redis(), req.session_id or "default")
+        if not (_active.get("goal") or _active.get("notes")):
+            _active = None
+        _intents = await focus_mod.list_intentions(_get_redis(), status="pending", limit=5)
+    except Exception as e:
+        log.debug("[recall] focus/intentions unavailable: %s", e)
+
     # SimpleMem Section 3.3 token-budget injection with XML wrapper
     # Skip pinned session summary if this session has already accumulated context
     # (session_ctx means we're mid-session, not starting fresh).
@@ -2503,6 +2651,8 @@ async def recall(req: RecallRequest):
         token_budget=req.token_budget or settings.default_token_budget,
         last_session_summary=_handoff,
         crystal_digests=crystal_digests or None,  # Auto-crystallized lessons learned
+        active_focus=_active,
+        intentions=_intents or None,
     )
     ms = int((time.time() - t0) * 1000)
 

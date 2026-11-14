@@ -10,7 +10,7 @@ from api.schemas.graph import (
 )
 from core import graph as graph_mod
 from core import store as mem_store
-from core.search import encode
+from core.search import async_encode
 from core.utils import decode_bytes, decode_attrs
 
 log = logging.getLogger("mem")
@@ -134,7 +134,7 @@ async def graph_neighbors(entity: str):
 @router.post("/graph/recall")
 async def graph_recall(req: GraphRecallRequest):
     """Retrieve facts from the knowledge graph neighbourhood of an entity."""
-    emb = encode(req.entity)
+    emb = await async_encode(req.entity)
     facts = await graph_mod.entity_recall(state.redis, req.entity, emb, k=req.max_facts)
     return {
         "entity": req.entity,

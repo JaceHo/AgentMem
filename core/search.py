@@ -416,6 +416,28 @@ class BM25Index:
                 return
             await self._build_and_install(docs_snapshot)
 
+    def build_bulk(self, items: list[tuple[str, str, dict, str]]) -> int:
+        """Warm-up only: append a whole corpus and build the index ONCE.
+
+        This runs inside ``asyncio.to_thread`` during startup, so the 25 s of
+        tokenization + rank_bm25 construction never touches the event loop — the
+        loop stays free to serve /livez /health /ready the whole time. Contrast
+        with ``add()`` ×N, which awaited 2,083 coroutines and starved the loop
+        enough that /ready timed out mid-warmup. No locks: warm-up runs before
+        any request is served, so there is no concurrent reader/writer.
+        """
+        self._docs.extend(items)
+        if not items:
+            return 0
+        new_bm25, n = self._build_corpus(self._docs)
+        if new_bm25 is None:
+            return 0
+        # Atomic swap — same as _build_and_install, but we're already in a thread.
+        self._bm25 = new_bm25
+        self._built_at_len = n
+        self._snap = (new_bm25, list(self._docs))
+        return n
+
     async def search(self, query: str, k: int = 10) -> list[dict]:
         """Return top-k facts by BM25 score. Non-blocking: reads current index snapshot."""
         if not BM25_AVAILABLE:

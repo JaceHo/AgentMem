@@ -536,8 +536,22 @@ async def ensure_procedures_recovered(r: aioredis.Redis) -> dict | None:
 from core import embedder as _embed_mod
 
 def _dims() -> int:
-    """Current embedding dimensions — resolved lazily after provider init."""
-    return _embed_mod._get_provider().dims
+    """Current embedding dimensions.
+
+    Uses the CHEAP provider-construction path (measure=False): the provider
+    knows its width from its config (AutoConfig.hidden_size for local models,
+    or the declared constant for API providers) WITHOUT loading any weights.
+
+    This used to call ``_get_provider()`` with the default ``measure=True``,
+    which triggers the full embedding-model load (torch + SentenceTransformer,
+    ~170 s on a memory-pressured box). ensure_indexes() runs in the startup
+    critical path and seeds vectorsets with _dims(); that call was loading the
+    entire model synchronously ON the event loop, blocking every request for
+    ~170 s (even /livez timed out — TCP accepted but the loop never scheduled
+    the handler). Now the width is resolved cheaply and the model load stays
+    where it belongs: Stage B of the warmup, off the loop (asyncio.to_thread).
+    """
+    return _embed_mod._get_provider(measure=False).dims
 
 # ── Shared connection pool (singleton) ────────────────────────────────────────
 # Prevents connection leaks: get_client() returns the SAME Redis instance

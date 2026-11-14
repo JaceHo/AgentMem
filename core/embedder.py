@@ -85,6 +85,7 @@ DIMS: int = 384  # default for local MiniLM; replaced by the *measured* width on
 
 _provider: Optional[BaseProvider] = None
 _provider_lock = threading.Lock()  # protects _provider and DIMS mutations
+_measured = False                  # width probe attempted once per process (or per reset)
 
 
 class DimensionMismatch(RuntimeError):
@@ -137,13 +138,38 @@ def _checked(vectors: list[np.ndarray]) -> list[np.ndarray]:
     return vectors
 
 
-def _get_provider() -> BaseProvider:
-    global _provider, DIMS
+def _get_provider(measure: bool = True) -> BaseProvider:
+    """Return the provider, optionally measuring its real width.
+
+    ``measure=False`` is the CHEAP path: it constructs the provider object but
+    never runs an encode, so it never loads the model. This split exists because
+    ``embed_signature()`` is called from request paths (/kb/status, cache keys,
+    chunk tagging) and, before this split, the first such call would construct
+    AND measure on the caller's thread -- and if a background warmup already
+    held ``_provider_lock`` mid-load, the event loop itself blocked on that lock
+    for the whole model load (measured 2026-11-05: /kb/status hung 110 s and
+    froze every other request behind it). Construction is cheap (config read);
+    measurement is the expensive, model-loading step.
+
+    Measuring happens at most once per process (``_measured``), like the
+    original ``if _provider is None`` guard — a failed probe must not turn every
+    later encode into another multi-second load attempt. ``_reset_provider``
+    clears the flag so a forced switch re-measures the new provider.
+
+    Thread-safety note for callers on the event loop: measuring here takes
+    ``_provider_lock`` for the whole load. The lifespan warmup runs the
+    measuring call via ``asyncio.to_thread`` for exactly this reason; sync
+    callers that might race the warmup should go through a worker thread too
+    (core.search does).
+    """
+    global _provider, DIMS, _measured
     with _provider_lock:
         if _provider is None:
-            _provider = _detect_provider()
-            _measure_provider(_provider)
+            _provider = _detect_provider()          # cheap: config only, no encode
+        if measure and not _measured:
+            _measure_provider(_provider)            # expensive: loads the model once
             DIMS = _provider.dims
+            _measured = True
         return _provider
 
 
@@ -155,8 +181,15 @@ def embed_signature() -> str:
     rows in place and turned `/kb/search` into a flat ordering with no error —
     measured 2026-10-27, every query scored exactly 1/(60+0). Chunks now carry
     this string so the mismatch is countable instead of invisible.
+
+    ``measure=False``: this is called from request paths and cache-key builders,
+    and must never trigger a model load. Before measurement the width is the
+    provider's hint (AutoConfig for local models); it converges to the measured
+    width during lifespan stage B, and the embed-cache keys are built from the
+    same string, so a hint→measured flip only costs cache misses, never stale
+    hits (different key ⇒ different row).
     """
-    p = _get_provider()
+    p = _get_provider(measure=False)
     model = (getattr(p, "model", None) or getattr(p, "model_name", None)
              or getattr(p, "_MODEL_NAME", None) or "")
     return f"{getattr(p, 'name', type(p).__name__)}:{getattr(p, 'dims', '?')}:{model}"
@@ -164,7 +197,7 @@ def embed_signature() -> str:
 
 def _reset_provider(name: str = "local") -> None:
     """Force-switch to a specific provider (used by dimension guard)."""
-    global _provider, DIMS
+    global _provider, DIMS, _measured
     with _provider_lock:
         # Close old provider's HTTP client if any
         if _provider is not None and hasattr(_provider, '_client') and _provider._client is not None:
@@ -175,6 +208,7 @@ def _reset_provider(name: str = "local") -> None:
         _provider = _create_provider(name)
         _measure_provider(_provider)
         DIMS = _provider.dims
+        _measured = True   # the switch just measured the new provider; don't re-probe
 
 
 def measured_dims() -> int:
@@ -213,17 +247,25 @@ def embedding_unavailable() -> bool:
 
 
 def _is_embed_outage(exc: BaseException) -> bool:
-    if isinstance(exc, (httpx.HTTPError, TimeoutError, OSError)):
+    """True for transport / HTTP failures that should open the soft-fail circuit.
+
+    Includes 4xx from local ollama/aiserv (e.g. model unloaded → 400) so recall
+    and store degrade to BM25/regex instead of ASGI 500 storms.
+    """
+    if isinstance(exc, (httpx.HTTPError, TimeoutError, OSError, ConnectionError)):
         return True
     msg = str(exc).lower()
-    return "502" in msg or "bad gateway" in msg or "timed out" in msg
+    return any(
+        tok in msg
+        for tok in ("502", "503", "bad gateway", "timed out", "connection refused", "400")
+    )
 
 
 def _trip_embed_circuit(exc: BaseException) -> None:
     global _embed_down_until
     if time.monotonic() >= _embed_down_until:
         log.warning(
-            "[embed] backend failed (%s: %s); skipping embeds for %.0fs",
+            "[embed] backend failed (%s: %s); soft-fail embeds for %.0fs",
             type(exc).__name__, exc, _EMBED_COOLDOWN_S,
         )
     _embed_down_until = time.monotonic() + _EMBED_COOLDOWN_S
@@ -236,8 +278,17 @@ def _clear_embed_circuit() -> None:
 
 def encode(text: str) -> np.ndarray:
     """Encode a single text string to a normalized float32 vector."""
+    from core import embed_cache
     if embedding_unavailable():
         raise EmbeddingUnavailable("embedding circuit open")
+    # NOTE: embed_signature() constructs the provider on first call, which lazy-loads
+    # the model. That is fine here -- the encode below needed it anyway -- but the
+    # circuit check above stays first so an open circuit never pays a network probe
+    # just to build a cache key.
+    key = embed_cache.cache_key(embed_signature(), text)
+    hit = embed_cache.get(key)
+    if hit is not None:
+        return hit
     try:
         vec = _get_provider().encode(text)
     except EmbeddingUnavailable:
@@ -245,28 +296,47 @@ def encode(text: str) -> np.ndarray:
     except Exception as exc:
         if _is_embed_outage(exc):
             _trip_embed_circuit(exc)
+            raise EmbeddingUnavailable(str(exc)) from exc
         raise
     _clear_embed_circuit()
-    _checked([vec])
+    vec = _checked([vec])[0]
+    embed_cache.put(key, vec)
     return vec
 
 
 def encode_batch(texts: list[str]) -> list[np.ndarray]:
     """Encode multiple texts. Returns list of normalized float32 vectors."""
+    from core import embed_cache
     if not texts:
         return []
     if embedding_unavailable():
         raise EmbeddingUnavailable("embedding circuit open")
+    sig = embed_signature()
+    keys = [embed_cache.cache_key(sig, t) for t in texts]
+    hits = embed_cache.get_many(keys)
+    misses = [i for i, k in enumerate(keys) if k not in hits]
+    if not misses:
+        # Fully served from cache -- the model is never touched on this path.
+        return [hits[k] for k in keys]
     try:
-        vecs = _get_provider().encode_batch(texts)
+        vecs = _get_provider().encode_batch([texts[i] for i in misses])
     except EmbeddingUnavailable:
         raise
     except Exception as exc:
         if _is_embed_outage(exc):
             _trip_embed_circuit(exc)
+            raise EmbeddingUnavailable(str(exc)) from exc
         raise
     _clear_embed_circuit()
-    return _checked(list(vecs))
+    vecs = _checked(list(vecs))
+    embed_cache.put_many([(keys[i], vecs[j]) for j, i in enumerate(misses)])
+    out: list[np.ndarray] = [None] * len(texts)  # type: ignore[list-item]
+    for j, i in enumerate(misses):
+        out[i] = vecs[j]
+    for i, k in enumerate(keys):
+        if k in hits:
+            out[i] = hits[k]
+    return out
 
 
 # Alias for compatibility with tests that use embed()
