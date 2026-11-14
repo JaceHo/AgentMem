@@ -154,27 +154,27 @@ def _regex_extract(user_text: str) -> list[ExtractedFact]:
     return facts
 
 
-# ── Layer 2: SimpleMem LLM gate via aiserv role-based routing ───────────────
-# Uses GET /v1/role/nlp to dynamically pick the best model based on live
-# provider health, latency, and availability — no hardcoded model cascade.
-# aiserv rotates across Cerebras, Groq, ZAI, Google, etc. and auto-heals
-# when provider keys are restored. Fallback: hardcoded "fast" tier.
+# ── Layer 2: SimpleMem LLM gate via aiserv FrugalGPT cascade ────────────────
+# ONE call to aiserv/extract — aiserv owns SLM-default → flash escalation
+# (models.yaml extract routes). Do NOT GET /v1/role/* and pin a concrete SKU:
+# that bypassed the cascade and made agentmem invent a client-side GLM/Kimi
+# timeout lottery (measured 2026-11-14: 28–30s store tails).
 
 AISERV_BASE  = os.getenv("AISERV_URL", "http://127.0.0.1:4000")
 AISERV_URL   = f"{AISERV_BASE}/v1/chat/completions"
 AISERV_KEY   = os.getenv("AISERV_KEY", "sk-aiserv-local-dev")
-AISERV_ROLE  = "nlp"                    # maps to /v1/role/nlp
-# Prefer aiserv/fast role alias when role API is down — aiserv routes it.
-AISERV_FALLBACK_MODEL = os.getenv("AGENTMEM_EXTRACT_FALLBACK", "aiserv/fast")
+AISERV_ROLE  = "extract"                # specialty role; kept for compat helpers
+# Cascade profile — aiserv walks yaml routes. Override only for labs.
+AISERV_EXTRACT_MODEL = os.getenv("AGENTMEM_EXTRACT_MODEL", "aiserv/extract")
+# Legacy alias used by circuit / tests; same as extract profile.
+AISERV_FALLBACK_MODEL = os.getenv("AGENTMEM_EXTRACT_FALLBACK", AISERV_EXTRACT_MODEL)
 AISERV_MODEL_CASCADE = []               # populated dynamically; kept for import compat
-# Local-first FrugalGPT cascade (LAN): try aiserv/fast FIRST, then at most
-# LLM_MAX_RETRIES role picks, under a hard wall budget. Measured 2026-11-14:
-# role→GLM/Kimi/DeepSeek @12s ×3 = 28–30s store tails that also starved recall.
-FAST_LLM_TIMEOUT_S = float(os.getenv("AGENTMEM_EXTRACT_FAST_TIMEOUT", "5.0"))
-ROLE_LLM_TIMEOUT_S = float(os.getenv("AGENTMEM_EXTRACT_ROLE_TIMEOUT", "6.0"))
+# Single wall budget for the whole aiserv cascade (not per upstream hop).
+FAST_LLM_TIMEOUT_S = float(os.getenv("AGENTMEM_EXTRACT_FAST_TIMEOUT", "8.0"))
+ROLE_LLM_TIMEOUT_S = float(os.getenv("AGENTMEM_EXTRACT_ROLE_TIMEOUT", "8.0"))
 LLM_TIMEOUT_S = ROLE_LLM_TIMEOUT_S
-LLM_MAX_RETRIES = int(os.getenv("AGENTMEM_EXTRACT_MAX_RETRIES", "1"))
-EXTRACT_BUDGET_S = float(os.getenv("AGENTMEM_EXTRACT_BUDGET_S", "10.0"))
+LLM_MAX_RETRIES = int(os.getenv("AGENTMEM_EXTRACT_MAX_RETRIES", "0"))  # no client lottery
+EXTRACT_BUDGET_S = float(os.getenv("AGENTMEM_EXTRACT_BUDGET_S", "12.0"))
 
 # Circuit breaker: models that failed recently are skipped for 5 minutes.
 # Timeouts open after ONE miss (slow models must not keep winning the role
@@ -430,15 +430,59 @@ def _parse_llm_json(raw: str) -> list:
     return []
 
 
+def _facts_from_llm_items(items: list) -> list[ExtractedFact]:
+    """Parse SimpleMem JSON items into ExtractedFact rows."""
+    facts: list[ExtractedFact] = []
+    _IMPORTANCE_FLOOR = {
+        "identity": 0.80, "rule": 0.80, "preference": 0.75, "work": 0.65,
+        "personal": 0.65, "reminder": 0.65, "decision": 0.60, "procedure": 0.55,
+        "location": 0.55, "capability_gained": 0.55, "env_change": 0.50,
+        "tool_use": 0.45, "env_context": 0.40, "context": 0.35, "general": 0.30,
+    }
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        content = item.get("lossless_restatement") or item.get("content") or ""
+        if not content or len(str(content).strip()) < 10:
+            continue
+        category = item.get("category", "general")
+        if category == "credential":
+            continue
+        importance = max(0.0, min(1.0, float(item.get("importance", 0.5))))
+        importance = max(importance, _IMPORTANCE_FLOOR.get(category, 0.35))
+        triple = item.get("triple") or {}
+        triple_s = triple.get("s") or None
+        triple_p = triple.get("p") or None
+        triple_o = triple.get("o") or None
+        if triple_s and triple_p and triple_o:
+            triple_s = str(triple_s).strip()[:100]
+            triple_p = str(triple_p).strip()[:100]
+            triple_o = str(triple_o).strip()[:200]
+        else:
+            triple_s = triple_p = triple_o = None
+        facts.append(ExtractedFact(
+            content=str(content).strip()[:500],
+            category=category,
+            confidence=0.9,
+            source="llm",
+            keywords=item.get("keywords") or None,
+            persons=item.get("persons") or None,
+            entities=item.get("entities") or None,
+            topic=item.get("topic") or None,
+            location=item.get("location") or None,
+            importance=importance,
+            triple_s=triple_s,
+            triple_p=triple_p,
+            triple_o=triple_o,
+        ))
+    return facts
+
+
 async def _llm_extract(conversation_text: str) -> list[ExtractedFact]:
-    """Layer 2: SimpleMem-style LLM extraction via aiserv role-based routing.
+    """Layer 2: one aiserv/extract call; aiserv owns FrugalGPT cascade.
 
     Produces pronoun-free, absolute-timestamp lossless_restatement entries
-    matching SimpleMem Section 3.1 multi-view indexing format.
-
-    v0.9.9: Role-based routing via /v1/role/nlp. aiserv dynamically selects
-    the best model based on live provider health. On failure, excludes the
-    failed model and retries with the next best.
+    matching SimpleMem Section 3.1. On total failure → regex-only upstream.
     """
     today = datetime.date.today().isoformat()
     prompt = _EXTRACT_PROMPT.format(
@@ -447,215 +491,80 @@ async def _llm_extract(conversation_text: str) -> list[ExtractedFact]:
     )
 
     import time as _time
-    # Prune expired circuit breaker entries first so a recovered aiserv/fast is usable.
     now = _time.time()
     expired = [m for m, t in _model_fail_times.items() if now - t > _CIRCUIT_BREAKER_TTL]
     for m in expired:
         del _model_fail_times[m]
         _model_fail_counts.pop(m, None)
 
-    # Honest local degradation: open fast-circuit → regex only. Do not start a
-    # role lottery (GLM/Kimi/DeepSeek) that recreates the 28s store storms.
-    if is_model_circuit_broken(AISERV_FALLBACK_MODEL):
-        log.info("[extractor] %s circuit open — regex-only", AISERV_FALLBACK_MODEL)
+    model = AISERV_EXTRACT_MODEL
+    if is_model_circuit_broken(model):
+        log.info("[extractor] %s circuit open — regex-only", model)
         return []
 
-    tried_models: list[str] = []
-    # FrugalGPT / local-first: aiserv/fast first; one role backup only if fast
-    # fails mid-call (lazy resolve — no pre-pay of /v1/role/nlp).
-    queue: list[tuple[str, str]] = [(AISERV_FALLBACK_MODEL, "fast")]
-
-    deadline = _time.monotonic() + max(1.0, EXTRACT_BUDGET_S)
-    role_backup_used = False
-
-    async def _enqueue_role_backup(failed: str) -> None:
-        nonlocal role_backup_used
-        if role_backup_used or LLM_MAX_RETRIES <= 0 or _time.monotonic() >= deadline:
-            return
-        role_backup_used = True
-        m, t = await _resolve_nlp_model(exclude=failed)
-        if m not in tried_models and not is_model_circuit_broken(m):
-            queue.append((m, t))
-
-    while queue:
-        model, tier = queue.pop(0)
-        if model in tried_models or is_model_circuit_broken(model):
-            continue
-        if _time.monotonic() >= deadline:
-            log.warning(
-                "[extractor] wall budget %.1fs hit after %s — regex fallback",
-                EXTRACT_BUDGET_S, ", ".join(tried_models) or "none",
+    timeout_s = min(EXTRACT_BUDGET_S, max(FAST_LLM_TIMEOUT_S, ROLE_LLM_TIMEOUT_S))
+    try:
+        posted = await async_post_json_detailed(
+            AISERV_URL,
+            payload={
+                "model": model,
+                "max_tokens": 1500,
+                "messages": [
+                    {"role": "system", "content": (
+                        "You are a professional memory extraction assistant. "
+                        "You extract structured, unambiguous information from conversations. "
+                        "Output valid JSON only."
+                    )},
+                    {"role": "user", "content": prompt},
+                ],
+            },
+            headers={"Authorization": f"Bearer {AISERV_KEY}"},
+            timeout=timeout_s,
+        )
+        data, err = posted.data, posted.error
+        if data is None:
+            reason = "timeout" if err == "timeout" else (
+                "http" if err and err.startswith("http_") else "other"
             )
-            break
-        tried_models.append(model)
-        # Don't let a single attempt overrun the remaining budget.
-        timeout_s = min(_timeout_for(model, tier), max(0.5, deadline - _time.monotonic()))
-        try:
-            posted = await async_post_json_detailed(
-                AISERV_URL,
-                payload={
-                    "model":      model,
-                    "max_tokens": 1500,
-                    "messages": [
-                        {"role": "system", "content": (
-                            "You are a professional memory extraction assistant. "
-                            "You extract structured, unambiguous information from conversations. "
-                            "Output valid JSON only."
-                        )},
-                        {"role": "user", "content": prompt},
-                    ],
-                },
-                headers={"Authorization": f"Bearer {AISERV_KEY}"},
-                timeout=timeout_s,
-            )
-            data, err = posted.data, posted.error
-            if data is None:
-                if err == "timeout":
-                    log.warning("[extractor] %s timed out (%.1fs)", model, timeout_s)
-                    reason = "timeout"
-                elif err and err.startswith("http_"):
-                    log.warning("[extractor] %s HTTP %s", model, err[5:])
-                    reason = "http"
-                else:
-                    log.warning("[extractor] %s returned no data (%s)", model, err or "empty")
-                    reason = "other"
-                mark_model_failed(model, reason=reason)
-                asyncio.create_task(_report_quality(model, -1, reason=reason))
-                await _enqueue_role_backup(model)
-                continue
+            log.warning("[extractor] %s failed (%s, %.1fs)", model, err or reason, timeout_s)
+            mark_model_failed(model, reason=reason if reason == "timeout" else "other")
+            asyncio.create_task(_report_quality(model, -1, reason=reason))
+            return []
 
-            raw_content = data["choices"][0]["message"].get("content")
-            if not raw_content or not raw_content.strip():
-                log.warning("[extractor] %s returned null content, trying next", model)
-                mark_model_failed(model)
-                await _enqueue_role_backup(model)
-                continue
-            raw = raw_content.strip()
-            items = _parse_llm_json(raw)
+        raw_content = data["choices"][0]["message"].get("content")
+        if not raw_content or not str(raw_content).strip():
+            log.warning("[extractor] %s returned null content — regex-only", model)
+            mark_model_failed(model)
+            return []
+        raw = str(raw_content).strip()
+        items = _parse_llm_json(raw)
+        if not isinstance(items, list):
+            log.warning("[extractor] %s returned non-list — regex-only", model)
+            mark_model_failed(model)
+            return []
+        if not items and not _looks_like_empty_array(raw):
+            log.warning("[extractor] %s produced no parseable facts — regex-only", model)
+            mark_model_failed(model)
+            return []
 
-            if not isinstance(items, list):
-                log.warning("[extractor] %s returned non-list, trying next", model)
-                mark_model_failed(model)
-                await _enqueue_role_backup(model)
-                continue
-            if not items and not _looks_like_empty_array(raw):
-                log.warning("[extractor] %s produced no parseable facts, trying next", model)
-                mark_model_failed(model)
-                await _enqueue_role_backup(model)
-                continue
-            # A good response proves the model is healthy — reset its circuit
-            # breaker so a recovered model isn't locked out for the full TTL.
-            clear_model_circuit(model)
-
-            facts: list[ExtractedFact] = []
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                # SimpleMem uses "lossless_restatement" as the primary content field
-                content = (
-                    item.get("lossless_restatement")
-                    or item.get("content")
-                    or ""
-                )
-                if not content or len(content.strip()) < 10:
-                    continue
-
-                category = item.get("category", "general")
-                # Never store credentials from LLM extraction for safety
-                if category == "credential":
-                    continue
-
-                importance = float(item.get("importance", 0.5))
-                importance = max(0.0, min(1.0, importance))
-
-                # A-MAC content type prior (arXiv:2603.04549):
-                # Category-based importance floors ensure high-value facts
-                # survive consolidation pruning. The LLM score is the ceiling;
-                # the floor prevents systematic under-scoring of critical facts.
-                _IMPORTANCE_FLOOR = {
-                    "identity":   0.80,
-                    "rule":       0.80,
-                    "preference": 0.75,
-                    "work":       0.65,
-                    "personal":   0.65,
-                    "reminder":   0.65,
-                    "decision":   0.60,
-                    "procedure":  0.55,
-                    "location":   0.55,
-                    "capability_gained": 0.55,
-                    "env_change": 0.50,
-                    "tool_use":   0.45,
-                    "env_context":0.40,
-                    "context":    0.35,
-                    "general":    0.30,
-                }
-                floor = _IMPORTANCE_FLOOR.get(category, 0.35)
-                importance = max(importance, floor)
-
-                # Memori-style semantic triple (arXiv:2603.19935)
-                triple = item.get("triple") or {}
-                triple_s = triple.get("s") or None
-                triple_p = triple.get("p") or None
-                triple_o = triple.get("o") or None
-                # Validate triple: all three parts must be non-empty strings
-                if triple_s and triple_p and triple_o:
-                    triple_s = str(triple_s).strip()[:100]
-                    triple_p = str(triple_p).strip()[:100]
-                    triple_o = str(triple_o).strip()[:200]
-                else:
-                    triple_s = triple_p = triple_o = None
-
-                facts.append(ExtractedFact(
-                    content=str(content).strip()[:500],
-                    category=category,
-                    confidence=0.9,   # LLM-extracted = higher confidence
-                    source="llm",
-                    keywords=item.get("keywords") or None,
-                    persons=item.get("persons") or None,
-                    entities=item.get("entities") or None,
-                    topic=item.get("topic") or None,
-                    location=item.get("location") or None,
-                    importance=importance,
-                    triple_s=triple_s,
-                    triple_p=triple_p,
-                    triple_o=triple_o,
-                ))
-
-            log.info(
-                f"[extractor] LLM produced {len(facts)} lossless entries "
-                f"(SimpleMem Φ_gate)"
-            )
-            # Report success to aiserv so health matrix tracks working models.
-            asyncio.create_task(_report_quality(model, +1))
-            return facts
-
-        except json.JSONDecodeError as e:
-            log.warning("[extractor] %s returned non-JSON: %s", model, e)
-            asyncio.create_task(_report_quality(model, -1, reason="bad_json"))
-            await _enqueue_role_backup(model)
-        except httpx.TimeoutException:
-            log.warning("[extractor] %s timed out (%.1fs)", model, timeout_s)
-            mark_model_failed(model, reason="timeout")
-            # Self-healing: push -1 + reason="timeout" back to aiserv. The
-            # reason field triggers aiserv to (a) urgently re-probe this
-            # route and (b) write a synthetic failed ProbeResult so the
-            # next /v1/role/nlp call automatically suppresses this model.
-            asyncio.create_task(_report_quality(model, -1, reason="timeout"))
-            await _enqueue_role_backup(model)
-        except Exception as e:
-            log.warning(
-                "[extractor] %s failed: %s: %s", model, type(e).__name__, e
-            )
-            mark_model_failed(model, reason="other")
-            asyncio.create_task(_report_quality(model, -1, reason="other"))
-            await _enqueue_role_backup(model)
-
-    log.warning(
-        "[extractor] All LLM models exhausted after %d attempts. Tried: %s. "
-        "Falling back to regex-only extraction.",
-        len(tried_models), ", ".join(tried_models) if tried_models else "none"
-    )
-    return []
+        clear_model_circuit(model)
+        facts = _facts_from_llm_items(items)
+        log.info(
+            "[extractor] LLM produced %d lossless entries via %s (SimpleMem Φ_gate)",
+            len(facts), model,
+        )
+        asyncio.create_task(_report_quality(model, +1))
+        return facts
+    except httpx.TimeoutException:
+        log.warning("[extractor] %s timed out (%.1fs)", model, timeout_s)
+        mark_model_failed(model, reason="timeout")
+        asyncio.create_task(_report_quality(model, -1, reason="timeout"))
+        return []
+    except Exception as e:
+        log.warning("[extractor] %s failed: %s: %s", model, type(e).__name__, e)
+        mark_model_failed(model, reason="other")
+        asyncio.create_task(_report_quality(model, -1, reason="other"))
+        return []
 
 
 # ── Merge + dedup ─────────────────────────────────────────────────────────────

@@ -19,11 +19,10 @@ def test_non_timeout_needs_two_strikes(monkeypatch):
     assert ex.is_model_circuit_broken("flaky")
 
 
-def test_defaults_are_local_first():
-    assert ex.AISERV_FALLBACK_MODEL == "aiserv/fast" or ex.AISERV_FALLBACK_MODEL
-    assert ex.EXTRACT_BUDGET_S <= 15.0
-    assert ex.LLM_MAX_RETRIES <= 2
-    assert ex.ROLE_LLM_TIMEOUT_S <= 8.0
+def test_defaults_delegate_cascade_to_aiserv():
+    assert "extract" in ex.AISERV_EXTRACT_MODEL
+    assert ex.LLM_MAX_RETRIES == 0  # no client-side model lottery
+    assert ex.EXTRACT_BUDGET_S <= 20.0
 
 
 def test_preference_regex_works_without_llm():
