@@ -1,6 +1,7 @@
-"""tool-feedback accepts LAN hook aliases and rejects empty names."""
+"""tool-feedback accepts LAN hook aliases; empty names soft-skip at the route."""
 
 from api.schemas.capability import ToolFeedbackRequest
+from api.schemas.consolidation import CompactRequest
 
 
 def test_aliases_name_and_tool():
@@ -13,3 +14,8 @@ def test_aliases_name_and_tool():
 def test_strips_whitespace():
     r = ToolFeedbackRequest.model_validate({"tool_name": "  Edit  ", "success": True})
     assert r.tool_name == "Edit"
+
+
+def test_compact_coerces_null_and_sessionId_alias():
+    assert CompactRequest.model_validate({"session_id": None}).session_id == ""
+    assert CompactRequest.model_validate({"sessionId": "abc"}).session_id == "abc"

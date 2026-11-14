@@ -373,19 +373,25 @@ async def store_procedure(req: StoreProcedureRequest, background_tasks: Backgrou
 # Redis/VSET stay healthy without losing ToolMem signal.
 _TOOL_FB_LAST_OK: dict[str, float] = {}
 _TOOL_FB_PENDING_OK: dict[str, int] = {}
-_TOOL_FB_SUCCESS_INTERVAL_S = float(__import__("os").environ.get("AGENTMEM_TOOL_FB_INTERVAL", "1.5"))
+# Default 5s (was 1.5): hooks still fire every tool; Redis writes coalesce harder.
+_TOOL_FB_SUCCESS_INTERVAL_S = float(
+    __import__("os").environ.get("AGENTMEM_TOOL_FB_INTERVAL", "5.0")
+)
 
 
 @router.post("/tool-feedback")
 async def tool_feedback(req: ToolFeedbackRequest):
     """Record success/failure for a tool invocation (ToolMem)."""
     if not req.tool_name:
-        # Empty names used to become tool="" and pollute ToolMem; reject loudly
-        # so hooks fix their payload (aliases: tool_name | name | tool).
-        raise HTTPException(
-            status_code=400,
-            detail="tool_name is required (aliases: name, tool)",
-        )
+        # Empty names used to become tool="" and pollute ToolMem. Soft-skip
+        # (200) so PostToolUse hooks don't 400-storm logs/ASGI — aliases still
+        # accepted: tool_name | name | tool.
+        return {
+            "ok": True,
+            "skipped": True,
+            "reason": "empty tool_name",
+            "observed": False,
+        }
     r = state.redis
     elem_key = req.tool_name.lower().replace(" ", "_").replace("/", "_")[:64]
 

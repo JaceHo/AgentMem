@@ -198,8 +198,9 @@ class Settings(BaseSettings):
         json_schema_extra={"env": "AGENTMEM_RECALL_CONCURRENCY"}
     )
     tool_fb_interval_s: float = Field(
-        default=1.5,
+        default=5.0,
         description="Min seconds between persisted success tool-feedback writes per tool",
+        json_schema_extra={"env": "AGENTMEM_TOOL_FB_INTERVAL"},
     )
     
     # ── Trivial Message Filter ─────────────────────────────────────────────

@@ -90,8 +90,14 @@ async def async_post_json_detailed(
         log.debug("[http] POST %s timed out (%.1fs)", url, timeout)
         return PostResult(None, "timeout")
     except httpx.HTTPStatusError as exc:
-        log.warning("[http] POST %s failed: %s", url, exc)
-        return PostResult(None, f"http_{exc.response.status_code}")
+        code = exc.response.status_code
+        # Optional aiserv endpoints (e.g. /v1/quality-feedback) are often absent
+        # on LAN — 404 is expected, not a warning-worthy outage.
+        if code in (404, 405):
+            log.debug("[http] POST %s → %d (optional)", url, code)
+        else:
+            log.warning("[http] POST %s failed: %s", url, exc)
+        return PostResult(None, f"http_{code}")
     except Exception as exc:
         log.debug("[http] POST %s error: %s", url, exc)
         return PostResult(None, f"transport:{type(exc).__name__}")

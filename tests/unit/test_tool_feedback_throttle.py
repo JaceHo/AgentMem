@@ -53,3 +53,13 @@ def test_failure_always_writes(client, monkeypatch):
         r = client.post("/tool-feedback", json={"tool_name": "Bash", "success": False})
         assert r.status_code == 200 and not r.json().get("deferred")
     assert calls["n"] == 3
+
+
+def test_empty_tool_name_soft_skips(client, monkeypatch):
+    atomic = AsyncMock(return_value={"success_count": 1})
+    monkeypatch.setattr(cap_routes.cap_mod, "atomic_tool_feedback", atomic)
+    r = client.post("/tool-feedback", json={"success": True})
+    assert r.status_code == 200
+    body = r.json()
+    assert body.get("skipped") is True and body.get("reason") == "empty tool_name"
+    atomic.assert_not_awaited()

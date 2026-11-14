@@ -67,9 +67,18 @@ _finished_monotonic: Optional[float] = None
 
 
 def set_phase(phase: str, detail: str = "") -> None:
-    """Record warmup progress. Visible to /health and /ready as it advances."""
+    """Record warmup progress. Visible to /health and /ready as it advances.
+
+    Once stage A has flipped ``ready``, later background work (dim-guard /
+    embedding load) must not stomp the phase back to a pre-ready label — that
+    made /health lie with ``ready:true, phase:dim_guard`` after boot.
+    """
     global _phase, _detail
     with _lock:
+        if _ready and phase not in ("ready", "failed", "embedding_ready"):
+            if detail:
+                _detail = detail
+            return
         _phase = phase
         _detail = detail
 
@@ -80,7 +89,7 @@ def mark_ready() -> None:
     with _lock:
         _ready = True
         _phase = "ready"
-        _detail = ""
+        _detail = "core ready; embedding warming"
         _finished_monotonic = time.monotonic()
 
 
@@ -88,10 +97,12 @@ def mark_embedding_ready() -> None:
     """Stage B done: model loaded, dim-guard verified. Non-gating — /ready flipped
     at stage A, and the lazy loader in embedder covers any request that arrives
     before this fires."""
-    global _embedding_ready, _embedding_failed
+    global _embedding_ready, _embedding_failed, _phase, _detail
     with _lock:
         _embedding_ready = True
         _embedding_failed = None
+        _phase = "ready"
+        _detail = "embedding ready"
 
 
 def mark_embedding_failed(error: str) -> None:

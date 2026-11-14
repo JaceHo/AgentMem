@@ -97,7 +97,7 @@ from contextlib import asynccontextmanager
 import httpx
 import numpy as np
 from fastapi import FastAPI, BackgroundTasks, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 # ── Schemas (extracted to api/schemas/) ──────────────────────────────────────
@@ -673,6 +673,24 @@ async def api_key_guard(request: Request, call_next):
 # Request tracing: assign a unique ID to each request for log correlation
 import uuid as _uuid
 
+# Hot paths that poll / fire every tool call. Logging each 200 at INFO
+# dominated stderr (~17k /tool-feedback lines in ~2h) and drowned real faults.
+_QUIET_ACCESS_EXACT = frozenset({
+    "/health", "/livez", "/ready", "/stats", "/favicon.ico", "/favicon.svg",
+    "/apple-touch-icon.png", "/tool-feedback", "/session/compact",
+    "/kb/status", "/graph/stats", "/sessions", "/observations",
+    "/active-memory", "/intentions",
+})
+_QUIET_ACCESS_PREFIX = ("/css/", "/js/", "/static/")
+
+
+def _quiet_access(path: str, status: int, elapsed_ms: int) -> bool:
+    """True → log at DEBUG. Always INFO for 5xx and slow responses."""
+    if status >= 500 or elapsed_ms >= 500:
+        return False
+    return path in _QUIET_ACCESS_EXACT or path.startswith(_QUIET_ACCESS_PREFIX)
+
+
 @app.middleware("http")
 async def request_tracing(request: Request, call_next):
     """Assign a unique request ID and log request/response timing."""
@@ -687,12 +705,32 @@ async def request_tracing(request: Request, call_next):
     response.headers["X-Request-ID"] = request_id
     response.headers["X-Response-Time"] = f"{elapsed_ms}ms"
 
-    # Structured access log for production monitoring
-    log.info(
-        "[access] %s %s → %d (%dms) rid=%s",
-        request.method, request.url.path, response.status_code, elapsed_ms, request_id,
-    )
+    path = request.url.path
+    if _quiet_access(path, response.status_code, elapsed_ms):
+        log.debug(
+            "[access] %s %s → %d (%dms) rid=%s",
+            request.method, path, response.status_code, elapsed_ms, request_id,
+        )
+    else:
+        log.info(
+            "[access] %s %s → %d (%dms) rid=%s",
+            request.method, path, response.status_code, elapsed_ms, request_id,
+        )
     return response
+
+
+@app.exception_handler(embedder.EmbeddingUnavailable)
+async def embedding_unavailable_handler(request: Request, exc: embedder.EmbeddingUnavailable):
+    """Soft-fail: never let an open embed circuit become an ASGI ExceptionGroup."""
+    return JSONResponse(
+        status_code=503,
+        content={
+            "detail": "embedding unavailable",
+            "error": str(exc) or "embedding circuit open",
+            "retry_after_s": 30,
+        },
+        headers={"Retry-After": "30"},
+    )
 
 # ── Static files + SSE log router ─────────────────────────────────────────────
 import os as _os

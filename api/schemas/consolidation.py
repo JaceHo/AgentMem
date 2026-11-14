@@ -1,12 +1,25 @@
 """API schemas for consolidation and lifecycle endpoints."""
 
-from pydantic import BaseModel
+from typing import Any
+
+from pydantic import AliasChoices, BaseModel, Field, field_validator
 
 
 class CompactRequest(BaseModel):
-    session_id: str = ""
+    # Hooks/plugins send session_id | sessionId; null must not 400 the PostToolUse storm.
+    session_id: str = Field(
+        default="",
+        validation_alias=AliasChoices("session_id", "sessionId", "session"),
+    )
     force: bool = False
     threshold_chars: int = 3000
+
+    @field_validator("session_id", mode="before")
+    @classmethod
+    def _coerce_session_id(cls, v: Any) -> str:
+        if v is None:
+            return ""
+        return str(v).strip()
 
 
 class AnswerRequest(BaseModel):
