@@ -49,9 +49,9 @@ WAIT_S: float = float(os.environ.get("AGENTMEM_WARMUP_WAIT_S", "20"))
 # Paths that must answer during warmup: liveness, readiness, docs, static assets.
 _EXEMPT_EXACT = frozenset({
     "/livez", "/health", "/ready", "/openapi.json", "/redoc", "/docs",
-    "/favicon.ico",
+    "/favicon.ico", "/favicon.svg", "/apple-touch-icon.png",
 })
-_EXEMPT_PREFIX = ("/static/", "/docs/", "/redoc/")
+_EXEMPT_PREFIX = ("/static/", "/docs/", "/redoc/", "/css/", "/js/")
 
 _lock = threading.Lock()
 _started_monotonic = time.monotonic()

@@ -42,6 +42,7 @@ a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
 #hdr.hdr,#hdr{position:sticky;top:0;z-index:100;background:var(--bg2);border-bottom:1px solid var(--border);padding:0 10px;display:flex;align-items:stretch;gap:6px;flex-shrink:0;min-height:40px}
 .hdr::after,#hdr::after{content:'';position:absolute;bottom:0;left:0;right:0;height:1px;background:linear-gradient(90deg,var(--accent),var(--purple),var(--cyan),var(--accent));opacity:.4;pointer-events:none}
 .hl{display:flex;align-items:center;gap:6px;flex-shrink:0;padding:6px 4px}
+.hl .logo-mark{width:18px;height:18px;border-radius:4px;flex-shrink:0;display:block}
 .hl .logo,.hdr h1{font-size:14px;font-weight:800;color:var(--accent);letter-spacing:-.03em}
 .hdr .dot,.hl .dot{width:8px;height:8px;border-radius:50%;background:var(--text3);flex-shrink:0;transition:all .3s}
 .hdr .dot.ok,.hl .dot.ok{background:var(--green);box-shadow:var(--glow-green);animation:pulse-dot 2s infinite}

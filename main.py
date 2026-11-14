@@ -817,6 +817,30 @@ async def dashboard():
     return {"message": f"AgentMem v{APP_VERSION}", "docs": "/docs"}
 
 
+def _static_asset(name: str, media_type: str | None = None):
+    path = _os.path.join(_static_dir, name)
+    if not _os.path.exists(path):
+        from fastapi import HTTPException
+        raise HTTPException(404, f"missing {name}")
+    kw = {"media_type": media_type} if media_type else {}
+    return FileResponse(path, **kw)
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon_ico():
+    return _static_asset("favicon.ico", "image/x-icon")
+
+
+@app.get("/favicon.svg", include_in_schema=False)
+async def favicon_svg():
+    return _static_asset("favicon.svg", "image/svg+xml")
+
+
+@app.get("/apple-touch-icon.png", include_in_schema=False)
+async def apple_touch_icon():
+    return _static_asset("apple-touch-icon.png", "image/png")
+
+
 # ── Request / Response models ──────────────────────────────────────────────────
 # All Pydantic request models are now in api/schemas/ — imported above.
 

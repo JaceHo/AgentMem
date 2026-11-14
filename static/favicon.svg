@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none">
+  <!-- AgentMem tab mark: dark tile + cyan memory graph -->
+  <rect width="32" height="32" rx="7" fill="#0a0e14"/>
+  <rect x="0.75" y="0.75" width="30.5" height="30.5" rx="6.25" stroke="#1a2030" stroke-width="1.5"/>
+  <!-- edges -->
+  <path d="M10 11.5L16 8.5L22 11.5L22 18.5L16 22.5L10 18.5Z"
+        stroke="#0288d1" stroke-width="1.4" stroke-linejoin="round" opacity=".55"/>
+  <path d="M10 11.5L16 15.5L22 11.5M16 15.5V22.5"
+        stroke="#4fc3f7" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- nodes -->
+  <circle cx="16" cy="8.5" r="2.35" fill="#4fc3f7"/>
+  <circle cx="10" cy="11.5" r="2.1" fill="#26c6da"/>
+  <circle cx="22" cy="11.5" r="2.1" fill="#26c6da"/>
+  <circle cx="16" cy="15.5" r="2.6" fill="#4fc3f7"/>
+  <circle cx="10" cy="18.5" r="2.1" fill="#0288d1"/>
+  <circle cx="22" cy="18.5" r="2.1" fill="#0288d1"/>
+  <circle cx="16" cy="22.5" r="2.2" fill="#4fc3f7"/>
+  <!-- live pulse -->
+  <circle cx="25.2" cy="6.8" r="2" fill="#4caf50"/>
+</svg>
