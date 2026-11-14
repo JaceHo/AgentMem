@@ -1,11 +1,31 @@
 """Health, stats, and config endpoints."""
 
+import asyncio
+import time
+
 from fastapi import APIRouter, HTTPException
 
 from api import state
 from config.settings import settings
 
 router = APIRouter(tags=["health"])
+
+
+def _runtime_signals() -> dict:
+    """Honest local-SOTA signals: circuit, cache, extractor cooldown (MEMORY-HEALTH style)."""
+    from core import embed_cache
+    from core import extractor as extractor_mod
+
+    broken = [
+        m for m, t in list(extractor_mod._model_fail_times.items())
+        if time.time() - t <= extractor_mod._CIRCUIT_BREAKER_TTL
+    ]
+    return {
+        "embed_circuit_open": bool(state.embedder.embedding_unavailable()),
+        "embed_cache": embed_cache.stats(),
+        "extractor_broken_models": broken,
+        "extractor_budget_s": getattr(extractor_mod, "EXTRACT_BUDGET_S", None),
+    }
 
 
 @router.get("/health")
@@ -21,17 +41,20 @@ async def health():
     from core import warmup as warmup_mod
 
     snap = warmup_mod.snapshot()
+    signals = _runtime_signals()
     r = state.redis
     if not snap["ready"]:
         return {"status": "starting", "redis": "pending" if r is None else "ok",
-                "version": settings.app_version, "warmup": snap}
+                "version": settings.app_version, "warmup": snap, "signals": signals}
     try:
         await r.ping()
-        return {"status": "ok", "redis": "ok", "version": settings.app_version,
-                "embedding": state.embedder.get_provider_info(), "warmup": snap}
+        status = "degraded" if signals["embed_circuit_open"] else "ok"
+        return {"status": status, "redis": "ok", "version": settings.app_version,
+                "embedding": state.embedder.get_provider_info(), "warmup": snap,
+                "signals": signals}
     except Exception as e:
         return {"status": "degraded", "redis": "error", "error": str(e),
-                "version": settings.app_version, "warmup": snap}
+                "version": settings.app_version, "warmup": snap, "signals": signals}
 
 
 @router.get("/ready")
@@ -119,6 +142,78 @@ async def stats():
         return counts
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/ops")
+async def ops_snapshot():
+    """Single-fetch console snapshot (health+stats+kb+graph+focus+intentions).
+
+    Local SOTA: one round-trip for the dashboard instead of 8 parallel polls,
+    matching the "ops health gate" pattern without cloud dependencies.
+    """
+    from api.routes import focus as focus_routes
+    from api.routes.compat import compat_observations, compat_sessions
+    from api.routes.kb import kb_status
+    from core import graph as graph_mod
+    from core import warmup as warmup_mod
+
+    health_body, stats_body = await asyncio.gather(
+        health(),
+        stats(),
+        return_exceptions=True,
+    )
+    if isinstance(health_body, Exception):
+        health_body = {"status": "error", "error": str(health_body)[:120]}
+    if isinstance(stats_body, Exception):
+        stats_body = {"error": str(stats_body)[:120]}
+
+    async def _safe(coro, label: str):
+        try:
+            return await coro
+        except Exception as exc:
+            return {"error": f"{label}: {exc}"[:160]}
+
+    async def _empty_graph():
+        return {"nodes": 0, "edges": 0, "total_nodes": 0, "total_edges": 0}
+
+    graph_coro = (
+        graph_mod.graph_stats(state.redis)
+        if state.redis is not None
+        else _empty_graph()
+    )
+    kb_body, gs_body, focus_body, intent_body, sess_body, obs_body = await asyncio.gather(
+        _safe(kb_status(), "kb"),
+        _safe(graph_coro, "graph"),
+        _safe(focus_routes.get_active_memory(session_id="default"), "focus"),
+        _safe(focus_routes.get_intentions(status="pending", limit=5), "intentions"),
+        _safe(compat_sessions(limit=5), "sessions"),
+        _safe(compat_observations(limit=5), "observations"),
+    )
+
+    signals = (
+        (health_body or {}).get("signals")
+        if isinstance(health_body, dict) and isinstance((health_body or {}).get("signals"), dict)
+        else _runtime_signals()
+    )
+    # Prefer health's warmup snapshot so nested fields stay consistent in one response.
+    warm = (
+        (health_body or {}).get("warmup")
+        if isinstance(health_body, dict) and isinstance((health_body or {}).get("warmup"), dict)
+        else warmup_mod.snapshot()
+    )
+    return {
+        "ts": time.time(),
+        "warmup": warm,
+        "health": health_body,
+        "stats": stats_body,
+        "kb": kb_body,
+        "graph": gs_body,
+        "focus": focus_body,
+        "intentions": intent_body,
+        "sessions": sess_body,
+        "observations": obs_body,
+        "signals": signals,
+    }
 
 
 @router.get("/config")

@@ -123,8 +123,11 @@ _PATTERNS = [
     (re.compile(r"我的学校(?:是|叫)\s*(.{2,30}?)(?:[，。！\n]|$)"),             "personal"),
     # Duration: 我已经X了Y年/月
     (re.compile(r"我(?:已经|已)?(.{2,20}?)[了]?\s*(\d+\s*(?:年|个月|周))(?:[，。！\n]|$)"), "personal"),
-    # Preferences: 我喜欢X / 我不喜欢X / 我偏好X
+    # Preferences: 我喜欢X / 偏好用X / prefer bun (regex must work when LLM is down)
     (re.compile(r"我(?:喜欢|热爱|爱好|偏好|不喜欢|讨厌)\s*(.{1,40}?)(?:[，。！\n]|$)"), "preference"),
+    (re.compile(r"(?:^|[，,；;。\s])(?:偏好|喜欢|爱用|优先用|改用)\s*(?:用|使用)?\s*(.{1,40}?)(?:[，。！\n]|做|来|进行|$)"), "preference"),
+    (re.compile(r"(?i)\b(?:i\s+)?(?:prefer|prefs?|preference)\b[:\s]+(.{1,60}?)(?:[.!,\n]|$)"), "preference"),
+    (re.compile(r"(?i)\bprefer(?:s|ring)?\s+(\S{1,40})\s+over\s+(\S{1,40})"), "preference"),
     # Named relations: 我的X(关系词)叫Y / 我的朋友X
     (re.compile(r"我的(?:伴侣|妻子|丈夫|老婆|老公|姐姐|妹妹|哥哥|弟弟|朋友|同事|邻居)\s*(.{1,10}?)(?:[，。！是叫\n]|$)"), "personal"),
     # Reminders / rules (Chinese): 记住X / 注意X / 重要：X
@@ -164,21 +167,23 @@ AISERV_ROLE  = "nlp"                    # maps to /v1/role/nlp
 # Prefer aiserv/fast role alias when role API is down — aiserv routes it.
 AISERV_FALLBACK_MODEL = os.getenv("AGENTMEM_EXTRACT_FALLBACK", "aiserv/fast")
 AISERV_MODEL_CASCADE = []               # populated dynamically; kept for import compat
-# Extraction is background, but long cascades (20–60s × N models) still pile
-# writer avg_ms into the 20–30s range and flood stderr with timeouts. Fail
-# fast to regex when aiserv is slow; quality-feedback still trains the router.
-FAST_LLM_TIMEOUT_S = float(os.getenv("AGENTMEM_EXTRACT_FAST_TIMEOUT", "8.0"))
-ROLE_LLM_TIMEOUT_S = float(os.getenv("AGENTMEM_EXTRACT_ROLE_TIMEOUT", "12.0"))
+# Local-first FrugalGPT cascade (LAN): try aiserv/fast FIRST, then at most
+# LLM_MAX_RETRIES role picks, under a hard wall budget. Measured 2026-11-14:
+# role→GLM/Kimi/DeepSeek @12s ×3 = 28–30s store tails that also starved recall.
+FAST_LLM_TIMEOUT_S = float(os.getenv("AGENTMEM_EXTRACT_FAST_TIMEOUT", "5.0"))
+ROLE_LLM_TIMEOUT_S = float(os.getenv("AGENTMEM_EXTRACT_ROLE_TIMEOUT", "6.0"))
 LLM_TIMEOUT_S = ROLE_LLM_TIMEOUT_S
-LLM_MAX_RETRIES = int(os.getenv("AGENTMEM_EXTRACT_MAX_RETRIES", "2"))
+LLM_MAX_RETRIES = int(os.getenv("AGENTMEM_EXTRACT_MAX_RETRIES", "1"))
+EXTRACT_BUDGET_S = float(os.getenv("AGENTMEM_EXTRACT_BUDGET_S", "10.0"))
 
 # Circuit breaker: models that failed recently are skipped for 5 minutes.
-# A single timeout must not lock the model out — aiserv blips were turning
-# every later compress into regex=0 / facts+0 for the full cooldown.
+# Timeouts open after ONE miss (slow models must not keep winning the role
+# lottery); other errors still need two strikes so blips don't lock everyone out.
 _model_fail_times: dict[str, float] = {}
 _model_fail_counts: dict[str, int] = {}
 _CIRCUIT_BREAKER_TTL = 300  # seconds
 _CIRCUIT_OPEN_AFTER = 2
+_CIRCUIT_OPEN_AFTER_TIMEOUT = 1
 LLM_MAX_INPUT = 3000   # chars of conversation to send to LLM
 
 
@@ -194,11 +199,12 @@ def is_model_circuit_broken(model: str) -> bool:
     return True
 
 
-def mark_model_failed(model: str) -> None:
-    """Record a model failure. The breaker opens only after repeated failures."""
+def mark_model_failed(model: str, *, reason: str = "other") -> None:
+    """Record a model failure. Timeouts open the breaker on the first miss."""
     n = _model_fail_counts.get(model, 0) + 1
     _model_fail_counts[model] = n
-    if n >= _CIRCUIT_OPEN_AFTER:
+    need = _CIRCUIT_OPEN_AFTER_TIMEOUT if reason == "timeout" else _CIRCUIT_OPEN_AFTER
+    if n >= need:
         _model_fail_times[model] = time.time()
 
 
@@ -440,37 +446,50 @@ async def _llm_extract(conversation_text: str) -> list[ExtractedFact]:
         conversation=conversation_text[:LLM_MAX_INPUT],
     )
 
-    exclude = None
-    tried_models = []
-    # Build candidate list: up to LLM_MAX_RETRIES role-routed models, then fallback
-    # Store (model, tier) pairs so timeout uses the correct tier
-    candidate_models: list[tuple[str, str]] = []
-    for _ in range(LLM_MAX_RETRIES):
-        m, t = await _resolve_nlp_model(exclude=exclude)
-        if m not in [c[0] for c in candidate_models]:
-            candidate_models.append((m, t))
-        exclude = m
-    if AISERV_FALLBACK_MODEL not in [c[0] for c in candidate_models]:
-        candidate_models.append((AISERV_FALLBACK_MODEL, "fast"))
-
-    # Prune expired circuit breaker entries
     import time as _time
+    # Prune expired circuit breaker entries first so a recovered aiserv/fast is usable.
     now = _time.time()
     expired = [m for m, t in _model_fail_times.items() if now - t > _CIRCUIT_BREAKER_TTL]
     for m in expired:
         del _model_fail_times[m]
+        _model_fail_counts.pop(m, None)
 
-    # Filter out circuit-broken models
-    candidate_models = [(m, t) for m, t in candidate_models if not is_model_circuit_broken(m)]
-    if not candidate_models:
-        log.warning("[extractor] all models circuit-broken, falling back to regex-only")
+    # Honest local degradation: open fast-circuit → regex only. Do not start a
+    # role lottery (GLM/Kimi/DeepSeek) that recreates the 28s store storms.
+    if is_model_circuit_broken(AISERV_FALLBACK_MODEL):
+        log.info("[extractor] %s circuit open — regex-only", AISERV_FALLBACK_MODEL)
         return []
 
-    for model, tier in candidate_models:
-        if model in tried_models:
+    tried_models: list[str] = []
+    # FrugalGPT / local-first: aiserv/fast first; one role backup only if fast
+    # fails mid-call (lazy resolve — no pre-pay of /v1/role/nlp).
+    queue: list[tuple[str, str]] = [(AISERV_FALLBACK_MODEL, "fast")]
+
+    deadline = _time.monotonic() + max(1.0, EXTRACT_BUDGET_S)
+    role_backup_used = False
+
+    async def _enqueue_role_backup(failed: str) -> None:
+        nonlocal role_backup_used
+        if role_backup_used or LLM_MAX_RETRIES <= 0 or _time.monotonic() >= deadline:
+            return
+        role_backup_used = True
+        m, t = await _resolve_nlp_model(exclude=failed)
+        if m not in tried_models and not is_model_circuit_broken(m):
+            queue.append((m, t))
+
+    while queue:
+        model, tier = queue.pop(0)
+        if model in tried_models or is_model_circuit_broken(model):
             continue
+        if _time.monotonic() >= deadline:
+            log.warning(
+                "[extractor] wall budget %.1fs hit after %s — regex fallback",
+                EXTRACT_BUDGET_S, ", ".join(tried_models) or "none",
+            )
+            break
         tried_models.append(model)
-        timeout_s = _timeout_for(model, tier)
+        # Don't let a single attempt overrun the remaining budget.
+        timeout_s = min(_timeout_for(model, tier), max(0.5, deadline - _time.monotonic()))
         try:
             posted = await async_post_json_detailed(
                 AISERV_URL,
@@ -500,16 +519,16 @@ async def _llm_extract(conversation_text: str) -> list[ExtractedFact]:
                 else:
                     log.warning("[extractor] %s returned no data (%s)", model, err or "empty")
                     reason = "other"
-                mark_model_failed(model)
-                exclude = model
+                mark_model_failed(model, reason=reason)
                 asyncio.create_task(_report_quality(model, -1, reason=reason))
+                await _enqueue_role_backup(model)
                 continue
 
             raw_content = data["choices"][0]["message"].get("content")
             if not raw_content or not raw_content.strip():
                 log.warning("[extractor] %s returned null content, trying next", model)
                 mark_model_failed(model)
-                exclude = model
+                await _enqueue_role_backup(model)
                 continue
             raw = raw_content.strip()
             items = _parse_llm_json(raw)
@@ -517,12 +536,12 @@ async def _llm_extract(conversation_text: str) -> list[ExtractedFact]:
             if not isinstance(items, list):
                 log.warning("[extractor] %s returned non-list, trying next", model)
                 mark_model_failed(model)
-                exclude = model
+                await _enqueue_role_backup(model)
                 continue
             if not items and not _looks_like_empty_array(raw):
                 log.warning("[extractor] %s produced no parseable facts, trying next", model)
                 mark_model_failed(model)
-                exclude = model
+                await _enqueue_role_backup(model)
                 continue
             # A good response proves the model is healthy — reset its circuit
             # breaker so a recovered model isn't locked out for the full TTL.
@@ -612,24 +631,24 @@ async def _llm_extract(conversation_text: str) -> list[ExtractedFact]:
 
         except json.JSONDecodeError as e:
             log.warning("[extractor] %s returned non-JSON: %s", model, e)
-            exclude = model
             asyncio.create_task(_report_quality(model, -1, reason="bad_json"))
+            await _enqueue_role_backup(model)
         except httpx.TimeoutException:
             log.warning("[extractor] %s timed out (%.1fs)", model, timeout_s)
-            exclude = model
-            mark_model_failed(model)
+            mark_model_failed(model, reason="timeout")
             # Self-healing: push -1 + reason="timeout" back to aiserv. The
             # reason field triggers aiserv to (a) urgently re-probe this
             # route and (b) write a synthetic failed ProbeResult so the
             # next /v1/role/nlp call automatically suppresses this model.
             asyncio.create_task(_report_quality(model, -1, reason="timeout"))
+            await _enqueue_role_backup(model)
         except Exception as e:
             log.warning(
                 "[extractor] %s failed: %s: %s", model, type(e).__name__, e
             )
-            exclude = model
-            mark_model_failed(model)
+            mark_model_failed(model, reason="other")
             asyncio.create_task(_report_quality(model, -1, reason="other"))
+            await _enqueue_role_backup(model)
 
     log.warning(
         "[extractor] All LLM models exhausted after %d attempts. Tried: %s. "

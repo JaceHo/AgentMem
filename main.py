@@ -676,7 +676,7 @@ import uuid as _uuid
 # Hot paths that poll / fire every tool call. Logging each 200 at INFO
 # dominated stderr (~17k /tool-feedback lines in ~2h) and drowned real faults.
 _QUIET_ACCESS_EXACT = frozenset({
-    "/health", "/livez", "/ready", "/stats", "/favicon.ico", "/favicon.svg",
+    "/health", "/livez", "/ready", "/stats", "/ops", "/favicon.ico", "/favicon.svg",
     "/apple-touch-icon.png", "/tool-feedback", "/session/compact",
     "/kb/status", "/graph/stats", "/sessions", "/observations",
     "/active-memory", "/intentions",
@@ -919,6 +919,11 @@ def _format_prepend(
     """
     if token_budget is None:
         token_budget = settings.default_token_budget
+    # Reserve wrapper tokens so packing can't "succeed" then overflow-clamp.
+    _WRAPPER_TOKENS = 30
+    pack_budget = max(32, int(token_budget) - _WRAPPER_TOKENS)
+    # Always-on persona must stay short (Mem0/Letta practice: stable prefix ≪ retrieval).
+    persona_token_cap = max(64, min(320, pack_budget // 4))
     sections: list[str] = []
     tokens_used = 0
 
@@ -926,7 +931,7 @@ def _format_prepend(
         nonlocal tokens_used
         text = _redact_secrets(text)
         cost = _estimate_tokens(text)
-        if tokens_used + cost > token_budget:
+        if tokens_used + cost > pack_budget:
             return False
         sections.append(text)
         tokens_used += cost
@@ -960,7 +965,7 @@ def _format_prepend(
         """
         nonlocal tokens_used
         text = _redact_secrets(text)
-        remaining = token_budget - tokens_used
+        remaining = pack_budget - tokens_used
         if remaining <= 0:
             return False
         if _estimate_tokens(text) > remaining:
@@ -972,9 +977,13 @@ def _format_prepend(
         tokens_used += cost
         return True
 
-    # Priority 1: persona (user profile — most stable context)
-    if persona_ctx and _add_fitted(persona_ctx):
-        _add("")
+    # Priority 1: persona (user profile — most stable context), hard-capped
+    if persona_ctx:
+        persona_block = persona_ctx
+        if _estimate_tokens(persona_block) > persona_token_cap:
+            persona_block = truncate_to_tokens(persona_block, persona_token_cap)
+        if persona_block and _add_fitted(persona_block):
+            _add("")
 
     # Priority 1.5: last session summary (cross-session continuity bridge)
     # Always injected when present so the agent knows what was accomplished
@@ -1076,16 +1085,19 @@ def _format_prepend(
     suffix = "\n</cross_session_memory>"
     out = prefix + body + suffix
 
-    # Final budget assertion. A single oversized line (one huge fact, one long
-    # procedure body) can still slip past the per-item check because _add only
-    # refuses items that overshoot. Overshooting silently is exactly what
-    # happened for months, so: clamp, and say so loudly.
-    _WRAPPER_TOKENS = 30
+    # Final budget assertion. A single oversized line can still slip past the
+    # per-item check; clamp and log (debug when only a few tokens over — that
+    # used to spam WARNING every recall when persona was 2k chars).
     cost = _estimate_tokens(out)
     if cost > token_budget:
-        log.warning("[recall] token_budget overflow: packed %d tokens > budget %d"
-                    " — clamping (%d facts, %d episodes, persona=%d chars)",
-                    cost, token_budget, len(facts), len(episodes), len(persona_ctx))
+        over = cost - token_budget
+        msg = ("[recall] token_budget overflow: packed %d tokens > budget %d"
+               " — clamping (%d facts, %d episodes, persona=%d chars)")
+        args = (cost, token_budget, len(facts), len(episodes), len(persona_ctx or ""))
+        if over <= 40:
+            log.debug(msg, *args)
+        else:
+            log.warning(msg, *args)
         body = truncate_to_tokens(body, max(16, token_budget - _WRAPPER_TOKENS))
         out = prefix + body + suffix
 

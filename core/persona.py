@@ -44,6 +44,11 @@ _MAX_ENTRIES_PER_FIELD = 5
 _MAX_FIELD_LEN = 500
 _MAX_FIELD_BYTES = 500        # the cap that actually leaves the process (JSON)
 _MAX_ENTRY_LEN = 160          # one persona line; longer = a pasted log/report
+# Injection budget for the whole "## User Profile" block. Live 2026-11-14 had
+# 1938 chars / ~586 tokens of bloated name/work/preferences starving facts
+# under a 1200–1500 token recall budget (SOTA: keep always-on memory short).
+_MAX_CONTEXT_CHARS = 720
+_MAX_CONTEXT_ENTRIES_PER_FIELD = 2
 
 # ── PII / path guards ─────────────────────────────────────────────────────────
 # The persona block is injected into EVERY agent's context on every /recall. A
@@ -469,25 +474,56 @@ async def sanitize_stored(r: aioredis.Redis, *, key: str = PERSONA_KEY) -> dict:
 
 
 async def get_context(r: aioredis.Redis, *, key: str = PERSONA_KEY) -> str:
-    """Return persona as a formatted context block, or '' if empty."""
+    """Return persona as a formatted context block, or '' if empty.
+
+    Re-applies entry/field caps on read so a historically bloated Redis hash
+    cannot monopolize every agent's token budget.
+    """
     raw = await r.hgetall(key)
     if not raw:
         return ""
 
     lines = ["## User Profile"]
+    used = len(lines[0])
     field_order = ["name", "work", "location", "preferences", "rules", "skills", "deadlines"]
     seen = set()
+
+    def _emit(field: str, val: str) -> bool:
+        nonlocal used
+        entries = _best_entries(_parse_entries(val), max_n=_MAX_CONTEXT_ENTRIES_PER_FIELD)
+        if not entries:
+            return False
+        compact = _compose_field(
+            entries,
+            max_chars=min(_MAX_FIELD_LEN, 220),
+            max_bytes=min(_MAX_FIELD_BYTES, 360),
+        )
+        if not compact:
+            return False
+        line = f"- {field}: {compact}"
+        # +1 for the newline join
+        if used + len(line) + 1 > _MAX_CONTEXT_CHARS:
+            remaining = _MAX_CONTEXT_CHARS - used - len(f"- {field}: ") - 2
+            if remaining < 24:
+                return False
+            compact = compact[:remaining].rstrip(" ;;.。，,") + "…"
+            line = f"- {field}: {compact}"
+        lines.append(line)
+        used += len(line) + 1
+        return True
+
     for field in field_order:
+        if used >= _MAX_CONTEXT_CHARS:
+            break
         key_b = field.encode()
         val = raw.get(key_b) or raw.get(field)
-        if val:
-            v = decode_bytes(val)
-            lines.append(f"- {field}: {v}")
+        if val and _emit(field, decode_bytes(val)):
             seen.add(field)
     for k, v in raw.items():
+        if used >= _MAX_CONTEXT_CHARS:
+            break
         k_str = decode_bytes(k)
-        if k_str not in seen:
-            v_str = decode_bytes(v)
-            lines.append(f"- {k_str}: {v_str}")
+        if k_str not in seen and _emit(k_str, decode_bytes(v)):
+            seen.add(k_str)
 
-    return "\n".join(lines)
+    return "\n".join(lines) if len(lines) > 1 else ""

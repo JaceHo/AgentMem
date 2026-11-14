@@ -3,19 +3,32 @@
    ═══════════════════════════════════════════════════════════════════════════ */
 
 async function loadDash() {
-  const [health, stats, sess, obs, gs, kb, focus, intents] = await Promise.all([
-    api('/health'), api('/stats'), api('/sessions?limit=5'),
-    api('/observations?limit=5'), api('/graph/stats'),
-    api('/kb/status'), api('/active-memory?session_id=default'),
-    api('/intentions?status=pending&limit=5'),
-  ]);
+  // Prefer single /ops snapshot (local SOTA ops gate); fall back to fan-out.
+  let health, stats, sess, obs, gs, kb, focus, intents;
+  const ops = await api('/ops');
+  if (ops && ops.health) {
+    health = ops.health; stats = ops.stats; sess = ops.sessions; obs = ops.observations;
+    gs = ops.graph; kb = ops.kb; focus = ops.focus; intents = ops.intentions;
+  } else {
+    [health, stats, sess, obs, gs, kb, focus, intents] = await Promise.all([
+      api('/health'), api('/stats'), api('/sessions?limit=5'),
+      api('/observations?limit=5'), api('/graph/stats'),
+      api('/kb/status'), api('/active-memory?session_id=default'),
+      api('/intentions?status=pending&limit=5'),
+    ]);
+  }
   S.health = health; S.stats = stats;
 
   // Ops strip: KB + writer errors + embedding — progressive disclosure for SOTA ops-first
   const strip = $('ops-strip');
   if (strip) {
     const chips = [];
-    chips.push(`<span class="ops-chip"><b>Embed</b> ${esc(health?.embedding?.provider || '?')} ${health?.embedding?.dims || ''}d</span>`);
+    const sig = health?.signals || ops?.signals || {};
+    const embCls = sig.embed_circuit_open ? 'ops-chip warn' : 'ops-chip';
+    chips.push(`<span class="${embCls}"><b>Embed</b> ${esc(health?.embedding?.provider || '?')} ${health?.embedding?.dims || ''}d${sig.embed_circuit_open ? ' · CIRCUIT' : ''}</span>`);
+    if (Array.isArray(sig.extractor_broken_models) && sig.extractor_broken_models.length) {
+      chips.push(`<span class="ops-chip warn"><b>Extract</b> cool ${sig.extractor_broken_models.length}</span>`);
+    }
     if (kb) chips.push(`<span class="ops-chip"><b>KB</b> ${kb.docs || 0} docs · ${kb.chunks || 0} chunks</span>`);
     if (gs) chips.push(`<span class="ops-chip"><b>Graph</b> ${gs.total_nodes || gs.nodes || 0}n / ${gs.total_edges || gs.edges || 0}e</span>`);
     const w = stats?.writer;
