@@ -100,3 +100,59 @@ async def test_post_json_classifies_timeout():
         http_mod._get_client = original
     assert result.data is None
     assert result.error == "timeout"
+
+
+# ── v1.1.1: 2026-11-19 ollama outage audit ───────────────────────────────────
+# One upstream outage produced 3422 HTTP 500s, 2008 tracebacks and ~800
+# duplicate warnings. These pin the degradation behaviour that fixes it.
+
+
+def test_is_expected_outage_classifies_only_dependency_failures():
+    from core import embedder as emb
+
+    assert emb.is_expected_outage(emb.EmbeddingUnavailable("circuit open"))
+    assert emb.is_expected_outage(httpx.ConnectError("connection refused"))
+    assert emb.is_expected_outage(TimeoutError("timed out"))
+    # A genuine code bug must NOT be downgraded to a one-line warning.
+    assert not emb.is_expected_outage(ValueError("bad argument"))
+    assert not emb.is_expected_outage(KeyError("missing key"))
+
+
+async def test_kb_search_degrades_to_bm25_when_circuit_open(monkeypatch):
+    """An embed outage must return keyword results, never a 500."""
+    from core import kb as kb_mod
+
+    kb = kb_mod.get_kb()
+
+    async def _boom(_text):
+        raise embedder.EmbeddingUnavailable("embedding circuit open")
+
+    async def _bm25(_query, _k):
+        return [{"uid": "u", "attrs": {"content": "match"}, "score": 1.0}]
+
+    async def _no_expand(_query):
+        return ""
+
+    monkeypatch.setattr(kb_mod, "async_encode", _boom)
+    monkeypatch.setattr(kb_mod, "expand_query", _no_expand)
+    monkeypatch.setattr(kb, "bm25", type("B", (), {"search": staticmethod(_bm25)})())
+
+    out = await kb.search(object(), "match", k=3)
+    assert out and out[0]["text"] == "match", "BM25 leg must survive the outage"
+    assert all(c["dense"] == 0.0 for c in out), "no dense leg should have run"
+
+
+async def test_async_encode_batch_chunked_fails_fast_on_open_circuit(monkeypatch):
+    """Three backoffs cannot recover a 30s circuit — stop on the first failure."""
+    from core import search as search_mod
+
+    calls = []
+
+    def _encode_batch(_texts):
+        calls.append(1)
+        raise embedder.EmbeddingUnavailable("embedding circuit open")
+
+    monkeypatch.setattr(search_mod, "encode_batch", _encode_batch)
+    out = await search_mod.async_encode_batch_chunked(["a", "b"])
+    assert out is None
+    assert len(calls) == 1, f"expected one attempt, got {len(calls)} retries"

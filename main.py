@@ -1762,7 +1762,13 @@ async def _do_store(messages: list[Message], session_id: str, scope: Scope = Sco
                  f"ep+{ep_saved} facts+{fact_saved} {ms}ms")
 
     except Exception as e:
-        log.warning(f"[store] background error: {e}", exc_info=True)
+        # A dependency outage is one WARNING line, not a 60-line traceback per
+        # store (2008 of them in the 2026-11-19 ollama outage). Unexpected bugs
+        # still carry exc_info so they stay debuggable — never silence those.
+        if embedder.is_expected_outage(e):
+            log.warning("[store] background deferred: %s", e)
+        else:
+            log.exception("[store] background error")
     finally:
         ms = int((time.time() - t0) * 1000)
         await _store_latency_sum_ms.add(ms)
@@ -2949,7 +2955,10 @@ async def _auto_crystallize() -> None:
                 log.info(f"[crystallize] auto-crystallized {crystallized_count} sessions")
 
         except Exception as e:
-            log.warning(f"[crystallize] auto-crystallization error: {e}", exc_info=True)
+            if embedder.is_expected_outage(e):
+                log.warning("[crystallize] deferred: %s", e)
+            else:
+                log.exception("[crystallize] auto-crystallization error")
 
 
 # ── Viewer ────────────────────────────────────────────────────────────────────

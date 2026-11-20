@@ -99,13 +99,27 @@ async def kb_raw(doc_id: str):
 
 @router.post("/search")
 async def kb_search(req: KbSearchRequest):
-    """Tier 2 — hybrid chunk retrieval (vector + BM25, wRRF fused)."""
+    """Tier 2 — hybrid chunk retrieval (vector + BM25, wRRF fused).
+
+    An embedding outage degrades to BM25-only *inside* kb.search; it is not an
+    error. A genuine bug is still a 500 and stays loud. The response carries a
+    ``degraded`` flag so callers can tell keyword-only results from hybrid ones
+    instead of silently trusting a half-ranked result set.
+    """
     try:
-        return {"query": req.query,
-                "chunks": await _kb().search(_redis(), req.query, k=req.k, library=req.library)}
-    except Exception as exc:  # noqa: BLE001
-        log.error("[kb/search] %s", exc)
+        chunks = await _kb().search(_redis(), req.query, k=req.k, library=req.library)
+    except embedder.EmbeddingUnavailable:
+        # Defensive: kb.search swallows this, but a provider introduced later may
+        # not. A dependency outage is 503 (retryable), never a 500 that trips ops.
+        raise
+    except Exception as exc:  # noqa: BLE001 — real bugs still surface as 500
+        log.exception("[kb/search] unexpected failure")
         raise HTTPException(status_code=500, detail=str(exc))
+    return {
+        "query": req.query,
+        "chunks": chunks,
+        "degraded": embedder.embedding_unavailable(),
+    }
 
 
 @router.post("/remove")

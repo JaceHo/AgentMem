@@ -54,7 +54,7 @@ _MAX_CONTEXT_ENTRIES_PER_FIELD = 2
 # The persona block is injected into EVERY agent's context on every /recall. A
 # single stored fact that points at an identity document therefore leaks a real
 # PII pointer into every downstream prompt forever (this actually happened:
-# "Both sides of the national ID card are stored in ~/Documents/profile/resume/…"
+# "Both sides of the national ID card are stored in ~/profile/resume/…"
 # landed in the `location` field and shipped on every recall).
 # Reject by *shape*, not by exact spelling, so new phrasings can't slip past.
 

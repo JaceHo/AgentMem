@@ -212,7 +212,15 @@ async def async_encode_batch_chunked(
                 )
                 all_vecs.extend(vecs)
                 break
-            except (asyncio.TimeoutError, Exception) as e:
+            except Exception as e:
+                # Retrying an open circuit is waste: it stays open ~30s, so the
+                # exponential backoffs (~3.5s total) can never recover it — they
+                # only add latency and log noise. A genuine transient error (raw
+                # 502 / executor timeout) still gets its retries below.
+                if isinstance(e, embedder.EmbeddingUnavailable):
+                    log.warning("[encode] circuit open — abandon chunk at offset %d (%s)",
+                                offset, e)
+                    return None
                 if attempt < max_retries:
                     backoff = 0.5 * (2 ** attempt)
                     log.info(

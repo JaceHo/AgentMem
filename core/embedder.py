@@ -261,6 +261,21 @@ def _is_embed_outage(exc: BaseException) -> bool:
     )
 
 
+def is_expected_outage(exc: BaseException) -> bool:
+    """True for a *known* dependency failure, as opposed to a code bug.
+
+    Call sites use this to keep expected outages to one WARNING line instead of
+    a full traceback. During the 2026-11-19 ollama outage a single upstream
+    failure produced 2008 tracebacks in stderr.log (store + crystallize + kg)
+    because every layer logged ``exc_info=True`` on the same wrapped exception.
+    Real bugs must still carry their traceback, so this is deliberately narrow:
+    circuit-open, transport/HTTP errors and the token list above.
+    """
+    if isinstance(exc, EmbeddingUnavailable):
+        return True
+    return _is_embed_outage(exc)
+
+
 def _trip_embed_circuit(exc: BaseException) -> None:
     global _embed_down_until
     if time.monotonic() >= _embed_down_until:
@@ -288,7 +303,11 @@ def encode(text: str) -> np.ndarray:
     key = embed_cache.cache_key(embed_signature(), text)
     hit = embed_cache.get(key)
     if hit is not None:
-        return hit
+        # A cache row written before the provider was measured (or by a bug)
+        # can carry a different width than the key claims. A stale vector is
+        # exactly the silent VADD-loss this module exists to prevent, so run
+        # hits through the same width gate as fresh encodes.
+        return _checked([hit])[0]
     try:
         vec = _get_provider().encode(text)
     except EmbeddingUnavailable:
@@ -317,7 +336,8 @@ def encode_batch(texts: list[str]) -> list[np.ndarray]:
     misses = [i for i, k in enumerate(keys) if k not in hits]
     if not misses:
         # Fully served from cache -- the model is never touched on this path.
-        return [hits[k] for k in keys]
+        # Validate width anyway: a poisoned/stale row must not bypass _checked.
+        return _checked([hits[k] for k in keys])
     try:
         vecs = _get_provider().encode_batch([texts[i] for i in misses])
     except EmbeddingUnavailable:
@@ -330,12 +350,17 @@ def encode_batch(texts: list[str]) -> list[np.ndarray]:
     _clear_embed_circuit()
     vecs = _checked(list(vecs))
     embed_cache.put_many([(keys[i], vecs[j]) for j, i in enumerate(misses)])
+    # Hits copied in from the cache were never width-checked. Check them with
+    # the fresh vectors before returning, so one stale row cannot poison a
+    # whole batch (same class of bug as the full-cache-hit path above).
     out: list[np.ndarray] = [None] * len(texts)  # type: ignore[list-item]
     for j, i in enumerate(misses):
         out[i] = vecs[j]
-    for i, k in enumerate(keys):
-        if k in hits:
-            out[i] = hits[k]
+    hit_indices = [i for i, k in enumerate(keys) if k in hits]
+    if hit_indices:
+        checked_hits = _checked([hits[keys[i]] for i in hit_indices])
+        for i, v in zip(hit_indices, checked_hits):
+            out[i] = v
     return out
 
 

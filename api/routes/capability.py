@@ -550,6 +550,14 @@ async def detect_meta_tools(threshold: int = 5, background_tasks: BackgroundTask
     async def _synthesize_chains(chains_to_add: list[dict]):
         new_count = 0
         embed_failures = 0
+        # One circuit-open warning for the whole batch, not one per chain. The
+        # 2026-11-19 outage logged ~800 "[awo] embed failed for <tool>" lines —
+        # all the same root cause. The sig is intentionally NOT set, so the next
+        # run retries synthesis once the backend answers.
+        if embed_mod.embedding_unavailable():
+            log.warning("[awo] synthesis deferred: embedding circuit open (%d chains)",
+                        len(chains_to_add))
+            return
         for ch in chains_to_add[:20]:
             a, b, c = ch["chain"]
             task = f"[meta-tool] {a} → {b} → {c} workflow"
@@ -565,6 +573,11 @@ async def detect_meta_tools(threshold: int = 5, background_tasks: BackgroundTask
                 emb = await async_encode(task)
             except Exception as e:
                 embed_failures += 1
+                # Circuit may open mid-batch. One line for that, not 20.
+                if embed_mod.is_expected_outage(e) and embed_mod.embedding_unavailable():
+                    log.warning("[awo] synthesis deferred: circuit opened mid-batch (%d/%d done)",
+                                new_count, len(chains_to_add))
+                    break
                 log.warning("[awo] embed failed for %s: %s", a, e)
                 continue
             if await mem_store.find_procedure_by_task(r, emb, task):

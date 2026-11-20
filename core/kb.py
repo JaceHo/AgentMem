@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+from . import embedder
 from .embedder import embed_signature
 from .search import BM25Index, async_encode, async_encode_batch_chunked
 from . import store as store_mod
@@ -505,19 +506,41 @@ class KBStore:
         return meta
 
     async def search(self, r, query: str, k: int = 6, library: str = "") -> List[Dict[str, Any]]:
-        """Tier 2 — hybrid vector + BM25, fused with weighted RRF."""
+        """Tier 2 — hybrid vector + BM25, fused with weighted RRF.
+
+        Dense legs are OPTIONAL. When the embedding backend is down the circuit
+        opens for 30s; letting ``EmbeddingUnavailable`` escape here used to turn
+        every search into an HTTP 500 (measured 2026-11-19: 3422 500s and 1301
+        ERROR lines from one ollama outage). BM25 still answers the query on its
+        own, so degrade to keyword-only instead — the caller sees results and a
+        ``degraded`` flag, never a 500 for a dependency outage.
+        """
         k = max(1, min(k, 25))
+
+        async def _dense(text: str):
+            """Encode or return None when the embed circuit is open."""
+            try:
+                return await async_encode(text)
+            except embedder.EmbeddingUnavailable:
+                return None
+
         # Same event-loop hazard as ingest: a sync query encode stalls /health
         # long enough for ops/watchdog.sh to declare the service down.
-        vec = await async_encode(query)
+        vec = await _dense(query)
         filter_expr = f'.library == "{library}"' if library else None
         fetch_k = k * 4
-        vres = await knn_search(r, KB_CHUNK_KEY, vec, fetch_k, filter_expr=filter_expr)
+        vres = await knn_search(r, KB_CHUNK_KEY, vec, fetch_k,
+                                filter_expr=filter_expr) if vec is not None else []
         bres = await self.bm25.search(query, fetch_k)
         expanded = await expand_query(query)
-        vres_x = await knn_search(r, KB_CHUNK_KEY, await async_encode(expanded), fetch_k,
-                                  filter_expr=filter_expr) if expanded else []
-        bres_x = await self.bm25.search(expanded, fetch_k) if expanded else []
+        vres_x = []
+        bres_x = []
+        if expanded:
+            vec_x = await _dense(expanded)
+            if vec_x is not None:
+                vres_x = await knn_search(r, KB_CHUNK_KEY, vec_x, fetch_k,
+                                          filter_expr=filter_expr)
+            bres_x = await self.bm25.search(expanded, fetch_k)
 
         # RRF weights. vres=1.0, bres_x=0.6 are fixed. Two adaptive weights:
         #   bres  — adapts per query (see below).

@@ -232,7 +232,7 @@ class TestTokenBudget:
 class TestPersonaHygiene:
     def test_path_and_id_document_are_rejected(self):
         for bad in (
-            "身份证正反面存放在 ~/Documents/profile/resume/ 目录下",
+            "身份证正反面存放在 ~/profile/resume/ 目录下",
             "Both sides of the national ID card are in /Users/jace/private/docs",
             "用户的身份证号是 110101199001011234",
             "护照扫描件在 ~/tmp/passport.jpg 里",
@@ -265,10 +265,10 @@ class TestPersonaHygiene:
     async def test_stored_pii_is_scrubbed_on_sanitize(self, r):
         await r.hset(persona_mod.PERSONA_KEY, "location",
                      "Both sides of the national ID card are stored in "
-                     "~/Documents/profile/resume/ directory; 用户喜欢用中文写周报，先结论后细节")
+                     "~/profile/resume/ directory; 用户喜欢用中文写周报，先结论后细节")
         removed = await persona_mod.sanitize_stored(r)
         left = decode_bytes(await r.hget(persona_mod.PERSONA_KEY, "location"))
-        assert "ID card" not in left and "~/Documents" not in left, left
+        assert "ID card" not in left and "~/profile" not in left, left
         assert "中文" in left                       # the clean entry survives
         assert "location" in removed
 
@@ -276,7 +276,7 @@ class TestPersonaHygiene:
         with caplog.at_level(logging.WARNING, logger="mem"):
             await persona_mod.update(
                 r, "location",
-                "身份证正反面在 ~/Documents/profile/resume/ 目录里存档备份")
+                "身份证正反面在 ~/profile/resume/ 目录里存档备份")
         assert decode_bytes(await r.hget(persona_mod.PERSONA_KEY, "location")) \
             in (None, "")
         assert any("persona" in rec.getMessage() for rec in caplog.records), \
@@ -284,7 +284,7 @@ class TestPersonaHygiene:
 
     async def test_update_many_refuses_pii(self, r):
         await persona_mod.update_many(r, [
-            ("location", "身份证正反面在 ~/Documents/profile/resume/ 目录里"),
+            ("location", "身份证正反面在 ~/profile/resume/ 目录里"),
             ("preference", "用户偏好中文回复，先给结论再给理由"),
         ])
         assert not await r.hget(persona_mod.PERSONA_KEY, "location")

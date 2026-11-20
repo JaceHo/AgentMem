@@ -43,16 +43,22 @@ class _LyingProvider:
 
 @pytest.fixture
 def provider(monkeypatch):
-    """Install a provider without touching detection or the network."""
-    holder = {"p": None}
+    """Install an already-measured provider without touching detection or network.
 
+    ``_get_provider()`` re-measures whenever the module-level ``_measured`` flag
+    is False — which would silently overwrite the fake's width on the next
+    ``encode()`` and make the wrong-width tests pass vacuously (they failed here
+    after the 2026-11-14 refactor introduced the flag). Pin it True so a
+    measurement done via ``_measure_provider`` stays authoritative. monkeypatch
+    restores both globals on teardown; never re-set them by hand (the old
+    teardown leaked the last fake provider into every later test).
+    """
     def install(p):
-        holder["p"] = p
         monkeypatch.setattr(embed_mod, "_provider", p, raising=False)
+        monkeypatch.setattr(embed_mod, "_measured", True, raising=False)
         return p
 
-    yield install
-    monkeypatch.setattr(embed_mod, "_provider", holder["p"], raising=False)
+    return install
 
 
 def test_measurement_overrides_the_declaration(provider):
@@ -85,15 +91,21 @@ class _FakeRedis:
         self.sets = sets
         self.keys = list(sets) + list(others)
 
-    async def scan(self, cursor, match="*", count=500):
-        return (0, [k.encode() for k in self.keys])
+    async def scan(self, cursor, match="*", count=500, _type=None):
+        # The real client filters vectorsets server-side; honour that here so
+        # the fake exercises the same path as production.
+        keys = self.keys if _type is None else list(self.sets)
+        return (0, [k.encode() for k in keys])
 
     async def type(self, key):
-        return b"vectorset" if key in self.sets else b"set"
+        # redis-py passes bytes keys; compare as str like the real client does
+        k = key.decode() if isinstance(key, bytes) else key
+        return b"vectorset" if k in self.sets else b"set"
 
     async def execute_command(self, cmd, key):
+        k = key.decode() if isinstance(key, bytes) else key
         if cmd == "VDIM":
-            return self.sets[key]
+            return self.sets[k]
         if cmd == "VCARD":
             return 7
         raise AssertionError(f"unexpected command {cmd}")

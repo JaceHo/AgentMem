@@ -67,7 +67,10 @@ async def test_deferred_write_replays_when_embedder_recovers(r, monkeypatch):
     monkeypatch.setattr(mem_store, "save_procedure", fake_save)
     monkeypatch.setattr(mem_store, "find_procedure_by_task", lambda *_a, **_k: _none())
     monkeypatch.setattr(mem_store, "nearest_procedures", lambda *_a, **_k: _empty())
-    monkeypatch.setattr(cap, "encode", lambda text: np.zeros(384, dtype=np.float32))
+    async def fake_encode(text):
+        return np.zeros(384, dtype=np.float32)
+
+    monkeypatch.setattr(cap, "async_encode", fake_encode)
     monkeypatch.setattr(embed_mod, "embedding_unavailable", lambda: True)
 
     await cap.store_procedure(_req("B"), BackgroundTasks())
@@ -90,10 +93,10 @@ async def test_breaker_reopening_mid_drain_keeps_the_order(r, monkeypatch):
                                                     "session_id": ""}))
     monkeypatch.setattr(embed_mod, "embedding_unavailable", lambda: False)
 
-    def boom(_text):
+    async def boom(_text):
         raise embed_mod.EmbeddingUnavailable("embedding circuit open")
 
-    monkeypatch.setattr(cap, "encode", boom)
+    monkeypatch.setattr(cap, "async_encode", boom)
     assert await cap.drain_proc_pending() == 0
     assert await r.llen(cap.PROC_PENDING_KEY) == 1, "a failed replay must not consume the record"
 
@@ -111,7 +114,10 @@ async def test_healthy_path_is_still_persisted_and_reported_as_queued(r, monkeyp
     monkeypatch.setattr(mem_store, "save_procedure", fake_save)
     monkeypatch.setattr(mem_store, "find_procedure_by_task", lambda *_a, **_k: _none())
     monkeypatch.setattr(mem_store, "nearest_procedures", lambda *_a, **_k: _empty())
-    monkeypatch.setattr(cap, "encode", lambda text: np.zeros(384, dtype=np.float32))
+    async def fake_encode(text):
+        return np.zeros(384, dtype=np.float32)
+
+    monkeypatch.setattr(cap, "async_encode", fake_encode)
 
     bg = BackgroundTasks()
     resp = await cap.store_procedure(_req(f"D{time.time_ns()}"), bg)
@@ -139,7 +145,10 @@ async def test_dedup_is_loud_not_silent(r, monkeypatch, caplog):
     """
     monkeypatch.setattr(state, "redis", r)
     monkeypatch.setattr(embed_mod, "embedding_unavailable", lambda: False)
-    monkeypatch.setattr(cap, "encode", lambda text: np.zeros(384, dtype=np.float32))
+    async def fake_encode(text):
+        return np.zeros(384, dtype=np.float32)
+
+    monkeypatch.setattr(cap, "async_encode", fake_encode)
     monkeypatch.setattr(mem_store, "find_procedure_by_task", lambda *_a, **_k: _none())
 
     async def known(*_a, **_k):
