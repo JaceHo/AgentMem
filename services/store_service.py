@@ -659,7 +659,14 @@ async def do_store(messages: list[Message], session_id: str) -> None:
                  f"ep+{ep_saved} facts+{fact_saved} {ms}ms")
 
     except Exception as e:
-        log.warning(f"[store] background error: {e}", exc_info=True)
+        # Same classifier as main._do_store: an expected dependency outage is
+        # one WARNING line, a genuine bug keeps its full traceback. This copy
+        # of do_store is currently unwired, but keeping the two paths identical
+        # means reviving it later can't reintroduce the traceback storm.
+        if embedder.is_expected_outage(e):
+            log.warning("[store] background deferred: %s", e)
+        else:
+            log.exception("[store] background error")
     finally:
         ms = int((time.time() - t0) * 1000)
         await state.store_latency_sum_ms.add(ms)

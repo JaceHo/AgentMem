@@ -5,7 +5,8 @@ import asyncio
 import httpx
 import pytest
 
-from api.routes.capability import _chain_signature
+from api.routes.capability import _chain_signature, register_tools
+from api.schemas.capability import RegisterToolsRequest, ToolDefinition
 from api.schemas.memory import StoreRequest
 from core import embedder, extractor
 from core.extractor import _looks_like_empty_array
@@ -156,3 +157,69 @@ async def test_async_encode_batch_chunked_fails_fast_on_open_circuit(monkeypatch
     out = await search_mod.async_encode_batch_chunked(["a", "b"])
     assert out is None
     assert len(calls) == 1, f"expected one attempt, got {len(calls)} retries"
+
+
+async def test_register_tools_defers_batch_with_one_warning_on_open_circuit(monkeypatch, caplog):
+    """A circuit-open at batch start is one WARNING, not one per tool."""
+    from fastapi import BackgroundTasks
+
+    import api.routes.capability as cap_route
+
+    monkeypatch.setattr(embedder, "embedding_unavailable", lambda: True)
+
+    async def _boom(_text):
+        raise embedder.EmbeddingUnavailable("embedding circuit open")
+
+    monkeypatch.setattr(cap_route, "async_encode", _boom)
+
+    req = RegisterToolsRequest(tools=[
+        ToolDefinition(name=f"tool{i}", description="d") for i in range(5)
+    ])
+    bg = BackgroundTasks()
+    await register_tools(req, bg)
+
+    import logging
+    with caplog.at_level(logging.WARNING, logger="mem"):
+        await bg()
+    deferred = [r.getMessage() for r in caplog.records
+                if "registration deferred" in r.getMessage()]
+    assert len(deferred) == 1, f"expected one batch warning, got {deferred}"
+    assert "5 tools" in deferred[0]
+
+
+async def test_register_tools_breaks_once_when_circuit_opens_mid_batch(monkeypatch, caplog):
+    """Mid-batch circuit open: one WARNING and stop, no per-tool spam."""
+    from fastapi import BackgroundTasks
+
+    import api.routes.capability as cap_route
+
+    monkeypatch.setattr(embedder, "embedding_unavailable", lambda: False)
+
+    state = {"n": 0}
+
+    async def _maybe_boom(_text):
+        state["n"] += 1
+        if state["n"] > 2:
+            embedder.embedding_unavailable = lambda: True
+            raise embedder.EmbeddingUnavailable("embedding circuit open")
+        return object()
+
+    async def _noop(*_a, **_k):
+        return "ok"
+
+    monkeypatch.setattr(cap_route, "async_encode", _maybe_boom)
+    monkeypatch.setattr(cap_route.cap_mod, "register_tool", _noop)
+
+    req = RegisterToolsRequest(tools=[
+        ToolDefinition(name=f"tool{i}", description="d") for i in range(8)
+    ])
+    bg = BackgroundTasks()
+    await register_tools(req, bg)
+
+    import logging
+    with caplog.at_level(logging.WARNING, logger="mem"):
+        await bg()
+    deferred = [r.getMessage() for r in caplog.records
+                if "registration deferred" in r.getMessage()]
+    assert len(deferred) == 1, f"expected one mid-batch warning, got {deferred}"
+    assert state["n"] == 3, "must break on the first circuit-open, not keep encoding"

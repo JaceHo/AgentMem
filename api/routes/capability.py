@@ -43,6 +43,15 @@ async def register_tools(req: RegisterToolsRequest, background_tasks: Background
 
     async def _do_register():
         count = 0
+        # One circuit-open warning for the whole batch, not one per tool. The
+        # 2026-11-19/21 outages logged ~800 "[tools] failed to register <name>"
+        # lines — all the same root cause. Tools are re-registered by the next
+        # client sync, so nothing is dropped permanently; a warning here is
+        # only an operator signal, never a reason to fail the request.
+        if embed_mod.embedding_unavailable():
+            log.warning("[tools] registration deferred: embedding circuit open (%d tools)",
+                        len(req.tools))
+            return
         for tool in req.tools:
             try:
                 emb = await async_encode(f"{tool.name}: {tool.description}")
@@ -58,6 +67,11 @@ async def register_tools(req: RegisterToolsRequest, background_tasks: Background
                 )
                 count += 1
             except Exception as e:
+                # Circuit may open mid-batch: one line for that, not one per tool.
+                if embed_mod.is_expected_outage(e) and embed_mod.embedding_unavailable():
+                    log.warning("[tools] registration deferred: circuit opened mid-batch "
+                                "(%d/%d done)", count, len(req.tools))
+                    break
                 log.warning("[tools] failed to register %s: %s", tool.name, e)
         log.info(f"[tools] registered {count} tools (agent={req.agent_id})")
 
